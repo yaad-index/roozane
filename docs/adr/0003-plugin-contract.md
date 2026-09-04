@@ -109,6 +109,9 @@ be honest about the security consequences of running configured executables.
 - The no-partial-success rule keeps contract 1 simple; if a source needs
   resumable partial fetches, that pressure lands on a contract 2, not on
   ad-hoc flags.
-- The config-is-the-trust-boundary stance makes config file permissions part
-  of the security model; the startup mode check enforces the cheap half and
-  documentation carries the rest.
+- The config-is-the-trust-boundary stance makes filesystem permissions part of
+  the security model, for the configuration *and* for the plugin executables it
+  points at — whoever can overwrite a configured binary gets the same arbitrary
+  code execution as whoever can edit the config, without needing config access.
+  The startup mode check enforces that cheap half on both; documentation carries
+  the rest.
