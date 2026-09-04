@@ -1,6 +1,6 @@
 # ADR-0001: Foundations
 
-**Status:** Proposed
+**Status:** Accepted
 
 ## Context
 
