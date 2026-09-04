@@ -1,0 +1,7 @@
+# Built binary (Makefile `build` target outputs ./roozane). Root-anchored so it
+# never matches the cmd/roozane package directory.
+/roozane
+
+# The default data root (ADR-0002): collected items, digests, aggregator state.
+# Never belongs in the repo.
+/data/
