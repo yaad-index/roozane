@@ -94,9 +94,17 @@ type wireResponse struct {
 	} `json:"error"`
 }
 
-// maxErrorBody bounds how much of a failing response is quoted back. Enough to
-// diagnose, not enough to dump a page of HTML into a log.
+// maxErrorBody bounds how much of a failing response is quoted back INTO AN
+// ERROR STRING. Enough to diagnose, not enough to dump a page of HTML into a
+// log. It is not a bound on what may be read.
 const maxErrorBody = 2048
+
+// maxResponseBody bounds what is read from the wire. It has to be far larger
+// than maxErrorBody: a digest completion is prose and routinely exceeds a
+// couple of kilobytes, and reading through the error-quoting bound would
+// truncate a perfectly good response mid-JSON. Still bounded rather than
+// unlimited, so a broken or hostile endpoint cannot exhaust memory.
+const maxResponseBody = 8 << 20
 
 // Complete performs one chat completion.
 func (c *Client) Complete(ctx context.Context, req Request) (Response, error) {
@@ -132,9 +140,16 @@ func (c *Client) Complete(ctx context.Context, req Request) (Response, error) {
 	}
 	defer resp.Body.Close() //nolint:errcheck // read-only body; a close error says nothing actionable
 
-	raw, err := io.ReadAll(io.LimitReader(resp.Body, maxErrorBody+1))
+	// One byte past the limit, so a body exactly at it is not mistaken for an
+	// oversize one.
+	raw, err := io.ReadAll(io.LimitReader(resp.Body, maxResponseBody+1))
 	if err != nil {
 		return Response{}, fmt.Errorf("read response: %w", err)
+	}
+	if len(raw) > maxResponseBody {
+		// Say so rather than handing a truncated body to the decoder, which
+		// would fail with a JSON syntax error that names nothing useful.
+		return Response{}, fmt.Errorf("response is larger than the %d byte limit; a truncated body cannot be decoded", maxResponseBody)
 	}
 
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {

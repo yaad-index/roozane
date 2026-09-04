@@ -438,3 +438,47 @@ func TestAFailureIsNeverReusedAsAVerdict(t *testing.T) {
 	assert.Contains(t, string(digestRaw), "fresh point")
 	assert.NotContains(t, string(digestRaw), "stale point")
 }
+
+func TestStateFromADifferentSchemaIsNotReused(t *testing.T) {
+	day := at(t, "2026-09-04T06:00:00Z")
+	cfg, root := fixture(t, day, "I care about orchestration.",
+		store.Item{Source: "a-source", URL: "https://example.com/a", Content: "text"},
+	)
+
+	items, err := store.New(root).ReadItems(day)
+	require.NoError(t, err)
+
+	// State written by some other version, carrying a judgement whose fields may
+	// not mean what this version thinks they mean.
+	foreign := map[string]any{
+		"schema": stateSchema + 1,
+		"day":    store.Day(day),
+		"items": map[string]any{
+			items[0].Filename: map[string]any{
+				"status":    StatusRelevant,
+				"judgement": map[string]any{"relevant": true, "score": 0.9, "points": []string{"stale"}, "reason": "stale"},
+			},
+		},
+	}
+	raw, err := json.MarshalIndent(foreign, "", "  ")
+	require.NoError(t, err)
+	require.NoError(t, store.New(root).WriteAtomic(store.New(root).StatePath(day), raw))
+
+	client := &stubClient{replies: []llm.Response{
+		{Content: judgementJSON(true, 0.5, []string{"fresh"}, "re-judged")},
+		{Content: "- fresh"},
+	}}
+	result, err := runner(t, cfg, client, day).Run(context.Background(), day)
+	require.NoError(t, err)
+
+	// Relabelling another version's bookkeeping as current is worse than paying
+	// for one re-run.
+	assert.Zero(t, result.Reused)
+	require.Len(t, client.calls, 2)
+
+	_, jsonPath := store.New(root).DigestPaths(day)
+	digest, err := os.ReadFile(jsonPath) //nolint:gosec // test-controlled path
+	require.NoError(t, err)
+	assert.Contains(t, string(digest), "fresh")
+	assert.NotContains(t, string(digest), "stale")
+}

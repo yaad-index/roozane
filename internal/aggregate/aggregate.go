@@ -369,10 +369,18 @@ func (r *Runner) loadState(day time.Time) State {
 		r.log.Warn("state file unreadable, starting the day fresh", "error", err)
 		return state
 	}
+	if loaded.Schema != stateSchema {
+		// Relabelling another version's data as current is worse than losing
+		// it: the fields may mean something different, and the cost of starting
+		// fresh is one day's re-run rather than a digest built on
+		// misinterpreted bookkeeping.
+		r.log.Warn("state file was written by a different schema, starting the day fresh",
+			"found", loaded.Schema, "want", stateSchema)
+		return state
+	}
 	if loaded.Items == nil {
 		loaded.Items = map[string]ItemState{}
 	}
-	loaded.Schema = stateSchema
 	loaded.Day = state.Day
 	return loaded
 }

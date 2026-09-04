@@ -209,3 +209,72 @@ func TestContextCancellationIsHonoured(t *testing.T) {
 	})
 	require.Error(t, err)
 }
+
+// TestLargeSuccessfulResponseIsNotTruncated is the regression test for a real
+// bug: the read was bounded by maxErrorBody — the limit meant for quoting a
+// FAILING body into an error string — so any successful completion over ~2 KiB
+// was truncated mid-JSON and died in the decoder.
+//
+// Every stub in this file was a few dozen bytes, which is exactly why the
+// original suite was green: the logic was tested and the size never was.
+func TestLargeSuccessfulResponseIsNotTruncated(t *testing.T) {
+	// A digest is prose; several kilobytes is ordinary, not exotic.
+	longContent := strings.Repeat("A sentence of digest prose that a reader would actually want. ", 400)
+	require.Greater(t, len(longContent), maxErrorBody*8, "the fixture must clear the old bound to exercise the bug")
+
+	body, err := json.Marshal(map[string]any{
+		"choices": []map[string]any{{"message": map[string]string{"role": "assistant", "content": longContent}}},
+		"usage":   map[string]int{"prompt_tokens": 5, "completion_tokens": 900, "total_tokens": 905},
+	})
+	require.NoError(t, err)
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write(body)
+	}))
+	defer srv.Close()
+
+	resp, err := New(srv.URL, testKey, 10*time.Second).Complete(context.Background(), Request{
+		Model: "m", Messages: []Message{{Role: RoleUser, Content: "u"}},
+	})
+	require.NoError(t, err, "a large but well-formed completion must decode")
+	assert.Equal(t, longContent, resp.Content, "the content must arrive whole, not clipped")
+	assert.Equal(t, 905, resp.Usage.TotalTokens)
+}
+
+func TestOversizeResponseIsReportedBySize(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		// Stream past the read ceiling without allocating it all here.
+		chunk := strings.Repeat("z", 1<<20)
+		for range 9 {
+			if _, err := io.WriteString(w, chunk); err != nil {
+				return
+			}
+		}
+	}))
+	defer srv.Close()
+
+	_, err := New(srv.URL, testKey, 30*time.Second).Complete(context.Background(), Request{
+		Model: "m", Messages: []Message{{Role: RoleUser, Content: "u"}},
+	})
+	require.Error(t, err)
+	// The size is named as the cause; a truncated body would otherwise fail
+	// with a JSON syntax error that explains nothing.
+	assert.Contains(t, err.Error(), "larger than the")
+	assert.NotContains(t, err.Error(), "decode response")
+}
+
+// TestErrorBodyStaysBoundedWithTheLargerReadCeiling guards the other half: the
+// read ceiling went up, but what reaches an error string must not.
+func TestErrorBodyStaysBoundedWithTheLargerReadCeiling(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusBadGateway)
+		_, _ = io.WriteString(w, strings.Repeat("z", 200_000))
+	}))
+	defer srv.Close()
+
+	_, err := New(srv.URL, testKey, 10*time.Second).Complete(context.Background(), Request{
+		Model: "m", Messages: []Message{{Role: RoleUser, Content: "u"}},
+	})
+	require.Error(t, err)
+	assert.Less(t, len(err.Error()), maxErrorBody*2, "a 200KB failure body must not become a 200KB log line")
+}
