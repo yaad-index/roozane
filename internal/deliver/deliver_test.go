@@ -13,6 +13,7 @@ import (
 	"strings"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -431,5 +432,98 @@ func TestFileSinkNeverExposesATornFile(t *testing.T) {
 		reads++
 		require.True(t, string(raw) == bodyA || string(raw) == bodyB,
 			"read a partial digest: torn write (len %d)", len(raw))
+	}
+}
+
+// TestSplitMessageNeverBisectsACharacter is the regression test for silent
+// corruption: the fallback cut for an unbroken line used a raw byte index, so a
+// multi-byte character straddling the limit was split in half and each half
+// encoded as U+FFFD. The API accepts both messages happily and the reader sees
+// two replacement characters where one real character was — the delivery layer
+// editing the digest, which splitMessage exists not to do.
+//
+// Persian is the case that matters first here, and its characters are two bytes
+// each, so a boundary landing mid-character is not exotic.
+func TestSplitMessageNeverBisectsACharacter(t *testing.T) {
+	for name, text := range map[string]string{
+		"persian":          strings.Repeat("روزنه", 800),
+		"mixed with ascii": strings.Repeat("روزنه digest ", 300),
+		"four-byte runes":  strings.Repeat("🌍", 2000),
+		"three-byte runes": strings.Repeat("日本語", 1000),
+	} {
+		t.Run(name, func(t *testing.T) {
+			require.Greater(t, len(text), telegramLimit, "the fixture must exceed the limit to exercise the split")
+			require.NotContains(t, text, "\n", "this must exercise the no-newline fallback, not the line-boundary path")
+
+			chunks := splitMessage(text, telegramLimit)
+			require.Greater(t, len(chunks), 1)
+
+			for i, chunk := range chunks {
+				assert.True(t, utf8.ValidString(chunk), "chunk %d is not valid UTF-8: a character was bisected", i)
+				assert.NotContains(t, chunk, "�", "chunk %d carries a replacement character", i)
+				assert.LessOrEqual(t, len(chunk), telegramLimit, "chunk %d is over the limit", i)
+			}
+
+			// Nothing added, nothing lost: the split is a transport concern and
+			// must not change a byte of the digest.
+			assert.Equal(t, text, strings.Join(chunks, ""))
+		})
+	}
+}
+
+// TestTelegramSinkDeliversMultiByteTextIntact walks the same case through the
+// real send path, since the corruption only became visible after json.Marshal.
+func TestTelegramSinkDeliversMultiByteTextIntact(t *testing.T) {
+	t.Setenv("TEST_BOT_TOKEN", "t")
+
+	var sent []string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var body map[string]string
+		raw, _ := io.ReadAll(r.Body)
+		require.NoError(t, json.Unmarshal(raw, &body))
+		sent = append(sent, body["text"])
+		_, _ = io.WriteString(w, `{"ok":true}`)
+	}))
+	defer srv.Close()
+
+	d := day(t, "2026-09-04")
+	cfg, root := fixture(t, d, false,
+		"sinks:\n  chat: {type: telegram, params: {chat_id: \"1\", token_env: TEST_BOT_TOKEN, api_base: \""+srv.URL+"\"}}\n")
+
+	digest := strings.Repeat("روزنه", 1200)
+	mdPath, _ := store.New(filepath.Join(root, "data")).DigestPaths(d)
+	require.NoError(t, store.New(filepath.Join(root, "data")).WriteAtomic(mdPath, []byte(digest)))
+
+	result, err := NewRunner(cfg, WithLogger(quietLogger())).Run(context.Background(), d)
+	require.NoError(t, err)
+	require.NoError(t, result.Sinks[0].Err)
+
+	require.Greater(t, len(sent), 1, "the fixture must have been split to exercise the boundary")
+	for i, msg := range sent {
+		assert.NotContains(t, msg, "�", "message %d reached the API with a replacement character", i)
+	}
+	// What the reader receives, concatenated, is exactly what was written.
+	assert.Equal(t, digest, strings.Join(sent, ""))
+}
+
+// TestSplitMessageTerminatesOnAPathologicalLimit pins the zero-cut guard. The
+// rune-boundary walk can reach index 0 only when the limit is smaller than a
+// single character — absurd in practice, but without the guard the function
+// appends an empty chunk and never advances, so a misconfiguration would hang
+// the delivery rather than fail it. The guard's job is termination, and that is
+// what this asserts.
+func TestSplitMessageTerminatesOnAPathologicalLimit(t *testing.T) {
+	const text = "🌍🌍🌍"
+
+	done := make(chan []string, 1)
+	go func() { done <- splitMessage(text, 1) }()
+
+	select {
+	case chunks := <-done:
+		assert.NotEmpty(t, chunks)
+		// Whatever it does with an impossible limit, it must not lose input.
+		assert.Equal(t, text, strings.Join(chunks, ""))
+	case <-time.After(5 * time.Second):
+		t.Fatal("splitMessage did not terminate: the zero-cut guard is missing")
 	}
 }

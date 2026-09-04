@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"os"
 	"strings"
+	"unicode/utf8"
 
 	"github.com/yaad-index/roozane/internal/config"
 )
@@ -143,8 +144,21 @@ func splitMessage(text string, limit int) []string {
 		cut := strings.LastIndexByte(text[:limit], '\n')
 		if cut <= 0 {
 			// No line boundary to use — a single very long line. Cut at the
-			// limit rather than growing the chunk past what the API accepts.
+			// limit, but back up to a rune boundary first: a raw byte cut
+			// bisects a multi-byte character, and each half then encodes as
+			// U+FFFD, so the reader silently receives two replacement
+			// characters where one real character was. That is the delivery
+			// layer corrupting the digest, which is the thing this function
+			// exists not to do.
 			cut = limit
+			for cut > 0 && !utf8.RuneStart(text[cut]) {
+				cut--
+			}
+			if cut == 0 {
+				// Unreachable for valid UTF-8 with any sane limit, but a zero
+				// cut would append an empty chunk and never advance.
+				cut = limit
+			}
 		}
 		chunks = append(chunks, strings.TrimRight(text[:cut], "\n"))
 		text = strings.TrimLeft(text[cut:], "\n")
