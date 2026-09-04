@@ -29,7 +29,7 @@ func TestRunVersion(t *testing.T) {
 func TestRunUnknownArgs(t *testing.T) {
 	for name, args := range map[string][]string{
 		"no arguments":       {},
-		"unknown subcommand": {"collect"},
+		"unknown subcommand": {"aggregate"},
 		"trailing argument":  {"version", "--json"},
 	} {
 		t.Run(name, func(t *testing.T) {
