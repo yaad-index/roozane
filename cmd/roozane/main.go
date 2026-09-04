@@ -14,6 +14,7 @@ import (
 	"github.com/yaad-index/roozane/internal/aggregate"
 	"github.com/yaad-index/roozane/internal/collect"
 	"github.com/yaad-index/roozane/internal/config"
+	"github.com/yaad-index/roozane/internal/deliver"
 	"github.com/yaad-index/roozane/internal/store"
 )
 
@@ -29,6 +30,7 @@ const usage = `usage:
   roozane version
   roozane collect   [-config roozane.yaml] [-v]
   roozane aggregate [-config roozane.yaml] [-day YYYY-MM-DD] [-v]
+  roozane deliver   [-config roozane.yaml] [-day YYYY-MM-DD] [-v]
 `
 
 func main() {
@@ -60,6 +62,9 @@ func run(args []string, stdout, stderr io.Writer) int {
 
 	case "aggregate":
 		return runAggregate(args[1:], stdout, stderr)
+
+	case "deliver":
+		return runDeliver(args[1:], stdout, stderr)
 
 	default:
 		_, _ = fmt.Fprintf(stderr, "unknown command %q\n\n%s", args[0], usage)
@@ -172,6 +177,65 @@ func runAggregate(args []string, stdout, stderr io.Writer) int {
 	// A failed item does not invalidate the digest that was written, but the
 	// exit code still reports it so a scheduler notices.
 	if result.Failed > 0 {
+		return 1
+	}
+	return 0
+}
+
+// runDeliver sends one day's digest to every configured sink.
+func runDeliver(args []string, stdout, stderr io.Writer) int {
+	fs := flag.NewFlagSet("deliver", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+	configPath := fs.String("config", "roozane.yaml", "path to the configuration file")
+	dayFlag := fs.String("day", "", "UTC day to deliver (YYYY-MM-DD); defaults to today")
+	verbose := fs.Bool("v", false, "log each delivery")
+	if err := fs.Parse(args); err != nil {
+		return 2
+	}
+
+	day := time.Now().UTC()
+	if *dayFlag != "" {
+		parsed, err := time.Parse(store.DayFormat, *dayFlag)
+		if err != nil {
+			_, _ = fmt.Fprintf(stderr, "invalid -day %q: want YYYY-MM-DD\n", *dayFlag)
+			return 2
+		}
+		day = parsed
+	}
+
+	level := slog.LevelInfo
+	if *verbose {
+		level = slog.LevelDebug
+	}
+	logger := slog.New(slog.NewTextHandler(stderr, &slog.HandlerOptions{Level: level}))
+
+	cfg, err := config.Load(*configPath)
+	if err != nil {
+		_, _ = fmt.Fprintf(stderr, "%v\n", err)
+		return 1
+	}
+
+	result, err := deliver.NewRunner(cfg, deliver.WithLogger(logger)).Run(context.Background(), day)
+	if err != nil {
+		_, _ = fmt.Fprintf(stderr, "%v\n", err)
+		return 1
+	}
+
+	if len(result.Sinks) == 0 {
+		_, _ = fmt.Fprintf(stdout, "%s: no sinks configured\n", result.Day)
+	}
+	for _, s := range result.Sinks {
+		if s.Err != nil {
+			_, _ = fmt.Fprintf(stdout, "%s: FAILED: %v\n", s.ID, s.Err)
+			continue
+		}
+		_, _ = fmt.Fprintf(stdout, "%s: delivered\n", s.ID)
+	}
+	if result.Empty {
+		_, _ = fmt.Fprintln(stdout, "(the digest was empty; a quiet day is still delivered)")
+	}
+
+	if result.Failed() {
 		return 1
 	}
 	return 0
