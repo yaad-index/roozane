@@ -9,9 +9,12 @@ import (
 	"io"
 	"log/slog"
 	"os"
+	"time"
 
+	"github.com/yaad-index/roozane/internal/aggregate"
 	"github.com/yaad-index/roozane/internal/collect"
 	"github.com/yaad-index/roozane/internal/config"
+	"github.com/yaad-index/roozane/internal/store"
 )
 
 // version is overwritten at link time with the release version:
@@ -24,7 +27,8 @@ var version = "dev"
 
 const usage = `usage:
   roozane version
-  roozane collect [-config roozane.yaml] [-v]
+  roozane collect   [-config roozane.yaml] [-v]
+  roozane aggregate [-config roozane.yaml] [-day YYYY-MM-DD] [-v]
 `
 
 func main() {
@@ -53,6 +57,9 @@ func run(args []string, stdout, stderr io.Writer) int {
 
 	case "collect":
 		return runCollect(args[1:], stdout, stderr)
+
+	case "aggregate":
+		return runAggregate(args[1:], stdout, stderr)
 
 	default:
 		_, _ = fmt.Fprintf(stderr, "unknown command %q\n\n%s", args[0], usage)
@@ -104,6 +111,67 @@ func runCollect(args []string, stdout, stderr io.Writer) int {
 	// partial-success protocol — but the exit code still reports the failure so
 	// a scheduler notices.
 	if result.Failed() {
+		return 1
+	}
+	return 0
+}
+
+// runAggregate judges one day's collected items and writes its digest.
+func runAggregate(args []string, stdout, stderr io.Writer) int {
+	fs := flag.NewFlagSet("aggregate", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+	configPath := fs.String("config", "roozane.yaml", "path to the configuration file")
+	dayFlag := fs.String("day", "", "UTC day to aggregate (YYYY-MM-DD); defaults to today")
+	verbose := fs.Bool("v", false, "log per-item decisions")
+	if err := fs.Parse(args); err != nil {
+		return 2
+	}
+
+	day := time.Now().UTC()
+	if *dayFlag != "" {
+		parsed, err := time.Parse(store.DayFormat, *dayFlag)
+		if err != nil {
+			_, _ = fmt.Fprintf(stderr, "invalid -day %q: want YYYY-MM-DD\n", *dayFlag)
+			return 2
+		}
+		day = parsed
+	}
+
+	level := slog.LevelInfo
+	if *verbose {
+		level = slog.LevelDebug
+	}
+	logger := slog.New(slog.NewTextHandler(stderr, &slog.HandlerOptions{Level: level}))
+
+	cfg, err := config.Load(*configPath)
+	if err != nil {
+		_, _ = fmt.Fprintf(stderr, "%v\n", err)
+		return 1
+	}
+
+	runner, err := aggregate.NewRunner(cfg, aggregate.WithLogger(logger))
+	if err != nil {
+		_, _ = fmt.Fprintf(stderr, "%v\n", err)
+		return 1
+	}
+
+	result, err := runner.Run(context.Background(), day)
+	if err != nil {
+		_, _ = fmt.Fprintf(stderr, "%v\n", err)
+		return 1
+	}
+
+	_, _ = fmt.Fprintf(stdout, "%s: %d items, %d relevant, %d suppressed, %d failed, %d reused\n",
+		result.Day, result.Items, result.Relevant, result.Suppressed, result.Failed, result.Reused)
+	if result.Empty {
+		_, _ = fmt.Fprintln(stdout, "digest: empty (nothing cleared the relevance bar)")
+	}
+	_, _ = fmt.Fprintf(stdout, "tokens: %d prompt, %d completion\n",
+		result.Usage.PromptTokens, result.Usage.CompletionTokens)
+
+	// A failed item does not invalidate the digest that was written, but the
+	// exit code still reports it so a scheduler notices.
+	if result.Failed > 0 {
 		return 1
 	}
 	return 0
