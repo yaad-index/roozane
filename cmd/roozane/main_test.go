@@ -28,8 +28,10 @@ func TestRunVersion(t *testing.T) {
 
 func TestRunUnknownArgs(t *testing.T) {
 	for name, args := range map[string][]string{
-		"no arguments":       {},
-		"unknown subcommand": {"deliver"},
+		"no arguments": {},
+		// A word chosen not to become a real subcommand: this fixture has been
+		// invalidated three times by the command it named getting implemented.
+		"unknown subcommand": {"definitely-not-a-command"},
 		"trailing argument":  {"version", "--json"},
 	} {
 		t.Run(name, func(t *testing.T) {
