@@ -42,9 +42,12 @@ newsletter later, purely by swapping configuration.
    deliberately stiff for now.** It reads the day's Markdown files one at a
    time and makes **one LLM API call per unit of work** (read, extract the few
    load-bearing data points, judge relevance against the profile). The LLM is
-   reached through **OpenRouter**, keeping the engine model-agnostic and letting
-   cost scale with the task (small model per item, larger model for the final
-   digest). No plugin system in this layer. The profile and the reader's
+   reached through the **standard chat-completions API shape, strictly
+   provider-agnostic**: the aggregator carries its own configuration (base URL,
+   model, credentials), its own prompts, and its own context handling, and the
+   engine neither endorses nor depends on any particular provider. Cost scales
+   with the task by configuring a small model per item and a larger one for the
+   final digest. No plugin system in this layer. The profile and the reader's
    ongoing feedback are inputs to the prompt, and the suppression default is
    built in: an item that does not clear the relevance bar produces nothing.
 
