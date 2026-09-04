@@ -285,3 +285,52 @@ func TestWriteItemNeverExposesATornFile(t *testing.T) {
 			"read a file whose content is neither complete body: torn write (len %d)", len(raw))
 	}
 }
+
+// TestWriteAtomicNeverExposesATornFile covers the other writer. WriteItem and
+// WriteAtomic are separate entry points, so a change that made WriteAtomic
+// write in place would leave the item test green while digests — which sinks
+// read concurrently — became torn-readable.
+func TestWriteAtomicNeverExposesATornFile(t *testing.T) {
+	s := New(t.TempDir())
+	path := filepath.Join(s.DigestsDir(), "2026-09-04.json")
+
+	bodyA := "A" + strings.Repeat("a", 512*1024)
+	bodyB := "B" + strings.Repeat("b", 512*1024)
+
+	require.NoError(t, s.WriteAtomic(path, []byte(bodyA)))
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for i := range 200 {
+			body := bodyA
+			if i%2 == 1 {
+				body = bodyB
+			}
+			if err := s.WriteAtomic(path, []byte(body)); err != nil {
+				return
+			}
+		}
+	}()
+
+	var reads int
+	for {
+		select {
+		case <-done:
+			assert.Greater(t, reads, 10, "the reader has to have raced the writer for this to say anything")
+			return
+		default:
+		}
+
+		raw, err := os.ReadFile(path) //nolint:gosec // test-controlled path
+		if os.IsNotExist(err) {
+			continue
+		}
+		require.NoError(t, err)
+		reads++
+
+		body := string(raw)
+		require.True(t, body == bodyA || body == bodyB,
+			"read a partial digest: torn write (len %d, starts %q)", len(body), body[:min(1, len(body))])
+	}
+}

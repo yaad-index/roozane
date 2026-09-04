@@ -14,6 +14,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"time"
 
@@ -272,4 +273,134 @@ func (s *Store) SourceLastCollected(source string, now time.Time, maxDays int) (
 	}
 
 	return time.Time{}, false, nil
+}
+
+// --- reading back, and the aggregator's outputs ---
+
+// StoredItem is an item read back off disk: its front matter plus its text.
+type StoredItem struct {
+	// Filename is the item's name within its day, which is also its stable
+	// identity for the aggregator's per-item bookkeeping.
+	Filename string
+
+	Source     string
+	URL        string
+	Title      string
+	FetchedAt  time.Time
+	SourceTime time.Time
+	Collector  string
+	Content    string
+}
+
+// DigestsDir is the sibling tree digests live in. Keeping them outside days/ is
+// what lets a digest outlive the raw items it came from (ADR-0002).
+func (s *Store) DigestsDir() string { return filepath.Join(s.root, "digests") }
+
+// DigestPaths are the two files one day's digest is written to: the
+// human-readable artifact and the structured sink input.
+func (s *Store) DigestPaths(t time.Time) (markdown, structured string) {
+	day := Day(t)
+	dir := s.DigestsDir()
+	return filepath.Join(dir, day+".md"), filepath.Join(dir, day+".json")
+}
+
+// StatePath is the aggregator's per-day bookkeeping file.
+func (s *Store) StatePath(t time.Time) string {
+	return filepath.Join(s.DayDir(t), "state.json")
+}
+
+// WriteAtomic writes data to path, creating parent directories, via the same
+// temp-then-rename used for items. Callers own their file formats; the atomic
+// guarantee stays in one place.
+func (s *Store) WriteAtomic(path string, data []byte) error {
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return fmt.Errorf("create directory: %w", err)
+	}
+	return writeFileAtomic(path, data)
+}
+
+// ReadItems returns every item collected on a day, sorted by filename so a
+// re-run sees them in the same order. A day with no items directory yields
+// nothing and no error: not having collected is not a failure.
+func (s *Store) ReadItems(t time.Time) ([]StoredItem, error) {
+	dir := s.ItemsDir(t)
+
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("read items directory: %w", err)
+	}
+
+	names := make([]string, 0, len(entries))
+	for _, e := range entries {
+		if e.IsDir() || !strings.HasSuffix(e.Name(), ".md") {
+			continue
+		}
+		names = append(names, e.Name())
+	}
+	sort.Strings(names)
+
+	items := make([]StoredItem, 0, len(names))
+	for _, name := range names {
+		raw, err := os.ReadFile(filepath.Join(dir, name)) //nolint:gosec // path is inside the engine's own data root
+		if err != nil {
+			return nil, fmt.Errorf("read %s: %w", name, err)
+		}
+		item, err := parseItem(name, string(raw))
+		if err != nil {
+			return nil, fmt.Errorf("parse %s: %w", name, err)
+		}
+		items = append(items, item)
+	}
+	return items, nil
+}
+
+// parseItem splits an item file into its front matter and its text.
+func parseItem(name, raw string) (StoredItem, error) {
+	const delim = "---\n"
+
+	if !strings.HasPrefix(raw, delim) {
+		return StoredItem{}, errors.New("no front matter")
+	}
+	rest := raw[len(delim):]
+
+	// The closing delimiter is the first one at the start of a line. Content is
+	// taken verbatim after it, so a `---` inside the text cannot end the block
+	// early — only the first closing delimiter counts.
+	end := strings.Index(rest, "\n"+delim)
+	if end < 0 {
+		return StoredItem{}, errors.New("front matter is not closed")
+	}
+	head, body := rest[:end+1], rest[end+1+len(delim):]
+
+	var fm frontMatter
+	if err := yaml.Unmarshal([]byte(head), &fm); err != nil {
+		return StoredItem{}, fmt.Errorf("front matter: %w", err)
+	}
+
+	item := StoredItem{
+		Filename:  name,
+		Source:    fm.Source,
+		URL:       fm.URL,
+		Title:     fm.Title,
+		Collector: fm.Collector,
+		Content:   body,
+	}
+	if fm.FetchedAt != "" {
+		parsed, err := time.Parse(time.RFC3339, fm.FetchedAt)
+		if err != nil {
+			return StoredItem{}, fmt.Errorf("fetched_at: %w", err)
+		}
+		item.FetchedAt = parsed
+	}
+	if fm.SourceTime != "" {
+		parsed, err := time.Parse(time.RFC3339, fm.SourceTime)
+		if err != nil {
+			return StoredItem{}, fmt.Errorf("source_time: %w", err)
+		}
+		item.SourceTime = parsed
+	}
+	return item, nil
 }
