@@ -394,3 +394,155 @@ func replaceLine(body, old, replacement string) string {
 	}
 	return strings.Replace(body, old+"\n", replacement+"\n", 1)
 }
+
+// --- sinks and env allow-lists (ADR-0003 §3, §6) ---
+
+// configWith appends extra top-level YAML to the valid baseline.
+func configWith(extra string) string { return validConfig + extra }
+
+func TestSinksOptional(t *testing.T) {
+	cfg, err := Load(write(t, validConfig))
+	require.NoError(t, err)
+
+	// No sinks is a complete pipeline: the aggregator still writes digests to
+	// disk, so an absent sink list must not be an error.
+	assert.Empty(t, cfg.Sinks)
+}
+
+func TestLoadSinks(t *testing.T) {
+	cfg, err := Load(write(t, configWith(`
+sinks:
+  local-file:
+    type: file
+    params:
+      path: /srv/roozane/digest.md
+  notify-script:
+    command: ["/usr/local/bin/notify", "--quiet"]
+    env: [NOTIFY_TOKEN]
+`)))
+	require.NoError(t, err)
+
+	require.Len(t, cfg.Sinks, 2)
+	assert.Equal(t, "file", cfg.Sinks["local-file"].Type)
+	assert.Empty(t, cfg.Sinks["local-file"].Command)
+	assert.Equal(t, []string{"/usr/local/bin/notify", "--quiet"}, cfg.Sinks["notify-script"].Command)
+	assert.Equal(t, []string{"NOTIFY_TOKEN"}, cfg.Sinks["notify-script"].Env)
+
+	var params struct {
+		Path string `yaml:"path"`
+	}
+	require.NoError(t, cfg.Sinks["local-file"].DecodeParams(&params))
+	assert.Equal(t, "/srv/roozane/digest.md", params.Path)
+
+	// A sink with no params block decodes to nothing without erroring.
+	params.Path = "untouched"
+	require.NoError(t, cfg.Sinks["notify-script"].DecodeParams(&params))
+	assert.Equal(t, "untouched", params.Path)
+}
+
+func TestSinkValidation(t *testing.T) {
+	for name, tc := range map[string]struct {
+		body string
+		want string // empty means the config is accepted
+	}{
+		"built-in type": {
+			body: "\nsinks:\n  a-sink: {type: file}\n",
+		},
+		"external command": {
+			body: "\nsinks:\n  a-sink: {command: [\"/bin/true\"]}\n",
+		},
+		"neither type nor command": {
+			body: "\nsinks:\n  a-sink: {params: {x: 1}}\n",
+			want: "set either type (a built-in sink) or command",
+		},
+		"both type and command": {
+			body: "\nsinks:\n  a-sink: {type: file, command: [\"/bin/true\"]}\n",
+			want: "set type or command, not both",
+		},
+		"empty program in command": {
+			body: "\nsinks:\n  a-sink: {command: [\"\", \"--flag\"]}\n",
+			want: "first element must be the program to run",
+		},
+		"bad sink id": {
+			body: "\nsinks:\n  Bad_Sink: {type: file}\n",
+			want: `sink id "Bad_Sink" must match [a-z0-9-]`,
+		},
+		// The doubled-hyphen rule exists because `--` separates the id from the
+		// item key in item FILENAMES. A sink never produces one, so the rule
+		// deliberately does not apply here.
+		"doubled hyphen is fine for a sink": {
+			body: "\nsinks:\n  a--sink: {type: file}\n",
+		},
+		"unknown sink field": {
+			body: "\nsinks:\n  a-sink: {type: file, kind: whatever}\n",
+			want: "kind",
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			_, err := Load(write(t, configWith(tc.body)))
+
+			if tc.want == "" {
+				require.NoError(t, err)
+				return
+			}
+			require.Error(t, err)
+			assert.Contains(t, err.Error(), tc.want)
+		})
+	}
+}
+
+func TestEnvAllowList(t *testing.T) {
+	for name, tc := range map[string]struct {
+		body string
+		want string // empty means accepted
+	}{
+		// validConfig ends inside its `sources:` map, so a two-space-indented
+		// entry continues it rather than starting a second mapping key.
+		"source env accepted": {
+			body: "  ok-source: {collector: feed, cadence: daily, env: [A_TOKEN, B_TOKEN]}\n",
+		},
+		"source env lower-case": {
+			body: "  ok-source: {collector: feed, cadence: daily, env: [a_token]}\n",
+			want: `source "ok-source": env[0] must be an environment variable NAME`,
+		},
+		"source env empty entry": {
+			body: "  ok-source: {collector: feed, cadence: daily, env: [\"\"]}\n",
+			want: `source "ok-source": env[0] must not be empty`,
+		},
+		"source env duplicate": {
+			body: "  ok-source: {collector: feed, cadence: daily, env: [A_TOKEN, A_TOKEN]}\n",
+			want: `source "ok-source": env lists A_TOKEN twice`,
+		},
+		"second env entry reports its own index": {
+			body: "  ok-source: {collector: feed, cadence: daily, env: [A_TOKEN, b_token]}\n",
+			want: `source "ok-source": env[1] must be an environment variable NAME`,
+		},
+		"sink env lower-case": {
+			body: "\nsinks:\n  a-sink: {type: file, env: [a_token]}\n",
+			want: `sink "a-sink": env[0] must be an environment variable NAME`,
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			_, err := Load(write(t, configWith(tc.body)))
+
+			if tc.want == "" {
+				require.NoError(t, err)
+				return
+			}
+			require.Error(t, err)
+			assert.Contains(t, err.Error(), tc.want)
+		})
+	}
+}
+
+func TestEnvErrorDoesNotEchoTheValue(t *testing.T) {
+	const pasted = "sk-live-do-not-log-this"
+
+	_, err := Load(write(t, configWith("\nsinks:\n  a-sink: {type: file, env: [\""+pasted+"\"]}\n")))
+
+	require.Error(t, err)
+	// Same reasoning as the aggregator credential: an env allow-list is where a
+	// secret gets pasted by mistake, so the error must not repeat it.
+	assert.NotContains(t, err.Error(), pasted)
+	assert.Contains(t, err.Error(), "not a credential")
+}
