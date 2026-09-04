@@ -1,0 +1,69 @@
+# Roozane configuration.
+#
+# Everything the engine does is decided here: which sources it reads, how often,
+# what "relevant" means, and where the digest comes from. Adding a source is a
+# change to this file and never a change to the code (ADR-0001).
+#
+# Relative paths resolve against this file's directory, so a config and its data
+# move together.
+
+# Root for everything on disk: collected items, digests, aggregator state
+# (ADR-0002). Default: data
+data_root: data
+
+# The reader-owned description of what matters to them. Prose, in a file you
+# edit — the engine never infers this. It is fed to the aggregator as prompt
+# input on every run. Default: profile.md
+relevance_profile: profile.md
+
+# Two independent windows, both counted in UTC days (ADR-0002).
+retention:
+  # Prunes day folders under days/. Default: 90
+  items: 90
+  # Prunes the digests/ tree. 0 keeps them forever, which is the default:
+  # digests are small and are the record worth keeping.
+  digests: 0
+
+# The one layer with a brain. It speaks the standard chat-completions API shape
+# and is described by endpoint and model names only — point it at whichever
+# service you use; the engine neither assumes nor endorses one.
+aggregator:
+  # Root of the chat-completions endpoint.
+  base_url: https://api.example.com/v1
+
+  # The NAME of the environment variable holding your credential — not the
+  # credential. Keeping it a reference is what makes this file safe to commit,
+  # diff and share. A pasted key is rejected at load rather than silently
+  # treated as a variable name that never resolves.
+  api_key_env: ROOZANE_API_KEY
+
+  # Cost scales with the size of the task: a small model reads each item, a
+  # larger one writes the day's digest (ADR-0001).
+  models:
+    item: your-small-model
+    digest: your-large-model
+
+  # Per-request timeout. Default: 60s
+  timeout: 60s
+
+# The source list. Each key is a source id: it becomes a path component of every
+# item that source collects (ADR-0002), so it is restricted to lower-case
+# letters, digits and single hyphens.
+#
+# Every entry carries its own cadence — daily, weekly or monthly.
+sources:
+  example-feed:
+    collector: feed
+    cadence: daily
+    params:
+      url: https://example.com/feed.xml
+
+  example-site:
+    collector: http
+    cadence: weekly
+    params:
+      url: https://example.com/updates
+
+# Newsletters and other hand-offs do not appear here. External tools drop files
+# into <data_root>/inbox/ and the next collector run takes them from there
+# (ADR-0002) — the engine never reaches outside its data root for input.
