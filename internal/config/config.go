@@ -43,6 +43,11 @@ type Config struct {
 	// validateSourceID is strict about it.
 	Sources map[string]Source `yaml:"sources"`
 
+	// Sinks is keyed by sink id and is optional: with none configured the
+	// aggregator still writes digests to disk, which is a complete pipeline for
+	// a reader who only wants the files.
+	Sinks map[string]Sink `yaml:"sinks"`
+
 	// dir is the directory the config was loaded from, used to resolve
 	// relative paths. Unexported so it cannot be set from the file itself.
 	dir string
@@ -99,6 +104,10 @@ type Source struct {
 	Collector string  `yaml:"collector"`
 	Cadence   Cadence `yaml:"cadence"`
 
+	// Env is the allow-list of environment variables this entry's collector
+	// receives (ADR-0003 §6). It names variables; it never carries values.
+	Env []string `yaml:"env"`
+
 	// Params is held undecoded so each collector can decode its own settings
 	// with its own strictness. Keeping it opaque here is what lets a new
 	// collector — eventually an external one, per ADR-0001 §5 — arrive without
@@ -109,11 +118,43 @@ type Source struct {
 // DecodeParams decodes a source's collector-specific params into v. Sources
 // with no params block decode to nothing and report no error, so a collector
 // that needs none does not have to special-case its absence.
-func (s Source) DecodeParams(v any) error {
-	if s.Params.IsZero() {
+func (s Source) DecodeParams(v any) error { return decodeParams(s.Params, v) }
+
+// Sink is one entry in the sink list: where a digest goes and what that
+// delivery needs (ADR-0003 §3). Exactly one of Type and Command identifies it —
+// a built-in delivery or an external program — which is what keeps the edge
+// open without making "which one runs" ambiguous.
+type Sink struct {
+	// Type names a built-in sink. The set of built-in types is defined by the
+	// sink layer itself, so this package deliberately does not police the value
+	// beyond requiring one: guessing an allow-list here would pre-empt that
+	// work and invent names nothing implements. The trade-off is real and
+	// stated rather than hidden — a misspelled type is caught when the sink
+	// layer resolves it, not at load.
+	Type string `yaml:"type"`
+
+	// Command is an exec-based sink: the program and its arguments, invoked
+	// under the ADR-0003 contract.
+	Command []string `yaml:"command"`
+
+	// Env is the allow-list of environment variables this sink receives — for
+	// a delivery credential, by variable name (ADR-0003 §6).
+	Env []string `yaml:"env"`
+
+	// Params carries sink-specific settings — a destination id, a path — and is
+	// held undecoded for the same reason a source's params are.
+	Params yaml.Node `yaml:"params"`
+}
+
+// DecodeParams decodes a sink's delivery-specific params into v, with the same
+// absent-is-not-an-error behaviour as Source.DecodeParams.
+func (s Sink) DecodeParams(v any) error { return decodeParams(s.Params, v) }
+
+func decodeParams(node yaml.Node, v any) error {
+	if node.IsZero() {
 		return nil
 	}
-	return s.Params.Decode(v)
+	return node.Decode(v)
 }
 
 // Cadence is how often a source is fetched. ADR-0001 fixes the vocabulary at
@@ -175,9 +216,9 @@ const (
 	defaultTimeout          = 60 * time.Second
 )
 
-// sourceIDPattern is ADR-0002's `[a-z0-9-]` constraint, anchored, and refusing
-// a leading or trailing hyphen.
-var sourceIDPattern = regexp.MustCompile(`^[a-z0-9]([a-z0-9-]*[a-z0-9])?$`)
+// idPattern is ADR-0002's `[a-z0-9-]` constraint, anchored, and refusing a
+// leading or trailing hyphen. Shared by source and sink ids.
+var idPattern = regexp.MustCompile(`^[a-z0-9]([a-z0-9-]*[a-z0-9])?$`)
 
 // envVarPattern is the conventional shape of an environment variable name. It
 // doubles as the guard that keeps an actual credential out of the file: a real
@@ -287,6 +328,7 @@ func (c *Config) Validate() error {
 
 	problems = append(problems, c.validateAggregator()...)
 	problems = append(problems, c.validateSources()...)
+	problems = append(problems, c.validateSinks()...)
 
 	return errors.Join(problems...)
 }
@@ -337,16 +379,8 @@ func (c *Config) validateSources() []error {
 		return []error{errors.New("sources must contain at least one entry: a pipeline with no sources can only ever produce an empty digest")}
 	}
 
-	// Map iteration order is random; sort so the same broken config always
-	// reports its problems in the same order.
-	ids := make([]string, 0, len(c.Sources))
-	for id := range c.Sources {
-		ids = append(ids, id)
-	}
-	sort.Strings(ids)
-
 	var problems []error
-	for _, id := range ids {
+	for _, id := range sortedKeys(c.Sources) {
 		if err := validateSourceID(id); err != nil {
 			problems = append(problems, err)
 		}
@@ -355,13 +389,51 @@ func (c *Config) validateSources() []error {
 	return problems
 }
 
+// validateSinks checks the optional sink list. An empty one is fine: without
+// sinks the aggregator still writes digests to disk.
+func (c *Config) validateSinks() []error {
+	var problems []error
+	for _, id := range sortedKeys(c.Sinks) {
+		if err := validateID("sink", id); err != nil {
+			problems = append(problems, err)
+		}
+		problems = append(problems, validateSink(id, c.Sinks[id])...)
+	}
+	return problems
+}
+
+// sortedKeys returns a map's keys in a stable order. Map iteration is random,
+// and a validator that reports the same broken config in a different order each
+// run is harder to work through than one that does not.
+func sortedKeys[V any](m map[string]V) []string {
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	return keys
+}
+
+// validateID is the id shape shared by sources and sinks: lower-case letters,
+// digits and interior hyphens. Both kinds end up in paths and log lines, so a
+// single rule is easier to remember than two nearly-identical ones.
+func validateID(kind, id string) error {
+	if !idPattern.MatchString(id) {
+		return fmt.Errorf("%s id %q must match [a-z0-9-], without a leading or trailing hyphen", kind, id)
+	}
+	return nil
+}
+
 func validateSourceID(id string) error {
-	if !sourceIDPattern.MatchString(id) {
-		return fmt.Errorf("source id %q must match [a-z0-9-], without a leading or trailing hyphen: it becomes a path component of every item file (ADR-0002)", id)
+	if err := validateID("source", id); err != nil {
+		// A source id carries the extra constraint below, but reporting both at
+		// once would be noise when the id is malformed to begin with.
+		return fmt.Errorf("%w: it becomes a path component of every item file (ADR-0002)", err)
 	}
 	// ADR-0002 names item files `<source-id>--<key>.md`. A doubled hyphen
 	// inside the id would make that split ambiguous, so it is rejected here
-	// rather than producing files nothing can reliably parse back.
+	// rather than producing files nothing can reliably parse back. This applies
+	// to sources only — a sink id never becomes an item filename.
 	if strings.Contains(id, "--") {
 		return fmt.Errorf("source id %q must not contain a doubled hyphen: `--` separates the id from the item key in item filenames (ADR-0002)", id)
 	}
@@ -384,6 +456,54 @@ func validateSource(id string, s Source) []error {
 			want[i] = string(c)
 		}
 		problems = append(problems, fmt.Errorf("source %q: cadence %q must be one of %s", id, s.Cadence, strings.Join(want, ", ")))
+	}
+
+	problems = append(problems, validateEnv(fmt.Sprintf("source %q", id), s.Env)...)
+
+	return problems
+}
+
+func validateSink(id string, s Sink) []error {
+	var problems []error
+
+	// Exactly one of the two. Neither leaves nothing to run; both leaves the
+	// sink layer to pick, and a config that needs a tie-break rule is a config
+	// whose author did not say what they meant.
+	switch {
+	case s.Type == "" && len(s.Command) == 0:
+		problems = append(problems, fmt.Errorf("sink %q: set either type (a built-in sink) or command (an external one)", id))
+	case s.Type != "" && len(s.Command) > 0:
+		problems = append(problems, fmt.Errorf("sink %q: set type or command, not both", id))
+	case len(s.Command) > 0 && s.Command[0] == "":
+		problems = append(problems, fmt.Errorf("sink %q: command's first element must be the program to run, not an empty string", id))
+	}
+
+	problems = append(problems, validateEnv(fmt.Sprintf("sink %q", id), s.Env)...)
+
+	return problems
+}
+
+// validateEnv checks an ADR-0003 §6 allow-list. Every entry must look like a
+// variable name for the same reason aggregator.api_key_env must: the config
+// carries names, and a pasted secret has to fail here rather than becoming a
+// name that never resolves.
+func validateEnv(who string, env []string) []error {
+	var problems []error
+	seen := make(map[string]bool, len(env))
+
+	for i, name := range env {
+		switch {
+		case name == "":
+			problems = append(problems, fmt.Errorf("%s: env[%d] must not be empty", who, i))
+		case !envVarPattern.MatchString(name):
+			// Deliberately does not echo the value — same reasoning as
+			// validateAggregator: it may be the credential itself.
+			problems = append(problems, fmt.Errorf("%s: env[%d] must be an environment variable NAME (upper-case letters, digits and underscores), not a credential", who, i))
+		case seen[name]:
+			problems = append(problems, fmt.Errorf("%s: env lists %s twice", who, name))
+		default:
+			seen[name] = true
+		}
 	}
 
 	return problems
