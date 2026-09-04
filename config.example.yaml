@@ -61,9 +61,32 @@ sources:
   example-site:
     collector: http
     cadence: weekly
+    # Optional: the ONLY environment variables this source's collector receives
+    # (ADR-0003). Names, never values — nothing else is passed through.
+    env:
+      - EXAMPLE_SITE_TOKEN
     params:
       url: https://example.com/updates
 
 # Newsletters and other hand-offs do not appear here. External tools drop files
 # into <data_root>/inbox/ and the next collector run takes them from there
 # (ADR-0002) — the engine never reaches outside its data root for input.
+
+# Where the digest goes. Optional: with no sinks the digest is still written
+# under <data_root>/digests/, which is a complete pipeline if files are all you
+# want. Each key is a sink id, same shape as a source id.
+#
+# Give each sink EITHER `type` (a built-in delivery) OR `command` (an external
+# program run under the ADR-0003 contract) — never both.
+sinks:
+  local-file:
+    type: file
+    params:
+      path: digests/latest.md
+
+  example-script:
+    command: ["/usr/local/bin/notify", "--quiet"]
+    env:
+      - EXAMPLE_NOTIFY_TOKEN
+    params:
+      destination: "your-destination-id"
