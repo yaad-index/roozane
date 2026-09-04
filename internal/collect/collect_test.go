@@ -9,6 +9,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -411,4 +412,78 @@ func source(t *testing.T, paramsYAML string) config.Source {
     params:
       `+paramsYAML+"\n")
 	return cfg.Sources["a-source"]
+}
+
+// TestFeedCollectorAcceptsAFeedLargerThanOneItem is the regression test for the
+// bug this collector shipped with: the raw feed fetch reused the single-item
+// byte budget, so a legitimate full-content feed over that size was truncated
+// mid-XML and failed to parse — zero items, every pass, with no way to raise it.
+// A feed is a whole document holding many entries; only the extracted text of
+// each entry needs the per-item bound.
+func TestFeedCollectorAcceptsAFeedLargerThanOneItem(t *testing.T) {
+	// Each entry is small; the document as a whole clears the per-item cap.
+	entryBody := strings.Repeat("x", 40*1024)
+	entries := (maxItemBytes / len(entryBody)) + 4
+
+	var body strings.Builder
+	body.WriteString(`<?xml version="1.0"?><rss version="2.0"><channel><title>Big</title>`)
+	for i := range entries {
+		body.WriteString(`<item><title>t</title><link>https://example.com/` + strconv.Itoa(i) +
+			`</link><description>` + entryBody + `</description></item>`)
+	}
+	body.WriteString(`</channel></rss>`)
+	require.Greater(t, body.Len(), maxItemBytes,
+		"the fixture has to exceed the per-item cap or it does not exercise the bug")
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = io.WriteString(w, body.String())
+	}))
+	defer srv.Close()
+
+	items, err := (&feedCollector{client: srv.Client()}).Collect(context.Background(), source(t, "url: "+srv.URL))
+	require.NoError(t, err)
+	assert.Len(t, items, entries)
+}
+
+func TestFeedCollectorRejectsAnOversizeFeedClearly(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = io.WriteString(w, strings.Repeat("x", 5000))
+	}))
+	defer srv.Close()
+
+	// A small ceiling drives the overflow path without materialising 16 MiB.
+	_, err := (&feedCollector{client: srv.Client(), maxBytes: 1000}).Collect(context.Background(), source(t, "url: "+srv.URL))
+
+	require.Error(t, err)
+	// A truncated feed fails inside the XML parser with a message that says
+	// nothing about the real cause, so the size has to be named here instead.
+	assert.Contains(t, err.Error(), "larger than the 1000 byte fetch limit")
+	assert.NotContains(t, err.Error(), "parse feed",
+		"the size must be reported as the cause, not as a downstream syntax error")
+}
+
+func TestHTTPCollectorStillTruncatesAnOversizePage(t *testing.T) {
+	// The page path keeps the item cap and the visible truncation marker: a long
+	// page is still worth reading, unlike half a feed.
+	// Comfortably past the item cap, so a fetch that used the far larger feed
+	// ceiling would visibly read more than it should.
+	const served = maxItemBytes * 4
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = io.WriteString(w, strings.Repeat("p", served))
+	}))
+	defer srv.Close()
+
+	items, err := (&httpCollector{client: srv.Client()}).Collect(context.Background(), source(t, "url: "+srv.URL))
+	require.NoError(t, err)
+	require.Len(t, items, 1)
+
+	// The bound has to be applied at READ time, not just by capContent
+	// afterwards: pulling the whole body into memory first is the thing the
+	// limit exists to avoid, and capContent alone cannot tell the two apart.
+	assert.LessOrEqual(t, len(items[0].Content), maxItemBytes+1,
+		"the page fetch must stop at the item cap rather than reading the whole body")
+
+	capped, truncated := capContent(items[0].Content)
+	assert.True(t, truncated, "an oversize page must still reach capContent as oversize")
+	assert.Contains(t, capped, "truncated at the size cap")
 }

@@ -37,7 +37,10 @@ func (c *httpCollector) Collect(ctx context.Context, src config.Source) ([]Colle
 		return nil, errors.New("http source needs params.url")
 	}
 
-	body, err := fetch(ctx, c.client, params.URL)
+	// A page is one item, so the item cap is the right bound here. An oversize
+	// body is kept and truncated downstream with a visible marker rather than
+	// discarded — a long page is still worth reading.
+	body, _, err := fetch(ctx, c.client, params.URL, maxItemBytes)
 	if err != nil {
 		return nil, err
 	}

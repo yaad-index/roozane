@@ -22,9 +22,22 @@ type feedParams struct {
 	MaxItems int `yaml:"max_items"`
 }
 
+// maxFeedBytes bounds a feed document. It is deliberately much larger than the
+// per-item cap: a feed is a whole document holding many entries, and budgeting
+// it as if it were one item truncates a legitimate full-content feed mid-XML, so
+// it fails to parse and the source yields nothing on every single pass. The
+// thing that actually needs bounding per item is the extracted text, which
+// capContent does after parsing.
+const maxFeedBytes = 16 << 20
+
 // feedCollector reads an RSS or Atom feed and returns each entry's text.
 type feedCollector struct {
 	client *http.Client
+
+	// maxBytes is the ceiling for one fetched feed document. Zero means
+	// maxFeedBytes; it is a field so a test can drive the overflow path without
+	// materialising sixteen megabytes.
+	maxBytes int
 }
 
 // Collect fetches and parses the feed. It reports the entries in the order the
@@ -42,9 +55,20 @@ func (c *feedCollector) Collect(ctx context.Context, src config.Source) ([]Colle
 		return nil, fmt.Errorf("feed params.max_items must not be negative, got %d", params.MaxItems)
 	}
 
-	body, err := fetch(ctx, c.client, params.URL)
+	limit := c.maxBytes
+	if limit == 0 {
+		limit = maxFeedBytes
+	}
+
+	body, truncated, err := fetch(ctx, c.client, params.URL, limit)
 	if err != nil {
 		return nil, err
+	}
+	if truncated {
+		// Reporting this plainly beats handing a half-document to the parser:
+		// truncated XML fails with a syntax error that says nothing about the
+		// real cause, and the source would silently yield nothing every pass.
+		return nil, fmt.Errorf("feed %s is larger than the %d byte fetch limit; a truncated feed cannot be parsed", params.URL, limit)
 	}
 
 	parsed, err := gofeed.NewParser().Parse(strings.NewReader(body))
@@ -92,34 +116,39 @@ func entryText(entry *gofeed.Item) string {
 	return strings.TrimSpace(text)
 }
 
-// fetch performs a GET and returns the body as text, bounded by the item cap so
-// a hostile or broken endpoint cannot exhaust memory. The cap is applied at
-// read time rather than after, because reading it all first is the thing being
+// fetch performs a GET and returns the body as text, bounded by limit so a
+// hostile or broken endpoint cannot exhaust memory. The bound is applied at read
+// time rather than after, because reading it all first is the thing being
 // avoided.
-func fetch(ctx context.Context, client *http.Client, url string) (string, error) {
+//
+// It reads one byte past limit and reports whether it got that far, leaving the
+// caller to decide what an oversize body means: a page is truncated with a
+// marker, while a feed document is an error, because half a feed parses to
+// nothing useful.
+func fetch(ctx context.Context, client *http.Client, url string, limit int) (string, bool, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
-		return "", fmt.Errorf("build request for %s: %w", url, err)
+		return "", false, fmt.Errorf("build request for %s: %w", url, err)
 	}
 	req.Header.Set("User-Agent", userAgent)
 
 	resp, err := client.Do(req)
 	if err != nil {
-		return "", fmt.Errorf("fetch %s: %w", url, err)
+		return "", false, fmt.Errorf("fetch %s: %w", url, err)
 	}
 	defer resp.Body.Close() //nolint:errcheck // read-only body; a close error says nothing actionable
 
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return "", fmt.Errorf("fetch %s: unexpected status %s", url, resp.Status)
+		return "", false, fmt.Errorf("fetch %s: unexpected status %s", url, resp.Status)
 	}
 
-	// One byte past the cap, so a body that is exactly at the limit is not
-	// mistaken for a truncated one.
-	body, err := io.ReadAll(io.LimitReader(resp.Body, maxItemBytes+1))
+	// One byte past the limit, so a body that is exactly at it is not mistaken
+	// for an oversize one.
+	body, err := io.ReadAll(io.LimitReader(resp.Body, int64(limit)+1))
 	if err != nil {
-		return "", fmt.Errorf("read %s: %w", url, err)
+		return "", false, fmt.Errorf("read %s: %w", url, err)
 	}
-	return string(body), nil
+	return string(body), len(body) > limit, nil
 }
 
 // userAgent identifies the engine to the sites it reads. A blank or forged
