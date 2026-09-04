@@ -1,6 +1,6 @@
 # ADR-0002: On-disk layout for the layer handoff
 
-**Status:** Proposed
+**Status:** Accepted
 
 ## Context
 
@@ -38,7 +38,10 @@ greppable by a human with no tooling.
    hex chars of SHA-256) of the item's identity** — its URL when it has one,
    otherwise its content — so re-running a collector for the same (source,
    day) rewrites the same filenames instead of appending duplicates: the
-   collector is idempotent by construction, not by convention. The file has
+   collector is idempotent by construction, not by convention. **Item writes
+   are atomic like every other write in this layout: create under a temporary
+   name, `rename(2)` into `items/`** — a re-run must never expose a torn file
+   to a concurrently reading aggregator. The file has
    YAML front-matter followed by the raw extracted text:
 
    ```markdown
@@ -92,7 +95,7 @@ greppable by a human with no tooling.
   days.
 - The explicit empty-digest marker implements the "silence must be
   distinguishable from breakage" principle at the file level.
-- `digest.json` is a second schema to keep stable; sinks depend on it. Its
+- `digests/<day>.json` is a second schema to keep stable; sinks depend on it. Its
   exact schema is fixed when layer 3's first sink is built (issue #8), and it
   versions with a top-level `schema` field from day one.
 - The per-day folder is the natural unit for the future public-newsletter
