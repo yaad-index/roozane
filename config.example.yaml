@@ -79,11 +79,29 @@ sources:
 # Give each sink EITHER `type` (a built-in delivery) OR `command` (an external
 # program run under the ADR-0003 contract) — never both.
 sinks:
+  # Built-in: write the digest to a path. `{day}` is replaced with the digest's
+  # UTC day, so this keeps one file per day; leave it out to overwrite one file.
+  # `format` is markdown (default) or json.
   local-file:
     type: file
     params:
-      path: digests/latest.md
+      path: digests/{day}.md
+      format: markdown
 
+  # Built-in: send the digest as a chat message. `token_env` names the variable
+  # holding the bot token — a reference, never the token itself. A digest longer
+  # than the platform's message limit is split, never truncated.
+  chat:
+    type: telegram
+    params:
+      chat_id: "your-chat-id"
+      token_env: TELEGRAM_BOT_TOKEN
+
+  # External: any program, run under the ADR-0003 contract. It receives
+  # {"contract": 1, "sink": "<id>", "params": {...}, "digest": {...}} on stdin;
+  # its exit code is the delivery result and its stdout is logged. It gets only
+  # PATH, locale and the variables named in `env` — nothing else is passed
+  # through.
   example-script:
     command: ["/usr/local/bin/notify", "--quiet"]
     env:
