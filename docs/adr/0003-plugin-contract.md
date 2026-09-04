@@ -1,6 +1,6 @@
 # ADR-0003: Exec-based plugin contract for collectors and sinks
 
-**Status:** Proposed
+**Status:** Accepted
 
 ## Context
 
