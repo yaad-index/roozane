@@ -1,0 +1,15 @@
+# Keep the build context to what the build actually reads.
+#
+# .git is deliberately NOT excluded: the builder derives a version from
+# `git describe` when no VERSION build-arg is given. The runtime stage copies
+# only the compiled binary, so nothing from here reaches the published image.
+
+# The default data root — collected items, digests and state are an operator's
+# data, never build input.
+/data/
+
+# A local build of the binary; the image builds its own.
+/roozane
+
+# Local operator config. The image takes its config from a mount.
+/roozane.yaml

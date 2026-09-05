@@ -48,3 +48,48 @@ jobs:
         # and the aggregator is the layer most likely to grow concurrency, so the
         # detector is on before there is anything for it to catch.
         run: go test -race ./...
+
+  # The publish workflow only runs on a tag, so without this job the Dockerfile
+  # would go untested until someone is trying to cut a release — the worst
+  # moment to discover it. This builds it on the pull request that changes it.
+  docker:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
+
+      - name: Build the image
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        with:
+          context: .
+          # Native amd64 and no push: this asks whether the Dockerfile is
+          # buildable and the image runnable, not whether it publishes.
+          platforms: linux/amd64
+          load: true
+          push: false
+          tags: roozane:ci
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Smoke-test the built image
+        # Building is not the whole contract. The image is invoked by a
+        # scheduler that names a subcommand and reads an exit code, so the two
+        # things worth proving here are that the entrypoint executes at all and
+        # that running it bare is a usage error rather than a silent success —
+        # an image that builds but cannot run is still broken on release day.
+        run: |
+          got="$(docker run --rm roozane:ci version)"
+          if [ -z "$got" ]; then
+            echo "the built image does not report a version: the entrypoint or the ldflag stamp is broken"
+            exit 1
+          fi
+          echo "built image reports: $got"
+
+          if docker run --rm roozane:ci; then
+            echo "running the image with no subcommand succeeded; it must be a usage error so a scheduler cannot mistake a missing argument for a completed pass"
+            exit 1
+          fi
+          echo "no-subcommand run correctly exits non-zero"
