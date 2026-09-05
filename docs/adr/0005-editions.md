@@ -103,10 +103,16 @@ sinks:
    keeps no ceremony and one audience is the degenerate case of the general
    rule rather than a second code path.
 
-5. **A sink names exactly one edition** (`edition:`, default `default`); many
-   sinks may name the same one, which is how one digest reaches both a chat and
-   a file. An unknown edition fails at config load, unlike a sink `type`,
-   because the edition list is closed and known locally.
+5. **A sink names exactly one of an edition or the report.** `edition: <id>`
+   or `report: true`; **the `default` default applies only when neither is
+   given**, and setting both is a config-load rejection — the same precedent as
+   `Sink.Type` and `Sink.Command`. Without that clause an absent `edition:`
+   would silently give every report-only sink the default edition as well, so
+   the sink would claim one of each. **The two namespaces never collide, but a
+   single sink can still claim one from each, and that is what this rejects.**
+   Many sinks may name the same edition, which is how one digest reaches both a
+   chat and a file. An unknown edition fails at config load, unlike a sink
+   `type`, because the edition list is closed and known locally.
 
 6. **Collection outcomes are persisted for the day, as telemetry only.**
    `days/<day>/collected.json` records, per source, whether it ran, how many
@@ -138,6 +144,11 @@ sinks:
    already records these as `StatusFailed` with the error); per edition, what
    it selected and why each enriched item was not; and **per pass and per
    model, prompt and completion tokens separately, plus wall time.**
+   ⏱️ **Those figures are per RUN, not per day, which is already how spend is
+   counted** — a reused enrichment costs nothing and is not counted. The
+   consequence is worth stating because it reads like a bug: **re-running a day
+   reports near-zero tokens, and that is correct.** Summing the day instead
+   would double-count every re-run.
 
    💶 **Money only if the config supplies prices, and priced per direction.**
    The engine is provider-agnostic by ADR-0001 §3 and cannot know what a model
@@ -146,6 +157,9 @@ sinks:
    `llm.Usage` already splits `PromptTokens` from `CompletionTokens` and every
    real provider charges them differently — a single blended figure would
    misprice every model and throw away data already collected.
+   **The config names the currency and the report prints it verbatim.** An
+   engine that refuses to assume a provider has no business assuming a
+   denomination, and an unlabelled number means whatever the reader guesses.
 
    **Why an item is absent has five answers, and only one is unanswerable:**
 
@@ -187,9 +201,11 @@ sinks:
   every shared item twice and could never express an item belonging to both. A
   reader grepping for the newsletter case must not find the old answer
   unmarked.
-- **Cost stops scaling with audiences.** The expensive per-item call happens
-  once regardless of how many editions exist, so a new edition costs one
-  selection pass over already-enriched items. The first draft of this ADR had
+- **Cost stops scaling with audiences, but does not stop scaling.** The
+  expensive per-item call happens once regardless of how many editions exist;
+  **selection still runs per (item, edition) and is cheaper rather than free**,
+  since it reads an enriched summary instead of the full item. A new edition
+  costs one selection pass, not one enrichment pass. The first draft of this ADR had
   it scale with distinct profiles; this is strictly cheaper and the reason the
   neutral pass was adopted.
 - **A whole failure class disappears rather than being defended against.** With
@@ -197,8 +213,9 @@ sinks:
   digest, and the resume cache needs no profile dimension.
 - **The price is where noise is suppressed.** A neutral pass cannot apply
   taste, so it can only drop obvious junk on generic salience; the real noise
-  ceiling — the 142-of-207 suppression the live deployment performs today —
-  moves into selection, where each edition's profile applies. Selection sees
+  ceiling — 142 of 207 items suppressed on the live deployment's first full run
+  on 2026-09-05, an observation of one corpus on one day rather than a standing
+  property — moves into selection, where each edition's profile applies. Selection sees
   more candidates than judging did, and the enriched summary rather than the
   full item is what it reads.
 - **Two schemas bump: `state.json` (now enrichment, not judgement) and the
