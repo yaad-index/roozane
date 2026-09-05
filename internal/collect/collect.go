@@ -56,8 +56,11 @@ type Collected struct {
 
 // Collector fetches the items currently available from one configured source.
 // Implementations are deliberately thin: fetch, extract text, return.
+//
+// The source id is passed alongside the source because ADR-0003 §2 puts it in
+// the envelope an exec plugin receives. The built-in collectors ignore it.
 type Collector interface {
-	Collect(ctx context.Context, src config.Source) ([]Collected, error)
+	Collect(ctx context.Context, id string, src config.Source) ([]Collected, error)
 }
 
 // Runner performs one collection pass over a configuration.
@@ -105,6 +108,13 @@ func NewRunner(cfg *config.Config, opts ...Option) *Runner {
 	}
 	for _, opt := range opts {
 		opt(r)
+	}
+
+	// Registered after the options because it needs the Runner's logger, which
+	// an option may have replaced — and skipped when a caller supplied its own
+	// exec collector, so WithCollector still wins.
+	if _, ok := r.collectors["exec"]; !ok {
+		r.collectors["exec"] = &execCollector{log: r.log}
 	}
 	return r
 }
@@ -239,7 +249,7 @@ func (r *Runner) collectSource(ctx context.Context, id string, src config.Source
 		return 0, fmt.Errorf("no collector registered for type %q", src.Collector)
 	}
 
-	items, err := collector.Collect(ctx, src)
+	items, err := collector.Collect(ctx, id, src)
 	if err != nil {
 		return 0, fmt.Errorf("collect: %w", err)
 	}

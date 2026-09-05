@@ -364,8 +364,22 @@ func TestDurationRejectsUnusableValues(t *testing.T) {
 
 // TestShippedExampleIsValid keeps config.example.yaml honest: it is the first
 // thing anyone copies, so it has to survive the same loader as a real config.
+//
+// It is loaded from a copy at an explicit mode rather than in place. Git tracks
+// only the executable bit, so a checkout's permissions come from the cloning
+// user's umask — 0644 under the usual 022, 0664 under 002 — and loading the
+// working-tree file directly would make this test pass or fail on the ADR-0003
+// §8 permission check according to whose machine it ran on. The question here
+// is whether the example's CONTENT is valid, so the copy pins the one variable
+// that has nothing to do with that.
 func TestShippedExampleIsValid(t *testing.T) {
-	cfg, err := Load(filepath.Join("..", "..", "config.example.yaml"))
+	example, err := os.ReadFile(filepath.Join("..", "..", "config.example.yaml"))
+	require.NoError(t, err)
+
+	path := filepath.Join(t.TempDir(), "config.example.yaml")
+	require.NoError(t, os.WriteFile(path, example, 0o600))
+
+	cfg, err := Load(path)
 	require.NoError(t, err)
 
 	assert.NotEmpty(t, cfg.Sources)
@@ -657,4 +671,30 @@ func TestRetentionRuleIgnoresAnUnknownCadence(t *testing.T) {
 	assert.Contains(t, msg, "cadence")
 	assert.NotContains(t, msg, "retention.items is 1 days",
 		"an unknown cadence has no length, so the retention rule must stay silent about it")
+}
+
+func TestExecSourceRequiresACommand(t *testing.T) {
+	// Vacuity guard: the same source WITH a command loads cleanly, so the
+	// failure below is about the missing command and not the fixture.
+	_, err := Load(write(t, sourceConfig("collector: exec\n    cadence: daily\n    command: [/bin/true]")))
+	require.NoError(t, err)
+
+	_, err = Load(write(t, sourceConfig("collector: exec\n    cadence: daily")))
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "requires a command")
+}
+
+// TestCommandOnANonExecCollectorIsRejected — a command that would be silently
+// ignored is worse than being told about it.
+func TestCommandOnANonExecCollectorIsRejected(t *testing.T) {
+	_, err := Load(write(t, sourceConfig("collector: http\n    cadence: daily\n    command: [/bin/true]\n    params:\n      url: https://example.com/")))
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "only meaningful for the \"exec\" collector")
+}
+
+func TestExecIsAKnownCollector(t *testing.T) {
+	cfg, err := Load(write(t, sourceConfig("collector: exec\n    cadence: daily\n    command: [/bin/true]")))
+	require.NoError(t, err)
+	assert.Equal(t, "exec", cfg.Sources["example-feed"].Collector)
+	assert.Equal(t, []string{"/bin/true"}, cfg.Sources["example-feed"].Command)
 }
