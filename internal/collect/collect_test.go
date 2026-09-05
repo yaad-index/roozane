@@ -487,3 +487,124 @@ func TestHTTPCollectorStillTruncatesAnOversizePage(t *testing.T) {
 	assert.True(t, truncated, "an oversize page must still reach capContent as oversize")
 	assert.Contains(t, capped, "truncated at the size cap")
 }
+
+// runPass performs one collection pass at the given instant. Passing the same
+// cfg and stub across calls is what lets a test watch the cadence decide, since
+// the data root persists between passes and the stub keeps counting its calls.
+func runPass(t *testing.T, cfg *config.Config, now time.Time, stub *stubCollector) Result {
+	t.Helper()
+	return NewRunner(cfg,
+		WithClock(func() time.Time { return now }),
+		WithCollector("feed", stub),
+		WithLogger(quietLogger()),
+	).Run(context.Background())
+}
+
+// TestEmptyRunIsNotRefetchedUntilTheCadenceElapses is the behaviour #18
+// reported and ADR-0004 decides, asserted the way an observer of the cadence
+// sees it: whether the source is fetched again, not whether a file appeared.
+func TestEmptyRunIsNotRefetchedUntilTheCadenceElapses(t *testing.T) {
+	root := t.TempDir()
+	cfg := testConfig(t, root, "  a-source: {collector: feed, cadence: weekly}\n")
+	day0 := at(t, "2026-09-04T06:30:00Z")
+
+	// The fetch succeeds and legitimately finds nothing.
+	stub := &stubCollector{items: nil}
+	first := runPass(t, cfg, day0, stub)
+
+	// Vacuity guard: the rest of this test means nothing unless the first pass
+	// really was a *successful* fetch that wrote no items.
+	require.Len(t, first.Sources, 1)
+	require.False(t, first.Sources[0].Skipped, "the source must have been due on the first pass")
+	require.NoError(t, first.Sources[0].Err, "the fixture must model a successful fetch, not a failure")
+	require.Zero(t, first.Sources[0].Written, "the fixture must model a zero-item run")
+	require.Equal(t, 1, stub.calls, "the collector must actually have been called")
+
+	// Every day inside the weekly cadence: not due, and not fetched.
+	for back := 1; back <= 6; back++ {
+		day := day0.AddDate(0, 0, back)
+		result := runPass(t, cfg, day, stub)
+
+		require.Len(t, result.Sources, 1)
+		assert.True(t, result.Sources[0].Skipped,
+			"a source that ran and found nothing must stay not-due within its cadence (day +%d)", back)
+		assert.Equal(t, 1, stub.calls,
+			"the source must not be re-fetched inside its cadence (day +%d)", back)
+	}
+
+	// And the cadence still fires when it elapses — the marker delays the next
+	// fetch, it does not cancel it.
+	result := runPass(t, cfg, day0.AddDate(0, 0, 7), stub)
+	require.Len(t, result.Sources, 1)
+	assert.False(t, result.Sources[0].Skipped, "the source must become due again once the cadence elapses")
+	assert.Equal(t, 2, stub.calls)
+}
+
+// TestFailedRunIsRetriedOnTheNextPass is the other half of the decision: a
+// failure must NOT leave a marker, so its absence keeps meaning "not due yet,
+// or broken" and the source is retried rather than written off as empty.
+func TestFailedRunIsRetriedOnTheNextPass(t *testing.T) {
+	root := t.TempDir()
+	cfg := testConfig(t, root, "  a-source: {collector: feed, cadence: weekly}\n")
+	day0 := at(t, "2026-09-04T06:30:00Z")
+
+	failing := &stubCollector{err: errors.New("feed is down")}
+	first := runPass(t, cfg, day0, failing)
+
+	// Vacuity guard: the fixture must model a failure that wrote nothing.
+	require.Len(t, first.Sources, 1)
+	require.Error(t, first.Sources[0].Err, "the fixture must model a failed fetch")
+	require.Zero(t, first.Sources[0].Written)
+	require.Equal(t, 1, failing.calls)
+
+	// No marker may exist for it.
+	_, err := os.Stat(filepath.Join(store.New(root).RanDir(day0), "a-source"))
+	assert.True(t, os.IsNotExist(err), "a failed fetch must leave no marker")
+
+	// So the very next pass tries again, well inside the weekly cadence.
+	second := runPass(t, cfg, day0.AddDate(0, 0, 1), failing)
+	require.Len(t, second.Sources, 1)
+	assert.False(t, second.Sources[0].Skipped, "a failed source must be retried, not treated as empty")
+	assert.Equal(t, 2, failing.calls)
+}
+
+// TestEmptyRunMarksOnlyTheSourceThatRan keeps the marker from becoming a
+// blanket "the pass happened" flag.
+func TestEmptyRunMarksOnlyTheSourceThatRan(t *testing.T) {
+	root := t.TempDir()
+	cfg := testConfig(t, root,
+		"  a-source: {collector: feed, cadence: weekly}\n  b-source: {collector: feed, cadence: weekly}\n")
+	day0 := at(t, "2026-09-04T06:30:00Z")
+
+	// Both sources share one collector here, so both run and both find nothing.
+	stub := &stubCollector{items: nil}
+	require.Len(t, runPass(t, cfg, day0, stub).Sources, 2)
+
+	ran := store.New(root).RanDir(day0)
+	for _, id := range []string{"a-source", "b-source"} {
+		_, err := os.Stat(filepath.Join(ran, id))
+		assert.NoError(t, err, "each source that ran empty gets its own marker: %s", id)
+	}
+
+	entries, err := os.ReadDir(ran)
+	require.NoError(t, err)
+	assert.Len(t, entries, 2, "no marker may be written for a source that did not run")
+}
+
+// TestSuccessfulRunWithItemsWritesNoMarker — the items themselves prove the
+// run, so a marker beside them would be redundant state to keep true.
+func TestSuccessfulRunWithItemsWritesNoMarker(t *testing.T) {
+	root := t.TempDir()
+	cfg := testConfig(t, root, "  a-source: {collector: feed, cadence: weekly}\n")
+	day0 := at(t, "2026-09-04T06:30:00Z")
+
+	stub := &stubCollector{items: []Collected{{URL: "https://example.com/a", Content: "body"}}}
+	result := runPass(t, cfg, day0, stub)
+
+	require.Len(t, result.Sources, 1)
+	require.NoError(t, result.Sources[0].Err)
+	require.Equal(t, 1, result.Sources[0].Written, "vacuity guard: this pass must have written an item")
+
+	_, err := os.Stat(store.New(root).RanDir(day0))
+	assert.True(t, os.IsNotExist(err), "a run that produced items needs no marker directory at all")
+}
