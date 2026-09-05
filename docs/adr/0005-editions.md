@@ -35,8 +35,7 @@ copy of each item on disk — and editions are views over that pool.
 ```yaml
 editions:
   personal:                      # the private brief
-    sources: [all]
-    profile: /etc/roozane/profile.md
+    profile: /etc/roozane/profile.md   # no `sources:` = the whole pool
   boardgames:                    # the public newsletter
     sources: [bgg-blog, bgg-hotness, dicebreaker]
     profile: /etc/roozane/boardgames.md
@@ -68,6 +67,17 @@ sinks:
    deduplicates across editions, because a shared item is not an accident to be
    collapsed — it is the requirement.
 
+   🚨 **This requires changing the judging cache, and it is a correctness
+   requirement rather than an optimisation.** `state.json` currently keys a
+   recorded judgement on the item filename alone (`state.Items[<filename>]`),
+   so under editions the second profile would silently reuse the first
+   profile's verdict — **a private profile's reasoning could be served verbatim
+   into a public digest.** The key becomes (item filename, profile identity),
+   where profile identity is a **hash of the profile's CONTENT**, so editing a
+   profile invalidates its cached judgements instead of pinning stale ones.
+   This is a `state.json` schema change and is listed in the migration notes
+   below alongside the digest path.
+
 3. **Editions each get a digest directory: `digests/<edition-id>/<day>.{md,json}`.**
    Edition ids take the same `[a-z0-9-]` constraint as source ids, for the same
    reason: they become path components.
@@ -84,8 +94,16 @@ sinks:
    sink `type`, because the edition list is closed and known locally.
 
 6. **An edition that selects nothing, or whose items all fall below the bar,
-   writes an empty digest** exactly as today (ADR-0002 §4). Silence and
-   breakage stay distinguishable per edition, not merely per run.
+   writes an empty digest** exactly as today (ADR-0002 §4), so a quiet edition
+   still proves it ran.
+   ⚠️ **Narrowing makes an empty digest weaker evidence than it was, and the
+   ADR does not fix that.** A whole-pool digest went empty only if the whole
+   day was quiet; an edition drawing on two sources goes empty the moment those
+   two fail upstream, and the digest looks identical either way. ADR-0004's
+   `ran/` markers still record which sources actually ran, so the information
+   exists on disk — it is simply no longer visible in the digest a reader sees.
+   Surfacing it (a per-edition note when a selected source produced nothing) is
+   left to the feedback work rather than smuggled in here.
 
 ## Consequences
 
@@ -102,7 +120,15 @@ sinks:
   one-time break, taken deliberately rather than special-casing the default
   edition into the old path, because a layout with one rule stays greppable and
   a layout with an exception does not. Files already written are left where
-  they are; retention prunes both shapes.
+  they are.
+- **Two pieces of retention and resume must be taught the new shape, and each
+  fails SILENTLY until it is.** `pruneDigests` skips directory entries outright
+  (`if e.IsDir() { continue }`), so the moment digests move into
+  `digests/<edition>/` a configured `retention.digests` quietly becomes
+  keep-forever — no error, just unbounded growth. And the `state.json` key
+  change above must ship with the edition work, not after it, since the failure
+  there is a wrong digest rather than a full disk. **Neither is a follow-up;
+  both are part of the change that moves the paths.**
 - Sinks get simpler to reason about, not harder: a sink is now "this edition,
   delivered there", and the question "which items does this sink send" is
   answered by the edition it names rather than by reading its params.
