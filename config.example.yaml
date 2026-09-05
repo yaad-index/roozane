@@ -16,9 +16,15 @@ data_root: data
 # input on every run. Default: profile.md
 relevance_profile: profile.md
 
-# Two independent windows, both counted in UTC days (ADR-0002).
+# Two independent windows, both counted in UTC days (ADR-0002). Each collection
+# pass enforces them before it collects. A window of N keeps the newest N days:
+# `items: 1` keeps today alone.
 retention:
   # Prunes day folders under days/. Default: 90
+  #
+  # Must be at least as long as the longest cadence below, or a source's items
+  # would be pruned before it is due again and it would be re-fetched on every
+  # pass. Config validation rejects a shorter window.
   items: 90
   # Prunes the digests/ tree. 0 keeps them forever, which is the default:
   # digests are small and are the record worth keeping.

@@ -608,3 +608,136 @@ func TestSuccessfulRunWithItemsWritesNoMarker(t *testing.T) {
 	_, err := os.Stat(store.New(root).RanDir(day0))
 	assert.True(t, os.IsNotExist(err), "a run that produced items needs no marker directory at all")
 }
+
+// testConfigRetention builds a config with an explicit item-retention window and
+// a single source on the given cadence.
+func testConfigRetention(t *testing.T, dataRoot string, items int, cadence config.Cadence) *config.Config {
+	t.Helper()
+
+	dir := t.TempDir()
+	path := filepath.Join(dir, "roozane.yaml")
+	body := "data_root: " + dataRoot + `
+relevance_profile: profile.md
+retention:
+  items: ` + strconv.Itoa(items) + `
+  digests: 0
+aggregator:
+  base_url: https://api.example.com/v1
+  api_key_env: ROOZANE_API_KEY
+  models: {item: small, digest: large}
+sources:
+  a-source: {collector: feed, cadence: ` + string(cadence) + "}\n"
+
+	require.NoError(t, os.WriteFile(path, []byte(body), 0o600))
+
+	cfg, err := config.Load(path)
+	require.NoError(t, err, "a window equal to the cadence must pass validation")
+	return cfg
+}
+
+// TestPruningCutoffMatchesTheValidationBoundary is the test the two mechanisms
+// are pinned to each other by. Config validation accepts retention.items equal
+// to the longest cadence on the argument that only the days strictly inside the
+// cadence period can change a due-ness answer; pruning has to keep exactly
+// those days for that argument to hold.
+//
+// It composes both sides rather than asserting either in isolation: the window
+// is taken from Cadence.Days() — the same quantity validation compares against
+// — the config must load, and the pass must then decide "not due" against a
+// layout it has just pruned. Move the pruning cutoff a day either way, or
+// loosen the validation, and this fails.
+func TestPruningCutoffMatchesTheValidationBoundary(t *testing.T) {
+	for _, cadence := range []config.Cadence{config.CadenceDaily, config.CadenceWeekly, config.CadenceMonthly} {
+		period, ok := cadence.Days()
+		require.True(t, ok, "vacuity guard: %q must be a known cadence", cadence)
+
+		t.Run(string(cadence), func(t *testing.T) {
+			root := t.TempDir()
+			now := at(t, "2026-09-30T06:30:00Z")
+
+			// The smallest window validation accepts for this cadence.
+			cfg := testConfigRetention(t, root, period, cadence)
+
+			// The oldest run that must still be readable: one day inside the
+			// period. A run older than this makes the source due anyway, so
+			// this is the only age where losing the evidence changes anything.
+			lastRun := now.AddDate(0, 0, -(period - 1))
+			_, err := store.New(root).WriteItem(store.Item{
+				Source: "a-source", URL: "https://example.com/seed",
+				FetchedAt: lastRun, Collector: "feed", Content: "seed",
+			})
+			require.NoError(t, err)
+
+			stub := &stubCollector{items: []Collected{{URL: "https://example.com/new", Content: "new"}}}
+			result := runPass(t, cfg, now, stub)
+
+			// The pass pruned before it decided, and the deciding day survived.
+			require.NoError(t, result.PruneErr)
+			assert.DirExists(t, store.New(root).ItemsDir(lastRun),
+				"the window must keep the oldest day that can still change the answer")
+
+			require.Len(t, result.Sources, 1)
+			assert.True(t, result.Sources[0].Skipped,
+				"a source last run inside its cadence must not be due after the prune")
+			assert.Zero(t, stub.calls, "and must not be fetched")
+		})
+	}
+}
+
+// TestPruningRemovesTheDayOneStepPastTheBoundary is the other side of the same
+// pin: at exactly the cadence period the day is pruned, and the source is due —
+// which is the correct answer, and shows the cutoff sits where the comment says.
+func TestPruningRemovesTheDayOneStepPastTheBoundary(t *testing.T) {
+	cadence := config.CadenceWeekly
+	period, ok := cadence.Days()
+	require.True(t, ok)
+
+	root := t.TempDir()
+	now := at(t, "2026-09-30T06:30:00Z")
+	cfg := testConfigRetention(t, root, period, cadence)
+
+	lastRun := now.AddDate(0, 0, -period)
+	_, err := store.New(root).WriteItem(store.Item{
+		Source: "a-source", URL: "https://example.com/seed",
+		FetchedAt: lastRun, Collector: "feed", Content: "seed",
+	})
+	require.NoError(t, err)
+
+	stub := &stubCollector{items: []Collected{{URL: "https://example.com/new", Content: "new"}}}
+	result := runPass(t, cfg, now, stub)
+
+	require.NoError(t, result.PruneErr)
+	assert.NoDirExists(t, store.New(root).ItemsDir(lastRun),
+		"a day at exactly the window's age is past it")
+
+	require.Len(t, result.Sources, 1)
+	assert.False(t, result.Sources[0].Skipped,
+		"a source whose cadence has elapsed is due — pruned evidence or not, the answer is the same")
+	assert.Equal(t, 1, stub.calls)
+}
+
+// TestCollectPassPrunesAndStillCollects — retention failing to run would be bad,
+// but retention stopping the collection would be worse.
+func TestCollectPassPrunesAndStillCollects(t *testing.T) {
+	root := t.TempDir()
+	now := at(t, "2026-09-30T06:30:00Z")
+	cfg := testConfigRetention(t, root, 7, config.CadenceDaily)
+
+	s := store.New(root)
+	_, err := s.WriteItem(store.Item{
+		Source: "a-source", URL: "https://example.com/old",
+		FetchedAt: now.AddDate(0, 0, -20), Collector: "feed", Content: "old",
+	})
+	require.NoError(t, err)
+
+	stub := &stubCollector{items: []Collected{{URL: "https://example.com/new", Content: "new"}}}
+	result := runPass(t, cfg, now, stub)
+
+	require.NoError(t, result.PruneErr)
+	assert.Equal(t, 1, result.Pruned.Days, "the stale day is gone")
+	assert.NoDirExists(t, s.DayDir(now.AddDate(0, 0, -20)))
+
+	require.Len(t, result.Sources, 1)
+	require.NoError(t, result.Sources[0].Err)
+	assert.Equal(t, 1, result.Sources[0].Written, "and the pass still collected")
+}

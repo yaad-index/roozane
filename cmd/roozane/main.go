@@ -98,6 +98,13 @@ func runCollect(args []string, stdout, stderr io.Writer) int {
 
 	// The summary goes to stdout so it can be piped, while the log goes to
 	// stderr — a cron job can keep one and discard the other.
+	if result.Pruned.Days > 0 || result.Pruned.Digests > 0 {
+		_, _ = fmt.Fprintf(stdout, "retention: %d days, %d digest files removed\n",
+			result.Pruned.Days, result.Pruned.Digests)
+	}
+	if result.PruneErr != nil {
+		_, _ = fmt.Fprintf(stdout, "retention: FAILED: %v\n", result.PruneErr)
+	}
 	if result.InboxDrained > 0 {
 		_, _ = fmt.Fprintf(stdout, "inbox: %d drained\n", result.InboxDrained)
 	}
