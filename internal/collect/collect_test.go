@@ -64,7 +64,7 @@ type stubCollector struct {
 	calls int
 }
 
-func (s *stubCollector) Collect(context.Context, config.Source) ([]Collected, error) {
+func (s *stubCollector) Collect(context.Context, string, config.Source) ([]Collected, error) {
 	s.calls++
 	if s.err != nil {
 		return nil, s.err
@@ -278,7 +278,7 @@ func TestFeedCollector(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	items, err := (&feedCollector{client: srv.Client()}).Collect(context.Background(), source(t, "url: "+srv.URL))
+	items, err := (&feedCollector{client: srv.Client()}).Collect(context.Background(), "a-source", source(t, "url: "+srv.URL))
 	require.NoError(t, err)
 	require.Len(t, items, 2)
 
@@ -310,7 +310,7 @@ func TestFeedCollectorParsesAtom(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	items, err := (&feedCollector{client: srv.Client()}).Collect(context.Background(), source(t, "url: "+srv.URL))
+	items, err := (&feedCollector{client: srv.Client()}).Collect(context.Background(), "a-source", source(t, "url: "+srv.URL))
 	require.NoError(t, err)
 	require.Len(t, items, 1)
 	assert.Equal(t, "https://example.com/entry", items[0].URL)
@@ -333,24 +333,24 @@ func TestFeedCollectorMaxItems(t *testing.T) {
 
 	c := &feedCollector{client: srv.Client()}
 
-	items, err := c.Collect(context.Background(), source(t, "url: "+srv.URL+"\n      max_items: 2"))
+	items, err := c.Collect(context.Background(), "a-source", source(t, "url: "+srv.URL+"\n      max_items: 2"))
 	require.NoError(t, err)
 	assert.Len(t, items, 2, "a first run against a long archive must not write the whole thing")
 
-	items, err = c.Collect(context.Background(), source(t, "url: "+srv.URL))
+	items, err = c.Collect(context.Background(), "a-source", source(t, "url: "+srv.URL))
 	require.NoError(t, err)
 	assert.Len(t, items, 5, "no max_items means no limit")
 }
 
 func TestFeedCollectorErrors(t *testing.T) {
 	t.Run("missing url", func(t *testing.T) {
-		_, err := (&feedCollector{client: http.DefaultClient}).Collect(context.Background(), config.Source{})
+		_, err := (&feedCollector{client: http.DefaultClient}).Collect(context.Background(), "a-source", config.Source{})
 		require.Error(t, err)
 		assert.Contains(t, err.Error(), "params.url")
 	})
 
 	t.Run("negative max_items", func(t *testing.T) {
-		_, err := (&feedCollector{client: http.DefaultClient}).Collect(context.Background(),
+		_, err := (&feedCollector{client: http.DefaultClient}).Collect(context.Background(), "a-source",
 			source(t, "url: https://example.com/f\n      max_items: -1"))
 		require.Error(t, err)
 		assert.Contains(t, err.Error(), "max_items")
@@ -362,7 +362,7 @@ func TestFeedCollectorErrors(t *testing.T) {
 		}))
 		defer srv.Close()
 
-		_, err := (&feedCollector{client: srv.Client()}).Collect(context.Background(), source(t, "url: "+srv.URL))
+		_, err := (&feedCollector{client: srv.Client()}).Collect(context.Background(), "a-source", source(t, "url: "+srv.URL))
 		require.Error(t, err)
 		assert.Contains(t, err.Error(), "404")
 	})
@@ -373,7 +373,7 @@ func TestFeedCollectorErrors(t *testing.T) {
 		}))
 		defer srv.Close()
 
-		_, err := (&feedCollector{client: srv.Client()}).Collect(context.Background(), source(t, "url: "+srv.URL))
+		_, err := (&feedCollector{client: srv.Client()}).Collect(context.Background(), "a-source", source(t, "url: "+srv.URL))
 		require.Error(t, err)
 		assert.Contains(t, err.Error(), "parse feed")
 	})
@@ -385,7 +385,7 @@ func TestHTTPCollector(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	items, err := (&httpCollector{client: srv.Client()}).Collect(context.Background(), source(t, "url: "+srv.URL))
+	items, err := (&httpCollector{client: srv.Client()}).Collect(context.Background(), "a-source", source(t, "url: "+srv.URL))
 	require.NoError(t, err)
 	require.Len(t, items, 1)
 
@@ -396,7 +396,7 @@ func TestHTTPCollector(t *testing.T) {
 }
 
 func TestHTTPCollectorNeedsAURL(t *testing.T) {
-	_, err := (&httpCollector{client: http.DefaultClient}).Collect(context.Background(), config.Source{})
+	_, err := (&httpCollector{client: http.DefaultClient}).Collect(context.Background(), "a-source", config.Source{})
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "params.url")
 }
@@ -440,7 +440,7 @@ func TestFeedCollectorAcceptsAFeedLargerThanOneItem(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	items, err := (&feedCollector{client: srv.Client()}).Collect(context.Background(), source(t, "url: "+srv.URL))
+	items, err := (&feedCollector{client: srv.Client()}).Collect(context.Background(), "a-source", source(t, "url: "+srv.URL))
 	require.NoError(t, err)
 	assert.Len(t, items, entries)
 }
@@ -452,7 +452,7 @@ func TestFeedCollectorRejectsAnOversizeFeedClearly(t *testing.T) {
 	defer srv.Close()
 
 	// A small ceiling drives the overflow path without materialising 16 MiB.
-	_, err := (&feedCollector{client: srv.Client(), maxBytes: 1000}).Collect(context.Background(), source(t, "url: "+srv.URL))
+	_, err := (&feedCollector{client: srv.Client(), maxBytes: 1000}).Collect(context.Background(), "a-source", source(t, "url: "+srv.URL))
 
 	require.Error(t, err)
 	// A truncated feed fails inside the XML parser with a message that says
@@ -473,7 +473,7 @@ func TestHTTPCollectorStillTruncatesAnOversizePage(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	items, err := (&httpCollector{client: srv.Client()}).Collect(context.Background(), source(t, "url: "+srv.URL))
+	items, err := (&httpCollector{client: srv.Client()}).Collect(context.Background(), "a-source", source(t, "url: "+srv.URL))
 	require.NoError(t, err)
 	require.Len(t, items, 1)
 

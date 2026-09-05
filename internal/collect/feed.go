@@ -43,7 +43,7 @@ type feedCollector struct {
 // Collect fetches and parses the feed. It reports the entries in the order the
 // feed lists them, unmodified: choosing which of them matter is the
 // aggregator's job, not this layer's.
-func (c *feedCollector) Collect(ctx context.Context, src config.Source) ([]Collected, error) {
+func (c *feedCollector) Collect(ctx context.Context, _ string, src config.Source) ([]Collected, error) {
 	var params feedParams
 	if err := src.DecodeParams(&params); err != nil {
 		return nil, fmt.Errorf("feed params: %w", err)

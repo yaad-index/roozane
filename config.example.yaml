@@ -74,6 +74,30 @@ sources:
     params:
       url: https://example.com/updates
 
+  # An exec source runs a program of your own as the collector (ADR-0003). The
+  # engine sends it {"contract":1,"source":"<id>","params":{…}} on stdin; the
+  # program writes one JSON object per line to stdout:
+  #
+  #   {"url":"…","title":"…","source_time":"2026-09-05T06:30:00Z","content":"…"}
+  #
+  # Only `content` is required. The engine stamps the collection time itself, so
+  # `source_time` is kept as provenance and never decides which day the item
+  # files under. Exit 0 means success; anything else marks the run failed and
+  # stderr is captured. A malformed line is skipped, not fatal.
+  #
+  # The program runs with this engine's privileges — the config is the trust
+  # boundary — so the engine refuses to start if the config file or any program
+  # named here is writable by other users. Keep both at go-w.
+  #
+  # example-plugin:
+  #   collector: exec
+  #   cadence: daily
+  #   command: [/usr/local/lib/roozane/example-collector]
+  #   env:
+  #     - EXAMPLE_PLUGIN_TOKEN
+  #   params:
+  #     list: hot
+
 # Newsletters and other hand-offs do not appear here. External tools drop files
 # into <data_root>/inbox/ and the next collector run takes them from there
 # (ADR-0002) — the engine never reaches outside its data root for input.

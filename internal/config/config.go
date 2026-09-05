@@ -104,6 +104,11 @@ type Source struct {
 	Collector string  `yaml:"collector"`
 	Cadence   Cadence `yaml:"cadence"`
 
+	// Command is an exec-based collector: the program and its arguments,
+	// invoked under the ADR-0003 contract. Required by, and only meaningful
+	// to, the `exec` collector.
+	Command []string `yaml:"command"`
+
 	// Env is the allow-list of environment variables this entry's collector
 	// receives (ADR-0003 §6). It names variables; it never carries values.
 	Env []string `yaml:"env"`
@@ -228,7 +233,11 @@ func (d Duration) Duration() time.Duration { return time.Duration(d) }
 // is rejected rather than passed through: an unknown type here is far more
 // likely to be a typo than a plugin, and the exec-plugin contract that would
 // legitimately widen this set is still a later ADR.
-var builtinCollectors = []string{"feed", "http"}
+// collectorExec is the ADR-0003 exec collector type: a configured executable
+// speaking the plugin contract rather than a built-in fetcher.
+const collectorExec = "exec"
+
+var builtinCollectors = []string{"feed", "http", collectorExec}
 
 // Defaults applied when a field is absent. They are the values that make an
 // otherwise-minimal config runnable, not policy.
@@ -270,6 +279,13 @@ func Load(path string) (*Config, error) {
 
 	if err := cfg.Validate(); err != nil {
 		return nil, fmt.Errorf("%s: %w", path, err)
+	}
+
+	// ADR-0003 §8 makes this a refusal to run, not a warning, and Load is the
+	// one startup path every command goes through — so the check lives here
+	// rather than in each of them, where one could be forgotten.
+	if err := cfg.CheckPermissions(path); err != nil {
+		return nil, err
 	}
 	return cfg, nil
 }
@@ -524,6 +540,15 @@ func validateSource(id string, s Source) []error {
 			want[i] = string(c)
 		}
 		problems = append(problems, fmt.Errorf("source %q: cadence %q must be one of %s", id, s.Cadence, strings.Join(want, ", ")))
+	}
+
+	// An exec source is defined by its command, and a command on any other
+	// collector would be silently ignored — which is worse than being told.
+	if s.Collector == collectorExec && len(s.Command) == 0 {
+		problems = append(problems, fmt.Errorf("source %q: collector %q requires a command", id, collectorExec))
+	}
+	if s.Collector != collectorExec && len(s.Command) > 0 {
+		problems = append(problems, fmt.Errorf("source %q: command is only meaningful for the %q collector, but this source uses %q", id, collectorExec, s.Collector))
 	}
 
 	problems = append(problems, validateEnv(fmt.Sprintf("source %q", id), s.Env)...)
