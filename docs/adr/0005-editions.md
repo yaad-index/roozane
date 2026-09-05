@@ -50,8 +50,9 @@ copy of each item on disk.
 ```
 collect ──▶ days/<day>/items/*.md          # unchanged, audience-agnostic
 enrich  ──▶ days/<day>/state.json          # summary, tags, category, salience
-select  ──▶ digests/<edition>/<day>.{md,json}
-deliver ──▶ each sink, for the edition it names
+select  ──▶ digests/<edition>/<day>.{md,json}   # once per edition
+report  ──▶ reports/<day>.{md,json}            # after every edition
+deliver ──▶ each sink, for the edition or the report it names
 ```
 
 ```yaml
@@ -66,6 +67,7 @@ sinks:
   morning:    {edition: personal,   type: telegram, params: {chat_id: "…"}}
   archive:    {edition: personal,   type: file,     params: {path: "…/{day}.md"}}
   newsletter: {edition: boardgames, command: [/usr/local/lib/roozane-plugins/mailer]}
+  telemetry:  {report: true,        type: file,     params: {path: "…/report-{day}.md"}}
 ```
 
 1. **ENRICH runs once per item, ever, and knows nothing about any audience.**
@@ -120,41 +122,61 @@ sinks:
    silently changes meaning. The invariant is stated here because the file
    looks useful to `due()` and the damage would be invisible.
 
-7. **Each day gets a report, and it is delivered like anything else: the
-   engine writes it as the reserved edition `report`, which any sink may
-   name.** It states, per source, what ran and what it yielded or how it
-   failed; per item, its tags, category and salience; per edition, which items
-   it selected and the reason each enriched item was not selected — below the
-   bar, or outside this edition's sources; and **per pass and per model, the
-   tokens spent and the wall time taken.**
-   🔑 **The report is an edition rather than a sink type, and the difference is
-   the layer law.** ADR-0001 makes sinks dumb: content is decided upstream,
-   delivery is all a sink does. A "feedback sink" that assembled its own report
-   would put generation in the delivery layer and would have to be reimplemented
-   in every sink that wanted it. As an edition it is generated once and can be
-   filed, messaged or mailed by whichever sink names it — the same freedom every
-   other audience has.
-   💶 **Tokens and durations are reported; money only if the config supplies
-   prices.** The engine is provider-agnostic by ADR-0001 §3 and therefore cannot
-   know what any model charges; a hardcoded price table would be both wrong and
-   a de facto endorsement. An optional per-model price per million tokens in the
-   config turns the token counts into a cost line, and its absence simply omits
-   that line.
-   🔑 **"Why is this news not here" has three answers and the engine can only
-   give two.** Collected but scored low, and collected but not selected by this
-   edition, are both recoverable. **No source covers it at all is invisible by
-   construction** — the item never entered the pipeline, and no amount of
-   reporting can describe what was never fetched. The report therefore prints
-   per-source yield so the gap is legible and the reader draws that conclusion
-   themselves. **Claiming the report explains every absence would make it
-   misleading in precisely the case it is most wanted for.**
+7. **Each day gets a report at `reports/<day>.{md,json}`, and a sink may name
+   it exactly as it names an edition** (`edition: personal` or `report:
+   true`). 🔑 **The report is NOT an edition, and forcing it into one was
+   wrong.** It has no sources and no profile, it selects nothing by
+   construction, and it must run *after* every edition because it describes
+   their outcomes — so every rule editions carry would need an exception for
+   it. **What actually needed widening is what a sink may be pointed at, not
+   what an edition is.** That keeps ADR-0001's dumb-sink law intact — the
+   engine still generates, the sink still only delivers — without bending
+   edition semantics around a document that is not an audience.
+
+   It states, per source, what ran and what it yielded or how it failed; per
+   item, its tags, category, salience, and enrichment failures (`state.json`
+   already records these as `StatusFailed` with the error); per edition, what
+   it selected and why each enriched item was not; and **per pass and per
+   model, prompt and completion tokens separately, plus wall time.**
+
+   💶 **Money only if the config supplies prices, and priced per direction.**
+   The engine is provider-agnostic by ADR-0001 §3 and cannot know what a model
+   charges; a hardcoded table would be wrong and a de facto endorsement. Prices
+   are configured **per model as separate input and output rates**, because
+   `llm.Usage` already splits `PromptTokens` from `CompletionTokens` and every
+   real provider charges them differently — a single blended figure would
+   misprice every model and throw away data already collected.
+
+   **Why an item is absent has five answers, and only one is unanswerable:**
+
+   | Why | Recoverable? |
+   |---|---|
+   | No source covers the topic at all | **No — invisible by construction** |
+   | A source that covers it failed today | Yes, from §6's outcomes |
+   | Collected, but enrichment failed | Yes, `StatusFailed` in `state.json` |
+   | Enriched, below the generic salience floor | Yes |
+   | Enriched, not selected by this edition | Yes, with which reason |
+
+   Only the first is invisible: the item never entered the pipeline and no
+   reporting can describe what was never fetched. The report surfaces
+   per-source yield so that gap is legible and the reader draws the conclusion.
+   ⚠️ **An earlier draft folded the second row into the first and so claimed a
+   failed covering source was unanswerable — which is exactly what §6 exists to
+   fix.** Persisting outcomes is pointless if the report then files that case
+   under "invisible".
 
 8. **An edition that selects nothing, or whose items all fall below the bar,
    still writes an empty digest** (ADR-0002 §4), so a quiet edition proves it
-   ran. The digest names the collection outcome of the sources it selected, so
-   a narrow edition cannot dilute a total upstream failure into something that
+   ran. It carries the collection outcome of the sources it selected, so a
+   narrow edition cannot dilute a total upstream failure into something that
    reads exactly like a quiet day — which it otherwise would, far more easily
    than the whole-pool digest ever could.
+   ⚠️ **The two digest files carry this differently, because ADR-0002 already
+   splits them by audience.** The `.json` records outcomes structurally,
+   error text included, for sinks and tooling. **The `.md` states only that a
+   selected source produced nothing, never the raw error** — a public
+   newsletter's markdown must not end with a fetch exception, and "the digest"
+   without a file named is precisely how that ships.
 
 ## Consequences
 
@@ -186,8 +208,10 @@ sinks:
   `pruneDigests` skips directory entries outright (`if e.IsDir() { continue }`),
   so the moment digests move under `digests/<edition>/`, a configured
   `retention.digests` quietly becomes keep-forever — no error, just unbounded
-  growth. `reports/` needs a retention rule for the same reason. **Neither is a
-  follow-up; both ship with the change that moves the paths.**
+  growth. **`reports/` is a sibling tree with the same problem and needs its
+  own retention rule**, which is a reason to keep it a distinct path rather
+  than hiding it under `digests/report/`. **Neither is a follow-up; both ship
+  with the change that moves the paths.**
 - **The digest path changes shape for everyone**, including the single-reader
   case: `digests/2026-09-04.md` becomes `digests/default/2026-09-04.md`. A
   one-time break taken deliberately rather than special-casing the default
@@ -199,11 +223,15 @@ sinks:
   rather than against the data root, so run from the data root that example
   recreates a flat `digests/<day>.md` beside the new `digests/default/`,
   reintroducing by example the exact shape this ADR removes.
-- **The reserved edition name `report` is a new collision risk**, the same
-  shape as the `all` token this ADR refuses: a user could reasonably want an
-  edition called `report`. Unlike `all` there is no absence to fall back on, so
-  the name is reserved explicitly and config load rejects a user edition that
-  claims it, rather than silently shadowing one with the other.
+- **No name is reserved, which is the point of not making the report an
+  edition.** A user may have an edition called `report`; a sink says either
+  `edition: <id>` or `report: true`, and the two namespaces never meet. An
+  earlier draft reserved the name and so reintroduced exactly the collision
+  shape this ADR refuses for the `all` token.
+- **Ordering becomes part of the contract: every edition is written before the
+  report**, since the report describes what they selected. This is the only
+  ordering the design imposes, and it exists because the report is downstream
+  of editions rather than one of them.
 - **The report is what makes the profile tunable, and it is the first artefact
   the engine writes for its owner rather than for a reader.** Whether tuning
   becomes interactive — reacting to items and having the engine learn — stays
