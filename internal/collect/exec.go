@@ -29,6 +29,18 @@ const contractVersion = 1
 // once, rather than half here.
 const execTimeout = 60 * time.Second
 
+// waitDelay bounds how long Wait may go on reading a plugin's pipes after the
+// context ends or the process exits. Without it, Wait reads to EOF — and EOF
+// does not arrive while ANY descendant still holds the write end, including one
+// that called setsid and so sits outside the process group the timeout kills.
+// The group kill then succeeds and the pass hangs regardless, defeating the
+// invariant the kill exists for.
+//
+// Five seconds is far more than a dead process's buffered output needs to
+// drain, and the delay only starts once the process has exited or the deadline
+// has passed, so it costs a healthy plugin nothing.
+const waitDelay = 5 * time.Second
+
 // maxPluginStderr bounds what is quoted back from a failing plugin, so a
 // chatty failure cannot flood the log through an error message.
 const maxPluginStderr = 2048
@@ -111,6 +123,10 @@ func (c *execCollector) Collect(ctx context.Context, id string, src config.Sourc
 		// children does not leave them behind holding the day's run hostage.
 		return syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
 	}
+
+	// Cap how long Wait may keep reading the pipes after the deadline, so a
+	// descendant outside the killed group cannot hold the pass open.
+	cmd.WaitDelay = waitDelay
 
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
