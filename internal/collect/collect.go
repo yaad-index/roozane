@@ -191,8 +191,23 @@ func (r *Runner) Run(ctx context.Context) Result {
 		written, err := r.collectSource(ctx, id, src, now)
 		result.Sources = append(result.Sources, SourceResult{ID: id, Written: written, Err: err})
 		if err != nil {
+			// No marker on a failure: its absence has to keep meaning "not due
+			// yet, or broken" so the source is retried rather than treated as
+			// having legitimately found nothing (ADR-0004).
 			r.log.Error("source failed", "source", id, "written", written, "error", err)
 			continue
+		}
+
+		if written == 0 {
+			// The fetch succeeded and there was nothing there. Without a marker
+			// the layout would read as never-collected and re-fetch this source
+			// on every pass regardless of its cadence.
+			if err := r.store.MarkRan(id, now); err != nil {
+				// A missing marker costs one duplicate fetch on the next pass,
+				// which is not a collection failure — the items, of which there
+				// are none, are not what went wrong.
+				r.log.Error("could not record empty run", "source", id, "error", err)
+			}
 		}
 		r.log.Info("source collected", "source", id, "items", written)
 	}
