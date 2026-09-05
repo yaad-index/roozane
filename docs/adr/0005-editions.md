@@ -1,0 +1,111 @@
+# ADR-0005: Editions — many audiences over one pool of collected items
+
+**Status:** Proposed
+
+## Context
+
+Today the pipeline narrows to a single digest: the aggregator judges the day's
+items against one relevance profile, writes `digests/<day>.{md,json}`, and
+every configured sink delivers that same file. That is correct for one reader
+and wrong for the product ADR-0001 describes, whose reusability law says the
+same three layers should be able to run a public newsletter alongside a
+personal brief.
+
+The requirement, from the maintainer: *"pull as many sources, and then have
+sinks that selects a bunch of them to a different sink"*, and, decisively,
+*"my boardgame newsletter can [be] a subset of board game items that I have in
+my personal feed."* **So the outputs overlap. This is not a partition of the
+day's items into disjoint buckets; the same item legitimately appears in a
+public newsletter and in a private morning brief on the same day.**
+
+That single sentence rules out the cheap design. Routing items to sinks — one
+item, one destination — cannot express overlap, and a filter applied by each
+sink to a shared digest cannot express voice: a newsletter written for
+strangers and a brief written for one person differ in what they explain, not
+only in which items survive. The narrowing that matters happens *before* the
+digest is written, not after.
+
+## Decision
+
+**Introduce the EDITION: a named audience with its own source selection, its
+own relevance profile, and therefore its own digest. Sinks deliver an edition
+rather than "the digest".** Collection stays exactly as it is — one pool, one
+copy of each item on disk — and editions are views over that pool.
+
+```yaml
+editions:
+  personal:                      # the private brief
+    sources: [all]
+    profile: /etc/roozane/profile.md
+  boardgames:                    # the public newsletter
+    sources: [bgg-blog, bgg-hotness, dicebreaker]
+    profile: /etc/roozane/boardgames.md
+
+sinks:
+  morning:
+    edition: personal
+    type: telegram
+    params: {chat_id: "…"}
+  archive:
+    edition: personal            # same edition, second destination
+    type: file
+    params: {path: "/var/lib/roozane/out/{day}.md"}
+  newsletter:
+    edition: boardgames
+    command: [/usr/local/lib/roozane-plugins/mailer]
+```
+
+1. **Selection is by SOURCE first, then by the edition's own profile.** The
+   source list is deterministic, greppable and owned by the config; the profile
+   does the fine-grained work the LLM is for. Both layers are needed and
+   neither substitutes for the other: `sources` cannot express "only the
+   boardgame items inside a general feed", and a profile alone would spend a
+   judging call on every unrelated item to discover it is unrelated.
+   `sources: [all]` is the explicit way to say the whole pool.
+
+2. **Overlap is free and expected.** An item selected by two editions is judged
+   once per *distinct profile* and written into each edition's digest. Nothing
+   deduplicates across editions, because a shared item is not an accident to be
+   collapsed — it is the requirement.
+
+3. **Editions each get a digest directory: `digests/<edition-id>/<day>.{md,json}`.**
+   Edition ids take the same `[a-z0-9-]` constraint as source ids, for the same
+   reason: they become path components.
+
+4. **With no `editions:` block the engine behaves as one edition named
+   `default`,** taking all sources and the top-level `relevance_profile`. This
+   keeps the single-reader config — the one in ADR-0001's spirit — free of
+   ceremony, and makes "one audience" the degenerate case of the general rule
+   rather than a separate code path.
+
+5. **A sink names exactly one edition** (`edition:`, defaulting to `default`).
+   Many sinks may name the same one; that is how a digest reaches both a chat
+   and a file. A sink naming an unknown edition fails at config load, unlike a
+   sink `type`, because the edition list is closed and known locally.
+
+6. **An edition that selects nothing, or whose items all fall below the bar,
+   writes an empty digest** exactly as today (ADR-0002 §4). Silence and
+   breakage stay distinguishable per edition, not merely per run.
+
+## Consequences
+
+- The reusability law becomes real: a public boardgame newsletter and a private
+  brief run from one deployment, one collection pass, one set of files.
+- **Cost scales with distinct PROFILES, not with editions or sinks.** Two
+  editions sharing a profile share their per-item judgements; two editions with
+  different profiles judge the overlapping items twice. This is the honest
+  price of separate voices, and it is bounded by the number of audiences, which
+  is small and human-chosen. Item judging is the expensive call, so an edition
+  that merely re-selects an existing profile's sources is nearly free.
+- **The digest path changes shape for everyone**, including the single-reader
+  case: `digests/2026-09-04.md` becomes `digests/default/2026-09-04.md`. A
+  one-time break, taken deliberately rather than special-casing the default
+  edition into the old path, because a layout with one rule stays greppable and
+  a layout with an exception does not. Files already written are left where
+  they are; retention prunes both shapes.
+- Sinks get simpler to reason about, not harder: a sink is now "this edition,
+  delivered there", and the question "which items does this sink send" is
+  answered by the edition it names rather than by reading its params.
+- **An edition is not a feedback surface.** Whether a reader can teach the
+  engine by reacting to items stays open and unaffected; editions change who a
+  digest is for, not how relevance is learned.
