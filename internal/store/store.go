@@ -481,3 +481,134 @@ func parseItem(name, raw string) (StoredItem, error) {
 	}
 	return item, nil
 }
+
+// PruneResult reports what one prune removed.
+type PruneResult struct {
+	Days    int
+	Digests int
+}
+
+// Prune enforces ADR-0002 §6's two retention windows, both counted in UTC days.
+//
+// THE CUTOFF, and why it is this one: a day folder survives while its age is
+// strictly less than the window, so `items: N` keeps the newest N days — ages
+// 0 through N-1 — and `items: 1` keeps today alone. ADR-0002 fixes the windows
+// in days but not the rounding, and this side is chosen to make the config
+// validation exactly tight rather than approximately safe.
+//
+// The collector decides due-ness by looking back one cadence period, so for a
+// source on a period of P days the folders that must survive are ages 0..P-1:
+// a source whose last run is older than that is due whether or not the evidence
+// is still on disk, so only the days strictly inside the period can change the
+// answer. Under this cutoff a window of N keeps exactly ages 0..N-1, which
+// covers 0..P-1 precisely when N >= P — the rule config validation enforces.
+// Round the other way and equality would keep one day more than needed;
+// validation would still be safe, but the two would no longer state the same
+// thing, and a test pins them together so they cannot drift apart.
+//
+// A window below 1 prunes nothing rather than everything: validation already
+// rejects it, and a bug that reached here should not be the one that deletes
+// the day collectors are writing into.
+func (s *Store) Prune(itemDays, digestDays int, now time.Time) (PruneResult, error) {
+	var result PruneResult
+	var problems []error
+
+	days, err := s.pruneDays(itemDays, now)
+	result.Days = days
+	if err != nil {
+		problems = append(problems, err)
+	}
+
+	digests, err := s.pruneDigests(digestDays, now)
+	result.Digests = digests
+	if err != nil {
+		problems = append(problems, err)
+	}
+
+	return result, errors.Join(problems...)
+}
+
+// pruneDays removes whole day folders past the item window.
+func (s *Store) pruneDays(itemDays int, now time.Time) (int, error) {
+	if itemDays < 1 {
+		return 0, nil
+	}
+
+	dir := filepath.Join(s.root, "days")
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return 0, nil
+		}
+		return 0, fmt.Errorf("read days directory: %w", err)
+	}
+
+	var removed int
+	var problems []error
+	for _, e := range entries {
+		age, ok := dayAge(e.Name(), now)
+		// Anything whose name is not a day key was not put there by this
+		// engine; deleting it because it is unrecognised would be the worst
+		// possible reading of a retention setting.
+		if !ok || age < itemDays {
+			continue
+		}
+		if err := os.RemoveAll(filepath.Join(dir, e.Name())); err != nil {
+			problems = append(problems, fmt.Errorf("remove day %s: %w", e.Name(), err))
+			continue
+		}
+		removed++
+	}
+	return removed, errors.Join(problems...)
+}
+
+// pruneDigests removes digest files past the digest window. Zero keeps them
+// forever, which is the default: the digests are small and are the record worth
+// keeping once the items behind them are gone.
+func (s *Store) pruneDigests(digestDays int, now time.Time) (int, error) {
+	if digestDays < 1 {
+		return 0, nil
+	}
+
+	dir := s.DigestsDir()
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return 0, nil
+		}
+		return 0, fmt.Errorf("read digests directory: %w", err)
+	}
+
+	var removed int
+	var problems []error
+	for _, e := range entries {
+		if e.IsDir() {
+			continue
+		}
+		ext := filepath.Ext(e.Name())
+		if ext != ".md" && ext != ".json" {
+			continue
+		}
+		age, ok := dayAge(strings.TrimSuffix(e.Name(), ext), now)
+		if !ok || age < digestDays {
+			continue
+		}
+		if err := os.Remove(filepath.Join(dir, e.Name())); err != nil {
+			problems = append(problems, fmt.Errorf("remove digest %s: %w", e.Name(), err))
+			continue
+		}
+		removed++
+	}
+	return removed, errors.Join(problems...)
+}
+
+// dayAge is how many whole UTC days ago a day key falls. The second result is
+// false when the name is not a day key at all.
+func dayAge(name string, now time.Time) (int, bool) {
+	day, err := time.Parse(DayFormat, name)
+	if err != nil {
+		return 0, false
+	}
+	today := now.UTC().Truncate(24 * time.Hour)
+	return int(today.Sub(day) / (24 * time.Hour)), true
+}

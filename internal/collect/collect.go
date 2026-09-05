@@ -125,6 +125,14 @@ type Result struct {
 	// into items.
 	InboxDrained int
 
+	// Pruned is what the pass removed to honour the retention windows.
+	Pruned store.PruneResult
+
+	// PruneErr is a failure to enforce retention. It is reported beside the
+	// collection rather than folded into it: old data that would not delete
+	// does not make what was collected wrong.
+	PruneErr error
+
 	// InboxErr is a failure of the drain itself, not of an individual file —
 	// per-file failures are logged and skipped so one bad drop cannot block the
 	// queue.
@@ -155,6 +163,21 @@ func (r Result) Failed() bool {
 func (r *Runner) Run(ctx context.Context) Result {
 	now := r.now().UTC()
 	var result Result
+
+	// Housekeeping before work: retention is enforced against the layout the
+	// cadence checks below are about to read, so a pass never decides due-ness
+	// from folders it is about to delete.
+	pruned, err := r.store.Prune(r.cfg.Retention.ItemDays(), r.cfg.Retention.Digests, now)
+	result.Pruned = pruned
+	if err != nil {
+		// Retention failing does not make the collection wrong, and refusing to
+		// collect because old data would not delete is the wrong trade.
+		result.PruneErr = err
+		r.log.Error("retention prune failed", "error", err)
+	}
+	if pruned.Days > 0 || pruned.Digests > 0 {
+		r.log.Info("pruned past the retention window", "days", pruned.Days, "digests", pruned.Digests)
+	}
 
 	drained, err := r.drainInbox(now)
 	result.InboxDrained = drained

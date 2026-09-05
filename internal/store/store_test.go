@@ -480,3 +480,158 @@ func TestSourceLastCollectedMarkerDoesNotMatchAPrefixOfAnotherID(t *testing.T) {
 	require.NoError(t, err)
 	assert.True(t, found)
 }
+
+// seedDay creates a day folder with one item in it, so a prune has something
+// real to remove.
+func seedDay(t *testing.T, s *Store, day time.Time) {
+	t.Helper()
+	_, err := s.WriteItem(Item{
+		Source: "a-source", FetchedAt: day, Collector: "http", Content: "body",
+	})
+	require.NoError(t, err)
+}
+
+// TestPruneKeepsExactlyTheNewestNDays pins the cutoff the config validation
+// depends on: a day survives while its age is strictly less than the window.
+func TestPruneKeepsExactlyTheNewestNDays(t *testing.T) {
+	root := t.TempDir()
+	s := New(root)
+	now := mustTime(t, "2026-09-30T12:00:00Z")
+
+	for age := 0; age <= 9; age++ {
+		seedDay(t, s, now.AddDate(0, 0, -age))
+	}
+
+	result, err := s.Prune(7, 0, now)
+	require.NoError(t, err)
+	assert.Equal(t, 3, result.Days, "ages 7, 8 and 9 are past a 7-day window")
+
+	// Ages 0..6 survive; 7 and older do not. The boundary pair is the point:
+	// age 6 present and age 7 absent is what makes the window mean "newest 7".
+	for age := 0; age <= 6; age++ {
+		assert.DirExists(t, s.DayDir(now.AddDate(0, 0, -age)),
+			"age %d is inside a 7-day window and must survive", age)
+	}
+	for age := 7; age <= 9; age++ {
+		assert.NoDirExists(t, s.DayDir(now.AddDate(0, 0, -age)),
+			"age %d is past a 7-day window and must be pruned", age)
+	}
+}
+
+func TestPruneWithAWindowOfOneKeepsTodayAlone(t *testing.T) {
+	root := t.TempDir()
+	s := New(root)
+	now := mustTime(t, "2026-09-30T12:00:00Z")
+
+	seedDay(t, s, now)
+	seedDay(t, s, now.AddDate(0, 0, -1))
+
+	result, err := s.Prune(1, 0, now)
+	require.NoError(t, err)
+	assert.Equal(t, 1, result.Days)
+
+	assert.DirExists(t, s.DayDir(now), "the day collectors are writing into must survive")
+	assert.NoDirExists(t, s.DayDir(now.AddDate(0, 0, -1)))
+}
+
+// TestPruneWithAWindowBelowOneRemovesNothing — validation rejects such a window,
+// so reaching here is a bug, and the safe reading of a bug is to delete nothing.
+func TestPruneWithAWindowBelowOneRemovesNothing(t *testing.T) {
+	root := t.TempDir()
+	s := New(root)
+	now := mustTime(t, "2026-09-30T12:00:00Z")
+
+	seedDay(t, s, now.AddDate(0, 0, -400))
+
+	for _, window := range []int{0, -1} {
+		result, err := s.Prune(window, 0, now)
+		require.NoError(t, err)
+		assert.Zero(t, result.Days, "window %d must prune nothing", window)
+		assert.DirExists(t, s.DayDir(now.AddDate(0, 0, -400)))
+	}
+}
+
+// TestPruneLeavesUnrecognisedEntriesAlone — a retention setting is permission to
+// delete this engine's own old days, not whatever else shares the directory.
+func TestPruneLeavesUnrecognisedEntriesAlone(t *testing.T) {
+	root := t.TempDir()
+	s := New(root)
+	now := mustTime(t, "2026-09-30T12:00:00Z")
+
+	seedDay(t, s, now.AddDate(0, 0, -30))
+	stray := filepath.Join(root, "days", "notes-from-the-operator")
+	require.NoError(t, os.MkdirAll(stray, 0o755))
+
+	result, err := s.Prune(7, 0, now)
+	require.NoError(t, err)
+	assert.Equal(t, 1, result.Days, "only the real day folder counts as pruned")
+	assert.DirExists(t, stray, "a name that is not a day key must not be touched")
+}
+
+func TestPruneDigestsUsesItsOwnWindow(t *testing.T) {
+	root := t.TempDir()
+	s := New(root)
+	now := mustTime(t, "2026-09-30T12:00:00Z")
+
+	require.NoError(t, os.MkdirAll(s.DigestsDir(), 0o755))
+	write := func(day time.Time) (string, string) {
+		md, structured := s.DigestPaths(day)
+		require.NoError(t, os.WriteFile(md, []byte("# digest"), 0o644))
+		require.NoError(t, os.WriteFile(structured, []byte("{}"), 0o644))
+		return md, structured
+	}
+	keptMD, keptJSON := write(now.AddDate(0, 0, -2))
+	goneMD, goneJSON := write(now.AddDate(0, 0, -3))
+
+	result, err := s.Prune(90, 3, now)
+	require.NoError(t, err)
+	assert.Equal(t, 2, result.Digests, "both files of one day are one day's digest")
+	assert.Zero(t, result.Days, "the item window is separate and untouched here")
+
+	assert.FileExists(t, keptMD)
+	assert.FileExists(t, keptJSON)
+	assert.NoFileExists(t, goneMD)
+	assert.NoFileExists(t, goneJSON)
+}
+
+// TestPruneDigestsZeroKeepsForever is the documented default.
+func TestPruneDigestsZeroKeepsForever(t *testing.T) {
+	root := t.TempDir()
+	s := New(root)
+	now := mustTime(t, "2026-09-30T12:00:00Z")
+
+	require.NoError(t, os.MkdirAll(s.DigestsDir(), 0o755))
+	md, _ := s.DigestPaths(now.AddDate(0, 0, -4000))
+	require.NoError(t, os.WriteFile(md, []byte("# ancient"), 0o644))
+
+	result, err := s.Prune(90, 0, now)
+	require.NoError(t, err)
+	assert.Zero(t, result.Digests)
+	assert.FileExists(t, md, "zero means keep forever, not keep nothing")
+}
+
+func TestPruneDigestsLeavesOtherFilesAlone(t *testing.T) {
+	root := t.TempDir()
+	s := New(root)
+	now := mustTime(t, "2026-09-30T12:00:00Z")
+
+	require.NoError(t, os.MkdirAll(s.DigestsDir(), 0o755))
+	readme := filepath.Join(s.DigestsDir(), "README.md")
+	require.NoError(t, os.WriteFile(readme, []byte("mine"), 0o644))
+	notADay := filepath.Join(s.DigestsDir(), "summary-2026.json")
+	require.NoError(t, os.WriteFile(notADay, []byte("{}"), 0o644))
+
+	result, err := s.Prune(90, 1, now)
+	require.NoError(t, err)
+	assert.Zero(t, result.Digests)
+	assert.FileExists(t, readme)
+	assert.FileExists(t, notADay)
+}
+
+func TestPruneOnAnEmptyDataRootIsNotAnError(t *testing.T) {
+	s := New(t.TempDir())
+	result, err := s.Prune(7, 7, mustTime(t, "2026-09-30T12:00:00Z"))
+	require.NoError(t, err, "a fresh install has neither tree yet")
+	assert.Zero(t, result.Days)
+	assert.Zero(t, result.Digests)
+}
