@@ -1,6 +1,6 @@
 # ADR-0004: Empty collector runs leave a marker in the day folder
 
-**Status:** Proposed
+**Status:** Accepted
 
 ## Context
 
