@@ -56,10 +56,18 @@ sinks:
 
 1. **Selection is by SOURCE first, then by the edition's own profile.** The
    source list is deterministic, greppable and owned by the config; the profile
-   does the fine-grained work the LLM is for. Both layers are needed and
-   neither substitutes for the other: `sources` cannot express "only the
-   boardgame items inside a general feed", and a profile alone would spend a
-   judging call on every unrelated item to discover it is unrelated.
+   does the fine-grained work the LLM is for.
+   **The two layers are asymmetric, and saying they are simply "both needed"
+   invites a reader to find the counterexample and doubt the section.** The
+   source filter genuinely cannot substitute for the profile: `sources` cannot
+   express "only the boardgame items inside a general feed". The profile *can*
+   substitute for the source filter — prose saying "only items from the
+   boardgame blogs" would mostly work — so **the source list earns its place on
+   determinism, greppability and cost, not on expressiveness.** Its cost saving
+   is likewise specific rather than general: it saves judging calls only on
+   items an edition excludes wholesale, since an item two editions both select
+   under different profiles is judged twice regardless. That is exactly the
+   newsletter case, so the argument holds for a reason rather than in general.
    **Omitting `sources` selects the whole pool.** There is deliberately no
    `all` keyword: source ids are `[a-z0-9-]`, so `all` is a legal source id and
    a magic token would collide with a real source the day someone names one.
@@ -78,8 +86,10 @@ sinks:
    into a public digest.** The key becomes (item filename, profile identity),
    where profile identity is a **hash of the profile's CONTENT**, so editing a
    profile invalidates its cached judgements instead of pinning stale ones.
-   This is a `state.json` schema change and is listed in the migration notes
-   below alongside the digest path.
+   This is a `state.json` schema change: `stateSchema` bumps, and the existing
+   schema-mismatch path already does the right thing by starting the day fresh,
+   so the migration costs one re-judged day rather than a converter. It is
+   listed in the migration notes below alongside the digest path.
 
 3. **Editions each get a digest directory: `digests/<edition-id>/<day>.{md,json}`.**
    Edition ids take the same `[a-z0-9-]` constraint as source ids, for the same
@@ -105,10 +115,21 @@ sinks:
    two fail upstream, and the digest looks identical either way. ADR-0004's
    `ran/` markers still record which sources actually ran, so the information
    exists on disk — it is simply no longer visible in the digest a reader sees.
-   Surfacing it (a per-edition note when a selected source produced nothing) is
-   left to the feedback work rather than smuggled in here.
+   **So the edition's digest records the collection outcome of the sources it
+   selected** — which ran, which produced nothing, which failed. The
+   information already exists at that point, both reviewers independently
+   reached for it, and without it a narrow edition dilutes a total upstream
+   failure into a digest that reads exactly like a quiet day.
 
 ## Consequences
+
+- **This supersedes ADR-0002's closing answer to the same question.** That ADR
+  said the public-newsletter case would be "a different data root with a
+  different config… a second, fully independent pipeline". Editions replace
+  that with one deployment over one pool, because two pipelines would collect
+  every shared item twice and could never express an item belonging to both.
+  A reader grepping for the newsletter case must not find the old answer
+  unmarked.
 
 - The reusability law becomes real: a public boardgame newsletter and a private
   brief run from one deployment, one collection pass, one set of files.
@@ -132,6 +153,11 @@ sinks:
   change above must ship with the edition work, not after it, since the failure
   there is a wrong digest rather than a full disk. **Neither is a follow-up;
   both are part of the change that moves the paths.**
+- **`config.example.yaml` has to move off `digests/`.** Its `local-file` sink
+  writes `path: digests/{day}.md`, and the file sink resolves a path as given
+  rather than against the data root, so run from the data root that example
+  recreates a flat `digests/<day>.md` beside the new `digests/default/` —
+  reintroducing by example the exact shape this ADR removes.
 - Sinks get simpler to reason about, not harder: a sink is now "this edition,
   delivered there", and the question "which items does this sink send" is
   answered by the edition it names rather than by reading its params.
