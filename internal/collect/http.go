@@ -28,7 +28,7 @@ type httpCollector struct {
 // day's single file rather than appending a duplicate. Each day still keeps its
 // own snapshot, which is what makes "what did this page say on the 4th" a
 // question the layout can answer.
-func (c *httpCollector) Collect(ctx context.Context, src config.Source) ([]Collected, error) {
+func (c *httpCollector) Collect(ctx context.Context, _ string, src config.Source) ([]Collected, error) {
 	var params httpParams
 	if err := src.DecodeParams(&params); err != nil {
 		return nil, fmt.Errorf("http params: %w", err)
