@@ -3,6 +3,7 @@ package config
 import (
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -545,4 +546,115 @@ func TestEnvErrorDoesNotEchoTheValue(t *testing.T) {
 	// secret gets pasted by mistake, so the error must not repeat it.
 	assert.NotContains(t, err.Error(), pasted)
 	assert.Contains(t, err.Error(), "not a credential")
+}
+
+func TestCadenceDays(t *testing.T) {
+	for _, tc := range []struct {
+		cadence Cadence
+		want    int
+	}{
+		{CadenceDaily, 1},
+		{CadenceWeekly, 7},
+		{CadenceMonthly, 30},
+	} {
+		days, ok := tc.cadence.Days()
+		require.True(t, ok, "%q is part of the vocabulary", tc.cadence)
+		assert.Equal(t, tc.want, days, "cadence %q", tc.cadence)
+	}
+
+	// An unknown cadence must not read as zero days: a caller that took that at
+	// face value would treat the source as due on every pass.
+	days, ok := Cadence("fortnightly").Days()
+	assert.False(t, ok)
+	assert.Zero(t, days)
+}
+
+// retentionConfig is validConfig with the item window and the second source's
+// cadence swapped in, so a test changes only what it is about.
+func retentionConfig(items int, cadence Cadence) string {
+	body := strings.Replace(validConfig, "  items: 30", "  items: "+strconv.Itoa(items), 1)
+	return strings.Replace(body, "    cadence: weekly", "    cadence: "+string(cadence), 1)
+}
+
+// TestRetentionShorterThanLongestCadenceIsRejected is the rule itself: a window
+// that would prune a source's evidence before it is due again must fail at
+// validation rather than degrade quietly at run time.
+func TestRetentionShorterThanLongestCadenceIsRejected(t *testing.T) {
+	// Vacuity guard: the same config with an adequate window loads cleanly, so
+	// the failure below is provably about the window and not about the fixture.
+	_, err := Load(write(t, retentionConfig(30, CadenceMonthly)))
+	require.NoError(t, err, "the fixture must be valid apart from the window under test")
+
+	_, err = Load(write(t, retentionConfig(7, CadenceMonthly)))
+	require.Error(t, err, "a 7-day window with a monthly source must be rejected")
+
+	// The message has to be actionable: which window, which source, which
+	// cadence, and how long it needs to be.
+	msg := err.Error()
+	assert.Contains(t, msg, "retention.items is 7 days")
+	assert.Contains(t, msg, `"example-site"`)
+	assert.Contains(t, msg, "monthly")
+	assert.Contains(t, msg, "30 days")
+}
+
+// TestRetentionEqualToLongestCadenceIsAccepted pins the boundary. Equality is
+// sufficient: a source whose last run falls on the oldest kept day is already
+// due by then, so only the days strictly inside the period matter.
+func TestRetentionEqualToLongestCadenceIsAccepted(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		items   int
+		cadence Cadence
+	}{
+		{"weekly at exactly seven", 7, CadenceWeekly},
+		{"monthly at exactly thirty", 30, CadenceMonthly},
+		{"daily at exactly one", 1, CadenceDaily},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := Load(write(t, retentionConfig(tc.items, tc.cadence)))
+			assert.NoError(t, err, "a window equal to the longest cadence is enough")
+		})
+	}
+}
+
+// TestRetentionOneDayShortOfLongestCadenceIsRejected is the other side of the
+// same boundary — without it, a rule that only fired far below the threshold
+// would still pass the equality test above.
+func TestRetentionOneDayShortOfLongestCadenceIsRejected(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		items   int
+		cadence Cadence
+	}{
+		{"weekly at six", 6, CadenceWeekly},
+		{"monthly at twenty-nine", 29, CadenceMonthly},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := Load(write(t, retentionConfig(tc.items, tc.cadence)))
+			assert.Error(t, err, "one day short of the cadence still prunes the deciding day")
+		})
+	}
+}
+
+// TestRetentionIsMeasuredAgainstTheLongestCadenceNotTheFirst guards against a
+// rule that stopped at whichever source it happened to read first.
+func TestRetentionIsMeasuredAgainstTheLongestCadenceNotTheFirst(t *testing.T) {
+	// example-feed is daily and sorts first; example-site is monthly. A window
+	// of 7 satisfies the daily source and must still be rejected for the other.
+	_, err := Load(write(t, retentionConfig(7, CadenceMonthly)))
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), `"example-site"`,
+		"the rule must report the source that actually needs the longer window")
+}
+
+// TestRetentionRuleIgnoresAnUnknownCadence keeps one mistake to one complaint:
+// an unrecognised cadence is already a validation error on its own terms.
+func TestRetentionRuleIgnoresAnUnknownCadence(t *testing.T) {
+	_, err := Load(write(t, retentionConfig(1, "fortnightly")))
+	require.Error(t, err, "the unknown cadence itself is still an error")
+
+	msg := err.Error()
+	assert.Contains(t, msg, "cadence")
+	assert.NotContains(t, msg, "retention.items is 1 days",
+		"an unknown cadence has no length, so the retention rule must stay silent about it")
 }
