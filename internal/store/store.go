@@ -104,6 +104,16 @@ func (s *Store) ItemsDir(t time.Time) string {
 	return filepath.Join(s.DayDir(t), "items")
 }
 
+// RanDir is where a day's empty-run markers live, a sibling of ItemsDir.
+//
+// ADR-0004 puts them beside the items rather than inside: a marker within
+// items/ would be a non-item every reader of that directory has to know to
+// skip, whereas a sibling directory is invisible to readers that do not look
+// for it.
+func (s *Store) RanDir(t time.Time) string {
+	return filepath.Join(s.DayDir(t), "ran")
+}
+
 // Day is the UTC day key for an instant.
 func Day(t time.Time) string { return t.UTC().Format(DayFormat) }
 
@@ -156,6 +166,32 @@ func (s *Store) WriteItem(item Item) (string, error) {
 		return "", err
 	}
 	return path, nil
+}
+
+// MarkRan records that a source ran on the given instant's UTC day and found
+// nothing, by creating an empty file named after the source under RanDir.
+//
+// The file is empty on purpose: its name and the day folder it sits in carry
+// the whole datum, so nothing has to be parsed back out and a marker survives
+// any copy that does not preserve timestamps. Writing it is idempotent — a
+// second zero-item run on the same day rewrites the same name.
+//
+// Only a successful zero-item run may call this. A fetch that failed must
+// leave no marker, so that its absence keeps meaning "not due yet, or broken"
+// and the source is retried on the next pass.
+func (s *Store) MarkRan(source string, t time.Time) error {
+	if source == "" {
+		return errors.New("marker has no source")
+	}
+	if t.IsZero() {
+		return errors.New("marker has no timestamp: the engine must stamp it")
+	}
+
+	dir := s.RanDir(t)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return fmt.Errorf("create ran directory: %w", err)
+	}
+	return writeFileAtomic(filepath.Join(dir, source), nil)
 }
 
 // render builds the front-matter-plus-content bytes for an item.
@@ -237,42 +273,83 @@ func writeFileAtomic(path string, data []byte) error {
 	return nil
 }
 
-// SourceLastCollected reports the most recent UTC day on which the source wrote
-// any item, searching back at most maxDays from now. The second result is false
-// when it never did within that window.
+// SourceLastCollected reports the most recent UTC day on which the source ran,
+// searching back at most maxDays from now. The second result is false when it
+// never did within that window.
+//
+// A day counts if the source wrote an item that day OR left an empty-run marker
+// there (ADR-0004). Walking backwards and returning the first day that has
+// either is what makes the result the *later* of the two: a source that found
+// items on one day and nothing on a later one is last-run on the later day.
 //
 // Deriving this from the layout rather than from a state file is deliberate:
 // the files already answer the question, and ADR-0002 assigns state.json to the
 // aggregator. A second bookkeeping file for the collector would be a second
 // thing to keep true.
 func (s *Store) SourceLastCollected(source string, now time.Time, maxDays int) (time.Time, bool, error) {
-	prefix := source + "--"
-
 	for back := 0; back <= maxDays; back++ {
 		day := now.UTC().AddDate(0, 0, -back)
 
-		entries, err := os.ReadDir(s.ItemsDir(day))
+		ran, err := s.ranOn(source, day)
 		if err != nil {
-			if os.IsNotExist(err) {
-				continue
-			}
-			return time.Time{}, false, fmt.Errorf("read items directory: %w", err)
+			return time.Time{}, false, err
+		}
+		if ran {
+			return day, true, nil
 		}
 
-		for _, e := range entries {
-			if e.IsDir() || !strings.HasSuffix(e.Name(), ".md") {
-				continue
-			}
-			// The prefix match is on `<source>--`, so a source id cannot match
-			// another whose id it is a prefix of: `hn` never matches
-			// `hn-front--….md` because the separator has to follow immediately.
-			if strings.HasPrefix(e.Name(), prefix) {
-				return day, true, nil
-			}
+		wrote, err := s.wroteItemOn(source, day)
+		if err != nil {
+			return time.Time{}, false, err
+		}
+		if wrote {
+			return day, true, nil
 		}
 	}
 
 	return time.Time{}, false, nil
+}
+
+// ranOn reports whether the source left an empty-run marker on the given day.
+//
+// The match is on the exact filename rather than a prefix, so neither a source
+// whose id is a prefix of another nor a leftover `.tmp-*` from an interrupted
+// write can be mistaken for a marker.
+func (s *Store) ranOn(source string, day time.Time) (bool, error) {
+	_, err := os.Stat(filepath.Join(s.RanDir(day), source))
+	switch {
+	case err == nil:
+		return true, nil
+	case os.IsNotExist(err):
+		return false, nil
+	default:
+		return false, fmt.Errorf("stat run marker: %w", err)
+	}
+}
+
+// wroteItemOn reports whether the source wrote any item on the given day.
+func (s *Store) wroteItemOn(source string, day time.Time) (bool, error) {
+	entries, err := os.ReadDir(s.ItemsDir(day))
+	if err != nil {
+		if os.IsNotExist(err) {
+			return false, nil
+		}
+		return false, fmt.Errorf("read items directory: %w", err)
+	}
+
+	// The prefix match is on `<source>--`, so a source id cannot match another
+	// whose id it is a prefix of: `hn` never matches `hn-front--….md` because
+	// the separator has to follow immediately.
+	prefix := source + "--"
+	for _, e := range entries {
+		if e.IsDir() || !strings.HasSuffix(e.Name(), ".md") {
+			continue
+		}
+		if strings.HasPrefix(e.Name(), prefix) {
+			return true, nil
+		}
+	}
+	return false, nil
 }
 
 // --- reading back, and the aggregator's outputs ---

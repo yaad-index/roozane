@@ -334,3 +334,149 @@ func TestWriteAtomicNeverExposesATornFile(t *testing.T) {
 			"read a partial digest: torn write (len %d, starts %q)", len(body), body[:min(1, len(body))])
 	}
 }
+
+func TestMarkRanWritesAnEmptyMarkerNamedForTheSource(t *testing.T) {
+	root := t.TempDir()
+	s := New(root)
+	now := mustTime(t, "2026-09-10T12:00:00Z")
+
+	require.NoError(t, s.MarkRan("a-source", now))
+
+	path := filepath.Join(s.RanDir(now), "a-source")
+	info, err := os.Stat(path)
+	require.NoError(t, err, "the marker must be named for the source, with nothing appended")
+	assert.Zero(t, info.Size(), "the name and the day folder are the whole datum; the file carries nothing")
+
+	// A sibling of items/, not a member of it — readers of items/ must not have
+	// to learn to skip anything.
+	assert.Equal(t, filepath.Join(s.DayDir(now), "ran"), s.RanDir(now))
+	assert.NotEqual(t, s.ItemsDir(now), s.RanDir(now))
+}
+
+func TestMarkRanIsIdempotentWithinADay(t *testing.T) {
+	root := t.TempDir()
+	s := New(root)
+	now := mustTime(t, "2026-09-10T12:00:00Z")
+
+	require.NoError(t, s.MarkRan("a-source", now))
+	require.NoError(t, s.MarkRan("a-source", now.Add(3*time.Hour)),
+		"a second empty run the same day must not fail")
+
+	entries, err := os.ReadDir(s.RanDir(now))
+	require.NoError(t, err)
+	require.Len(t, entries, 1, "the same day must hold one marker per source, not one per run")
+	assert.Equal(t, "a-source", entries[0].Name())
+}
+
+func TestMarkRanRejectsAnUnstampedMarker(t *testing.T) {
+	s := New(t.TempDir())
+
+	require.Error(t, s.MarkRan("", mustTime(t, "2026-09-10T12:00:00Z")))
+	require.Error(t, s.MarkRan("a-source", time.Time{}),
+		"an unstamped marker would land in whatever day the zero time falls in")
+}
+
+// TestSourceLastCollectedCountsAnEmptyRun is the property ADR-0004 exists for:
+// a source that ran and found nothing must read as having run, not as never
+// collected.
+func TestSourceLastCollectedCountsAnEmptyRun(t *testing.T) {
+	root := t.TempDir()
+	s := New(root)
+	now := mustTime(t, "2026-09-10T12:00:00Z")
+
+	_, found, err := s.SourceLastCollected("a-source", now, 30)
+	require.NoError(t, err)
+	require.False(t, found, "vacuity guard: the source must start out never-collected")
+
+	require.NoError(t, s.MarkRan("a-source", now.AddDate(0, 0, -3)))
+
+	last, found, err := s.SourceLastCollected("a-source", now, 30)
+	require.NoError(t, err)
+	require.True(t, found, "a marker must count as a run even with no items beside it")
+	assert.Equal(t, "2026-09-07", Day(last))
+
+	// The marker obeys the same window as an item: past the lookback it is the
+	// same answer as never.
+	_, found, err = s.SourceLastCollected("a-source", now, 2)
+	require.NoError(t, err)
+	assert.False(t, found)
+}
+
+// TestSourceLastCollectedTakesTheLaterOfItemAndMarker runs both orderings.
+// One direction alone cannot expose a mistake here: an implementation that
+// only ever consulted items would still pass the marker-older case.
+func TestSourceLastCollectedTakesTheLaterOfItemAndMarker(t *testing.T) {
+	now := mustTime(t, "2026-09-10T12:00:00Z")
+
+	t.Run("marker is the later one", func(t *testing.T) {
+		s := New(t.TempDir())
+		_, err := s.WriteItem(Item{
+			Source: "a-source", FetchedAt: now.AddDate(0, 0, -8),
+			Collector: "http", Content: "body",
+		})
+		require.NoError(t, err)
+		require.NoError(t, s.MarkRan("a-source", now.AddDate(0, 0, -2)))
+
+		last, found, err := s.SourceLastCollected("a-source", now, 30)
+		require.NoError(t, err)
+		require.True(t, found)
+		assert.Equal(t, "2026-09-08", Day(last),
+			"a source that found items once and nothing later last ran on the later day")
+	})
+
+	t.Run("item is the later one", func(t *testing.T) {
+		s := New(t.TempDir())
+		require.NoError(t, s.MarkRan("a-source", now.AddDate(0, 0, -8)))
+		_, err := s.WriteItem(Item{
+			Source: "a-source", FetchedAt: now.AddDate(0, 0, -2),
+			Collector: "http", Content: "body",
+		})
+		require.NoError(t, err)
+
+		last, found, err := s.SourceLastCollected("a-source", now, 30)
+		require.NoError(t, err)
+		require.True(t, found)
+		assert.Equal(t, "2026-09-08", Day(last),
+			"an older marker must not pull the last-run day backwards")
+	})
+}
+
+// TestSourceLastCollectedIgnoresATemporaryMarkerFile guards the exact-name
+// match. writeFileAtomic stages every write as `.tmp-*` in the destination
+// directory, so a crash mid-write can leave one behind — and in ran/ the
+// filename IS the source id, so a reader that accepted any entry would credit
+// a source with a run it never had.
+func TestSourceLastCollectedIgnoresATemporaryMarkerFile(t *testing.T) {
+	root := t.TempDir()
+	s := New(root)
+	now := mustTime(t, "2026-09-10T12:00:00Z")
+
+	require.NoError(t, os.MkdirAll(s.RanDir(now), 0o755))
+	stranded := filepath.Join(s.RanDir(now), ".tmp-834217")
+	require.NoError(t, os.WriteFile(stranded, nil, 0o644))
+
+	_, found, err := s.SourceLastCollected("a-source", now, 30)
+	require.NoError(t, err)
+	assert.False(t, found, "a stranded temporary file is not a run marker")
+
+	// Vacuity guard: the directory really does hold the file under test.
+	entries, err := os.ReadDir(s.RanDir(now))
+	require.NoError(t, err)
+	require.Len(t, entries, 1)
+}
+
+func TestSourceLastCollectedMarkerDoesNotMatchAPrefixOfAnotherID(t *testing.T) {
+	root := t.TempDir()
+	s := New(root)
+	now := mustTime(t, "2026-09-10T12:00:00Z")
+
+	require.NoError(t, s.MarkRan("hn-front", now))
+
+	_, found, err := s.SourceLastCollected("hn", now, 30)
+	require.NoError(t, err)
+	assert.False(t, found, "one source's marker must not be credited to another")
+
+	_, found, err = s.SourceLastCollected("hn-front", now, 30)
+	require.NoError(t, err)
+	assert.True(t, found)
+}
