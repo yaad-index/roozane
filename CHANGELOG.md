@@ -1,5 +1,18 @@
 # Changelog
 
+## [0.3.0](https://github.com/yaad-index/roozane/compare/v0.2.0...v0.3.0) (2026-09-05)
+
+
+### Features
+
+* exec collector runner and the ADR-0003 permission refusal ([#35](https://github.com/yaad-index/roozane/issues/35)) ([69106c6](https://github.com/yaad-index/roozane/commit/69106c6a89c32f40ba862a3b9bc61502a8d77a3d))
+* publish a container image to GHCR on release ([#32](https://github.com/yaad-index/roozane/issues/32)) ([8e94582](https://github.com/yaad-index/roozane/commit/8e945821c07f5f0825b523d1388691bff13cc9f9))
+
+
+### Bug Fixes
+
+* bound plugin Wait so an escaped descendant cannot hang a run ([#37](https://github.com/yaad-index/roozane/issues/37)) ([1d91784](https://github.com/yaad-index/roozane/commit/1d917845e97ce88c8f64623720736ea8ed78ddd6))
+
 ## [0.2.0](https://github.com/yaad-index/roozane/compare/v0.1.0...v0.2.0) (2026-09-05)
 
 
