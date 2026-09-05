@@ -53,8 +53,8 @@ days/
 
 3. **Markers are created atomically like every other write in this layout**
    (temporary name, then `rename(2)`), are empty (the name is the datum), and
-   are pruned with their day folder by the existing `retention.items` window —
-   they add no retention configuration.
+   belong to their day folder, so the `retention.items` window covers them
+   whenever day-folder pruning runs — they add no retention configuration.
 
 4. **`state.json` stays the aggregator's file.** Layer 1 still owns no state
    file; its state remains the layout itself, now including the marker.
@@ -70,3 +70,10 @@ days/
   read `items/` or `digests/` are unaffected.
 - A collector crash between fetch and marker write re-fetches once on the next
   pass — the failure mode is a duplicate fetch, never a skipped one.
+- The cadence guarantee is conditional on retention: a `retention.items`
+  window shorter than the longest configured cadence prunes the evidence
+  (markers and items alike) before `due()` looks back one cadence period,
+  returning such a source to per-pass fetching. This precondition predates
+  this ADR — item-producing sources have the same dependency — and the default
+  window (90) covers the largest built-in cadence (30). Rejecting such configs
+  at validation is #25.
