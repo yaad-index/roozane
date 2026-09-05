@@ -120,11 +120,26 @@ sinks:
    silently changes meaning. The invariant is stated here because the file
    looks useful to `due()` and the damage would be invisible.
 
-7. **Each day gets a report: `reports/<day>.md`.** It states, per source, what
-   ran and what it yielded or how it failed; per item, its tags, category and
-   salience; and per edition, which items it selected and the reason each
-   enriched item was not selected — below the bar, or outside this edition's
-   sources.
+7. **Each day gets a report, and it is delivered like anything else: the
+   engine writes it as the reserved edition `report`, which any sink may
+   name.** It states, per source, what ran and what it yielded or how it
+   failed; per item, its tags, category and salience; per edition, which items
+   it selected and the reason each enriched item was not selected — below the
+   bar, or outside this edition's sources; and **per pass and per model, the
+   tokens spent and the wall time taken.**
+   🔑 **The report is an edition rather than a sink type, and the difference is
+   the layer law.** ADR-0001 makes sinks dumb: content is decided upstream,
+   delivery is all a sink does. A "feedback sink" that assembled its own report
+   would put generation in the delivery layer and would have to be reimplemented
+   in every sink that wanted it. As an edition it is generated once and can be
+   filed, messaged or mailed by whichever sink names it — the same freedom every
+   other audience has.
+   💶 **Tokens and durations are reported; money only if the config supplies
+   prices.** The engine is provider-agnostic by ADR-0001 §3 and therefore cannot
+   know what any model charges; a hardcoded price table would be both wrong and
+   a de facto endorsement. An optional per-model price per million tokens in the
+   config turns the token counts into a cost line, and its absence simply omits
+   that line.
    🔑 **"Why is this news not here" has three answers and the engine can only
    give two.** Collected but scored low, and collected but not selected by this
    edition, are both recoverable. **No source covers it at all is invisible by
@@ -184,6 +199,11 @@ sinks:
   rather than against the data root, so run from the data root that example
   recreates a flat `digests/<day>.md` beside the new `digests/default/`,
   reintroducing by example the exact shape this ADR removes.
+- **The reserved edition name `report` is a new collision risk**, the same
+  shape as the `all` token this ADR refuses: a user could reasonably want an
+  edition called `report`. Unlike `all` there is no absence to fall back on, so
+  the name is reserved explicitly and config load rejects a user edition that
+  claims it, rather than silently shadowing one with the other.
 - **The report is what makes the profile tunable, and it is the first artefact
   the engine writes for its owner rather than for a reader.** Whether tuning
   becomes interactive — reacting to items and having the engine learn — stays
