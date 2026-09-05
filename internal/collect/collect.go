@@ -35,16 +35,6 @@ const truncationMarker = "\n\n[roozane: item truncated at the size cap]\n"
 // the day's run hostage.
 const defaultFetchTimeout = 30 * time.Second
 
-// cadenceDays is how many UTC days must pass before a source is due again.
-// Monthly is 30 days rather than calendar-month arithmetic: for a fetch
-// schedule, "every 30 days" is predictable and "the 31st of the month" is a bug
-// report waiting to happen.
-var cadenceDays = map[config.Cadence]int{
-	config.CadenceDaily:   1,
-	config.CadenceWeekly:  7,
-	config.CadenceMonthly: 30,
-}
-
 // Collected is one item as a collector produces it. It carries no identity and
 // no timestamp of the engine's: ADR-0003 reserves those for the engine so that
 // nothing a collector returns can choose which day folder it lands in.
@@ -267,7 +257,7 @@ func (r *Runner) collectSource(ctx context.Context, id string, src config.Source
 
 // due reports whether a source should be collected now, from the layout alone.
 func (r *Runner) due(id string, cadence config.Cadence, now time.Time) (bool, error) {
-	days, ok := cadenceDays[cadence]
+	days, ok := cadence.Days()
 	if !ok {
 		return false, fmt.Errorf("unknown cadence %q", cadence)
 	}

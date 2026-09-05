@@ -170,6 +170,16 @@ const (
 
 var cadences = []Cadence{CadenceDaily, CadenceWeekly, CadenceMonthly}
 
+// cadenceDays is how many UTC days must pass before a source is due again.
+// Monthly is 30 days rather than calendar-month arithmetic: for a fetch
+// schedule, "every 30 days" is predictable and "the 31st of the month" is a bug
+// report waiting to happen.
+var cadenceDays = map[Cadence]int{
+	CadenceDaily:   1,
+	CadenceWeekly:  7,
+	CadenceMonthly: 30,
+}
+
 // Valid reports whether c is one of the three defined cadences.
 func (c Cadence) Valid() bool {
 	for _, known := range cadences {
@@ -178,6 +188,19 @@ func (c Cadence) Valid() bool {
 		}
 	}
 	return false
+}
+
+// Days is how many UTC days must pass before a source on this cadence is due
+// again. The second result is false for a cadence outside the vocabulary, so a
+// caller cannot silently read an unknown cadence as zero days and fetch on
+// every pass.
+//
+// This lives with the Cadence type rather than with the collector because two
+// packages now need it: the collector to decide due-ness, and validation to
+// check the retention window is long enough to keep a cadence's evidence.
+func (c Cadence) Days() (int, bool) {
+	days, ok := cadenceDays[c]
+	return days, ok
 }
 
 // Duration is a time.Duration that reads from YAML as a human string ("45s",
@@ -328,6 +351,7 @@ func (c *Config) Validate() error {
 
 	problems = append(problems, c.validateAggregator()...)
 	problems = append(problems, c.validateSources()...)
+	problems = append(problems, c.validateRetentionCoversCadences()...)
 	problems = append(problems, c.validateSinks()...)
 
 	return errors.Join(problems...)
@@ -387,6 +411,50 @@ func (c *Config) validateSources() []error {
 		problems = append(problems, validateSource(id, c.Sources[id])...)
 	}
 	return problems
+}
+
+// validateRetentionCoversCadences rejects an item-retention window shorter than
+// the longest configured cadence.
+//
+// The collector derives a source's last run from the layout, looking back one
+// cadence period. Item retention prunes whole day folders, so a window shorter
+// than that period deletes the evidence — items and empty-run markers alike —
+// before the source is due again, and the source silently returns to being
+// fetched on every pass. That is the behaviour ADR-0004 removes, reintroduced
+// through a retention setting rather than a collector bug, which is why it is
+// worth failing loudly here instead of degrading quietly at run time.
+//
+// Equality passes, and is exactly sufficient rather than generous: a source
+// whose last run falls on the oldest day the window keeps is already due by
+// then, so pruning that day changes nothing. Only the days strictly inside the
+// period distinguish "not due" from "due", and a window equal to the period
+// keeps all of them.
+func (c *Config) validateRetentionCoversCadences() []error {
+	longestDays, longestSource := 0, ""
+	for _, id := range sortedKeys(c.Sources) {
+		// An unknown cadence is already reported by validateSources; counting
+		// it here would be a second complaint about one mistake.
+		days, ok := c.Sources[id].Cadence.Days()
+		if !ok {
+			continue
+		}
+		if days > longestDays {
+			longestDays, longestSource = days, id
+		}
+	}
+	if longestDays == 0 {
+		return nil
+	}
+
+	items := c.Retention.ItemDays()
+	if items >= longestDays {
+		return nil
+	}
+	return []error{fmt.Errorf(
+		"retention.items is %d days but source %q has cadence %q (%d days): "+
+			"the window must be at least as long as the longest cadence, or that source's "+
+			"items are pruned before it is due again and it is re-fetched on every pass",
+		items, longestSource, c.Sources[longestSource].Cadence, longestDays)}
 }
 
 // validateSinks checks the optional sink list. An empty one is fine: without
