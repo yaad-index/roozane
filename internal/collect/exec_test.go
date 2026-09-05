@@ -279,3 +279,29 @@ echo '{"url":"https://example.com/b","content":"after the giant"}'
 	assert.Equal(t, "after the giant", items[1].Content,
 		"reading must continue past an oversize line, not stop at it")
 }
+
+// TestExecCollectorEscapedDescendantCannotHangThePass covers the gap the
+// process-group kill alone leaves. A descendant that calls setsid is in its own
+// session, so a negative-pid SIGKILL never reaches it — and while it holds the
+// stdout pipe open, Wait keeps reading to EOF that never comes. The group kill
+// succeeds and the pass hangs anyway, which is exactly the invariant the kill
+// exists to protect: a hung plugin must not hold the day's run hostage.
+//
+// The in-group child of the timeout test cannot catch this, because it dies
+// with the group and releases the pipe.
+func TestExecCollectorEscapedDescendantCannotHangThePass(t *testing.T) {
+	// The descendant escapes the group AND inherits stdout, so it holds the
+	// pipe open long past the deadline.
+	sh := plugin(t, "cat > /dev/null\nsetsid sh -c 'sleep 20' &\nsleep 20\n")
+
+	ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
+	defer cancel()
+
+	start := time.Now()
+	_, err := execCollectorForTest().Collect(ctx, "a-source", execSource(t, sh, ""))
+	elapsed := time.Since(start)
+
+	require.Error(t, err, "a plugin past its deadline must fail")
+	assert.Less(t, elapsed, 15*time.Second,
+		"the pass waited on a descendant that escaped the process group; it must give up instead")
+}

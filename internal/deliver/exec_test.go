@@ -182,3 +182,22 @@ func TestExecSinkReceivesAnEmptyDigestToo(t *testing.T) {
 	require.NoError(t, json.Unmarshal(raw, &envelope))
 	assert.True(t, envelope.Digest.Empty, "a plugin is told about a quiet day rather than left to guess")
 }
+
+// TestExecSinkEscapedDescendantCannotHangTheRun is the sink half of the same
+// gap: a setsid descendant is outside the group the timeout kills, and while it
+// holds stdout open Wait reads to an EOF that never arrives.
+func TestExecSinkEscapedDescendantCannotHangTheRun(t *testing.T) {
+	sh := script(t, "cat > /dev/null\nsetsid sh -c 'sleep 20' &\nsleep 20\n")
+
+	sink := &execSink{id: "plugin", command: []string{sh}}
+	ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
+	defer cancel()
+
+	start := time.Now()
+	err := sink.Deliver(ctx, Digest{Day: "2026-09-05", Structured: []byte(`{"empty":false}`)})
+	elapsed := time.Since(start)
+
+	require.Error(t, err, "a plugin past its deadline must fail")
+	assert.Less(t, elapsed, 15*time.Second,
+		"the run waited on a descendant that escaped the process group; it must give up instead")
+}
