@@ -1,6 +1,6 @@
 # ADR-0005: Editions, a neutral enrichment pass, and the daily report
 
-**Status:** Proposed
+**Status:** Accepted
 
 ## Context
 
