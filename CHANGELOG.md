@@ -1,5 +1,14 @@
 # Changelog
 
+## [0.2.0](https://github.com/yaad-index/roozane/compare/v0.1.0...v0.2.0) (2026-09-05)
+
+
+### Features
+
+* enforce the retention windows instead of only validating them ([#30](https://github.com/yaad-index/roozane/issues/30)) ([fe94647](https://github.com/yaad-index/roozane/commit/fe946473583161cbb773b3173d75802f072cc65c))
+* record empty collector runs so cadence survives a quiet source ([#26](https://github.com/yaad-index/roozane/issues/26)) ([5ad6115](https://github.com/yaad-index/roozane/commit/5ad6115fc45488cf5bcbef41bd0f0f50a244a330))
+* reject a retention window shorter than the longest cadence ([#28](https://github.com/yaad-index/roozane/issues/28)) ([64256c4](https://github.com/yaad-index/roozane/commit/64256c485cb93c82d9b8a833eba8190eafb4748e))
+
 ## 0.1.0 (2026-09-04)
 
 
