@@ -60,7 +60,10 @@ sinks:
    neither substitutes for the other: `sources` cannot express "only the
    boardgame items inside a general feed", and a profile alone would spend a
    judging call on every unrelated item to discover it is unrelated.
-   `sources: [all]` is the explicit way to say the whole pool.
+   **Omitting `sources` selects the whole pool.** There is deliberately no
+   `all` keyword: source ids are `[a-z0-9-]`, so `all` is a legal source id and
+   a magic token would collide with a real source the day someone names one.
+   Absence cannot collide.
 
 2. **Overlap is free and expected.** An item selected by two editions is judged
    once per *distinct profile* and written into each edition's digest. Nothing
