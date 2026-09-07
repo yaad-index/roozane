@@ -292,7 +292,7 @@ func TestWriteItemNeverExposesATornFile(t *testing.T) {
 // read concurrently — became torn-readable.
 func TestWriteAtomicNeverExposesATornFile(t *testing.T) {
 	s := New(t.TempDir())
-	path := filepath.Join(s.DigestsDir(), "2026-09-04.json")
+	path := filepath.Join(s.EditionDir("default"), "2026-09-04.json")
 
 	bodyA := "A" + strings.Repeat("a", 512*1024)
 	bodyB := "B" + strings.Repeat("b", 512*1024)
@@ -573,9 +573,9 @@ func TestPruneDigestsUsesItsOwnWindow(t *testing.T) {
 	s := New(root)
 	now := mustTime(t, "2026-09-30T12:00:00Z")
 
-	require.NoError(t, os.MkdirAll(s.DigestsDir(), 0o755))
+	require.NoError(t, os.MkdirAll(s.EditionDir("default"), 0o755))
 	write := func(day time.Time) (string, string) {
-		md, structured := s.DigestPaths(day)
+		md, structured := s.DigestPaths(day, "default")
 		require.NoError(t, os.WriteFile(md, []byte("# digest"), 0o644))
 		require.NoError(t, os.WriteFile(structured, []byte("{}"), 0o644))
 		return md, structured
@@ -600,8 +600,8 @@ func TestPruneDigestsZeroKeepsForever(t *testing.T) {
 	s := New(root)
 	now := mustTime(t, "2026-09-30T12:00:00Z")
 
-	require.NoError(t, os.MkdirAll(s.DigestsDir(), 0o755))
-	md, _ := s.DigestPaths(now.AddDate(0, 0, -4000))
+	require.NoError(t, os.MkdirAll(s.EditionDir("default"), 0o755))
+	md, _ := s.DigestPaths(now.AddDate(0, 0, -4000), "default")
 	require.NoError(t, os.WriteFile(md, []byte("# ancient"), 0o644))
 
 	result, err := s.Prune(90, 0, now)
@@ -615,17 +615,24 @@ func TestPruneDigestsLeavesOtherFilesAlone(t *testing.T) {
 	s := New(root)
 	now := mustTime(t, "2026-09-30T12:00:00Z")
 
-	require.NoError(t, os.MkdirAll(s.DigestsDir(), 0o755))
-	readme := filepath.Join(s.DigestsDir(), "README.md")
+	require.NoError(t, os.MkdirAll(s.EditionDir("default"), 0o755))
+	readme := filepath.Join(s.EditionDir("default"), "README.md")
 	require.NoError(t, os.WriteFile(readme, []byte("mine"), 0o644))
-	notADay := filepath.Join(s.DigestsDir(), "summary-2026.json")
+	notADay := filepath.Join(s.EditionDir("default"), "summary-2026.json")
 	require.NoError(t, os.WriteFile(notADay, []byte("{}"), 0o644))
+
+	// A stray file sitting directly under digests/ is not a digest under the
+	// nested layout either, and removing whatever happens to be there is not
+	// the pruner's business.
+	strayAtRoot := filepath.Join(s.DigestsDir(), "2026-01-01.md")
+	require.NoError(t, os.WriteFile(strayAtRoot, []byte("old layout"), 0o644))
 
 	result, err := s.Prune(90, 1, now)
 	require.NoError(t, err)
 	assert.Zero(t, result.Digests)
 	assert.FileExists(t, readme)
 	assert.FileExists(t, notADay)
+	assert.FileExists(t, strayAtRoot)
 }
 
 func TestPruneOnAnEmptyDataRootIsNotAnError(t *testing.T) {
@@ -634,4 +641,56 @@ func TestPruneOnAnEmptyDataRootIsNotAnError(t *testing.T) {
 	require.NoError(t, err, "a fresh install has neither tree yet")
 	assert.Zero(t, result.Days)
 	assert.Zero(t, result.Digests)
+}
+
+// --- digests nested under an edition (ADR-0005 §4) ---
+
+func TestDigestPathsAreNestedUnderTheEdition(t *testing.T) {
+	s := New("/srv/roozane")
+	day := mustTime(t, "2026-09-04T00:00:00Z")
+
+	md, structured := s.DigestPaths(day, "boardgames")
+	assert.Equal(t, "/srv/roozane/digests/boardgames/2026-09-04.md", md)
+	assert.Equal(t, "/srv/roozane/digests/boardgames/2026-09-04.json", structured)
+
+	// The single-reader case takes the same shape rather than a flat path, so
+	// the layout has one rule instead of a rule and an exception.
+	md, _ = s.DigestPaths(day, "default")
+	assert.Equal(t, "/srv/roozane/digests/default/2026-09-04.md", md)
+}
+
+// TestPruneDigestsDescendsIntoEveryEdition is the case that silently stopped
+// working when digests moved: the pruner skipped directory entries outright, so
+// a configured window became keep-forever with no error and no log line — a
+// failure noticed by a full disk.
+func TestPruneDigestsDescendsIntoEveryEdition(t *testing.T) {
+	root := t.TempDir()
+	s := New(root)
+	now := mustTime(t, "2026-09-30T12:00:00Z")
+
+	write := func(edition string, day time.Time) (string, string) {
+		require.NoError(t, os.MkdirAll(s.EditionDir(edition), 0o755))
+		md, structured := s.DigestPaths(day, edition)
+		require.NoError(t, os.WriteFile(md, []byte("# digest"), 0o644))
+		require.NoError(t, os.WriteFile(structured, []byte("{}"), 0o644))
+		return md, structured
+	}
+
+	personalKept, _ := write("personal", now.AddDate(0, 0, -2))
+	personalGone, personalGoneJSON := write("personal", now.AddDate(0, 0, -3))
+	boardKept, _ := write("boardgames", now.AddDate(0, 0, -1))
+	boardGone, boardGoneJSON := write("boardgames", now.AddDate(0, 0, -9))
+
+	result, err := s.Prune(90, 3, now)
+	require.NoError(t, err)
+
+	// Four files across two editions: the window has to be applied inside each
+	// one, not to the top level where nothing but directories live.
+	assert.Equal(t, 4, result.Digests)
+	assert.FileExists(t, personalKept)
+	assert.FileExists(t, boardKept)
+	assert.NoFileExists(t, personalGone)
+	assert.NoFileExists(t, personalGoneJSON)
+	assert.NoFileExists(t, boardGone)
+	assert.NoFileExists(t, boardGoneJSON)
 }
