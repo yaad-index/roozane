@@ -45,10 +45,10 @@ func fixture(t *testing.T, d time.Time, empty bool, sinksYAML string) (*config.C
 		markdown = "# Digest — " + store.Day(d) + "\n\n_Nothing today cleared the relevance bar._\n"
 		items = "[]"
 	}
-	structured := `{"schema":1,"day":"` + store.Day(d) + `","generated_at":"2026-09-04T07:00:00Z","empty":` +
+	structured := `{"schema":1,"day":"` + store.Day(d) + `","edition":"default","generated_at":"2026-09-04T07:00:00Z","empty":` +
 		map[bool]string{true: "true", false: "false"}[empty] + `,"items":` + items + `}`
 
-	mdPath, jsonPath := s.DigestPaths(d, config.DefaultEdition)
+	mdPath, jsonPath := s.DigestPaths(d, "default")
 	require.NoError(t, s.WriteAtomic(mdPath, []byte(markdown)))
 	require.NoError(t, s.WriteAtomic(jsonPath, []byte(structured)))
 
@@ -141,7 +141,9 @@ func TestAnEmptyDigestIsStillDelivered(t *testing.T) {
 	).Run(context.Background(), d)
 	require.NoError(t, err)
 
-	assert.True(t, result.Empty)
+	require.Len(t, result.Sinks, 1)
+	assert.True(t, result.Sinks[0].Empty, "the run reports which sinks carried a quiet day")
+	assert.Equal(t, "default", result.Sinks[0].Edition)
 	require.Len(t, sink.got, 1)
 	assert.True(t, sink.got[0].Empty)
 	assert.Contains(t, sink.got[0].Markdown, "Nothing today cleared the relevance bar")
@@ -153,16 +155,24 @@ func TestMissingDigestIsNotTreatedAsEmpty(t *testing.T) {
 
 	// Ask for a day that was never aggregated.
 	sink := &recordingSink{}
-	_, err := NewRunner(cfg,
+	result, err := NewRunner(cfg,
 		WithLogger(quietLogger()),
 		WithSinkBuilder(func(string, config.Sink) (Sink, error) { return sink, nil }),
 	).Run(context.Background(), day(t, "2026-09-05"))
+	require.NoError(t, err)
 
 	// Absent is not empty: delivering an invented empty digest would erase the
-	// difference ADR-0002 goes out of its way to preserve.
-	require.Error(t, err)
-	assert.Contains(t, err.Error(), "has not run")
+	// difference ADR-0002 goes out of its way to preserve. Nothing reaching the
+	// sink is the property; where the error is reported is not.
 	assert.Empty(t, sink.got)
+
+	// The failure is recorded against the sinks bound to that edition rather
+	// than returned for the run, so one edition that was never aggregated does
+	// not stop the ones that were. The pass still fails overall.
+	require.Len(t, result.Sinks, 1)
+	require.Error(t, result.Sinks[0].Err)
+	assert.Contains(t, result.Sinks[0].Err.Error(), "has not run")
+	assert.True(t, result.Failed())
 }
 
 func TestNoSinksIsNotAFailure(t *testing.T) {
@@ -227,7 +237,7 @@ func TestFileSinkJSONFormatPassesTheBytesThrough(t *testing.T) {
 	require.NoError(t, err)
 	require.NoError(t, result.Sinks[0].Err)
 
-	_, jsonPath := store.New(filepath.Join(root, "data")).DigestPaths(d, config.DefaultEdition)
+	_, jsonPath := store.New(filepath.Join(root, "data")).DigestPaths(d, "default")
 	onDisk, err := os.ReadFile(jsonPath) //nolint:gosec // test-controlled path
 	require.NoError(t, err)
 	delivered, err := os.ReadFile(out) //nolint:gosec // test-controlled path
@@ -372,7 +382,7 @@ func TestTelegramSinkSplitsALongDigest(t *testing.T) {
 
 	// Overwrite the digest with one past the platform's message ceiling.
 	long := "# Digest\n\n" + strings.Repeat("A line of the digest that the reader wants.\n", 200)
-	mdPath, _ := store.New(filepath.Join(root, "data")).DigestPaths(d, config.DefaultEdition)
+	mdPath, _ := store.New(filepath.Join(root, "data")).DigestPaths(d, "default")
 	require.NoError(t, store.New(filepath.Join(root, "data")).WriteAtomic(mdPath, []byte(long)))
 	require.Greater(t, len(long), telegramLimit, "the fixture must exceed the ceiling to exercise splitting")
 
@@ -491,7 +501,7 @@ func TestTelegramSinkDeliversMultiByteTextIntact(t *testing.T) {
 		"sinks:\n  chat: {type: telegram, params: {chat_id: \"1\", token_env: TEST_BOT_TOKEN, api_base: \""+srv.URL+"\"}}\n")
 
 	digest := strings.Repeat("روزنه", 1200)
-	mdPath, _ := store.New(filepath.Join(root, "data")).DigestPaths(d, config.DefaultEdition)
+	mdPath, _ := store.New(filepath.Join(root, "data")).DigestPaths(d, "default")
 	require.NoError(t, store.New(filepath.Join(root, "data")).WriteAtomic(mdPath, []byte(digest)))
 
 	result, err := NewRunner(cfg, WithLogger(quietLogger())).Run(context.Background(), d)
@@ -526,4 +536,147 @@ func TestSplitMessageTerminatesOnAPathologicalLimit(t *testing.T) {
 	case <-time.After(5 * time.Second):
 		t.Fatal("splitMessage did not terminate: the zero-cut guard is missing")
 	}
+}
+
+// --- per-edition routing (ADR-0005 §5) ---
+
+// writeEditionDigest puts one edition's digest on disk under an existing data
+// root, so a test can set up several editions for one day.
+func writeEditionDigest(t *testing.T, root string, d time.Time, edition string) {
+	t.Helper()
+	s := store.New(root)
+
+	markdown := "# Digest — " + store.Day(d) + "\n\n- a point for " + edition + "\n"
+	structured := `{"schema":1,"day":"` + store.Day(d) + `","edition":"` + edition +
+		`","generated_at":"2026-09-04T07:00:00Z","empty":false,"items":[]}`
+
+	mdPath, jsonPath := s.DigestPaths(d, edition)
+	require.NoError(t, s.WriteAtomic(mdPath, []byte(markdown)))
+	require.NoError(t, s.WriteAtomic(jsonPath, []byte(structured)))
+}
+
+// TestEachSinkGetsTheEditionItNames is the point of the binding: two sinks on
+// one run carry different digests, and neither sees the other's.
+func TestEachSinkGetsTheEditionItNames(t *testing.T) {
+	d := day(t, "2026-09-04")
+	cfg, _ := fixture(t, d, false, `editions:
+  personal: {}
+  boardgames: {}
+sinks:
+  private-file: {type: file, edition: personal}
+  newsletter:   {type: file, edition: boardgames}
+`)
+	writeEditionDigest(t, cfg.DataRootPath(), d, "personal")
+	writeEditionDigest(t, cfg.DataRootPath(), d, "boardgames")
+
+	got := map[string]Digest{}
+	result, err := NewRunner(cfg,
+		WithLogger(quietLogger()),
+		WithSinkBuilder(func(id string, _ config.Sink) (Sink, error) {
+			return &capturingSink{id: id, into: got}, nil
+		}),
+	).Run(context.Background(), d)
+	require.NoError(t, err)
+	assert.False(t, result.Failed())
+
+	require.Contains(t, got, "private-file")
+	require.Contains(t, got, "newsletter")
+	assert.Contains(t, got["private-file"].Markdown, "a point for personal")
+	assert.Contains(t, got["newsletter"].Markdown, "a point for boardgames")
+	assert.NotContains(t, got["newsletter"].Markdown, "personal",
+		"a sink must never receive an edition it did not name")
+	assert.Equal(t, "personal", got["private-file"].Edition)
+	assert.Equal(t, "boardgames", got["newsletter"].Edition)
+}
+
+// TestManySinksMayNameOneEdition is how one digest reaches both a chat and a
+// file.
+func TestManySinksMayNameOneEdition(t *testing.T) {
+	d := day(t, "2026-09-04")
+	cfg, _ := fixture(t, d, false, `editions:
+  personal: {}
+sinks:
+  to-file: {type: file, edition: personal}
+  to-chat: {type: telegram, edition: personal}
+`)
+	writeEditionDigest(t, cfg.DataRootPath(), d, "personal")
+
+	got := map[string]Digest{}
+	result, err := NewRunner(cfg,
+		WithLogger(quietLogger()),
+		WithSinkBuilder(func(id string, _ config.Sink) (Sink, error) {
+			return &capturingSink{id: id, into: got}, nil
+		}),
+	).Run(context.Background(), d)
+	require.NoError(t, err)
+	assert.False(t, result.Failed())
+
+	require.Len(t, got, 2)
+	assert.Equal(t, got["to-file"].Markdown, got["to-chat"].Markdown)
+}
+
+// TestOneMissingEditionDoesNotStopTheOthers is why a missing digest is recorded
+// per sink rather than returned for the run.
+func TestOneMissingEditionDoesNotStopTheOthers(t *testing.T) {
+	d := day(t, "2026-09-04")
+	cfg, _ := fixture(t, d, false, `editions:
+  present: {}
+  absent: {}
+sinks:
+  a-sink: {type: file, edition: absent}
+  b-sink: {type: file, edition: present}
+`)
+	writeEditionDigest(t, cfg.DataRootPath(), d, "present")
+
+	got := map[string]Digest{}
+	result, err := NewRunner(cfg,
+		WithLogger(quietLogger()),
+		WithSinkBuilder(func(id string, _ config.Sink) (Sink, error) {
+			return &capturingSink{id: id, into: got}, nil
+		}),
+	).Run(context.Background(), d)
+	require.NoError(t, err)
+
+	byID := map[string]SinkResult{}
+	for _, s := range result.Sinks {
+		byID[s.ID] = s
+	}
+	require.Error(t, byID["a-sink"].Err)
+	assert.Contains(t, byID["a-sink"].Err.Error(), "has not run")
+	assert.NoError(t, byID["b-sink"].Err, "the edition that was aggregated is still delivered")
+	assert.Contains(t, got["b-sink"].Markdown, "a point for present")
+
+	assert.True(t, result.Failed(), "the pass still fails overall so a scheduler notices")
+}
+
+// TestAReportSinkIsNotGivenAnEditionsDigest is the failure the binding exists to
+// prevent, checked at the layer that would commit it.
+func TestAReportSinkIsNotGivenAnEditionsDigest(t *testing.T) {
+	d := day(t, "2026-09-04")
+	cfg, _ := fixture(t, d, false, "sinks:\n  telemetry: {type: file, report: true}\n")
+
+	got := map[string]Digest{}
+	result, err := NewRunner(cfg,
+		WithLogger(quietLogger()),
+		WithSinkBuilder(func(id string, _ config.Sink) (Sink, error) {
+			return &capturingSink{id: id, into: got}, nil
+		}),
+	).Run(context.Background(), d)
+	require.NoError(t, err)
+
+	assert.Empty(t, got, "a report sink must receive nothing rather than the default edition's digest")
+	require.Len(t, result.Sinks, 1)
+	require.Error(t, result.Sinks[0].Err)
+	assert.Contains(t, result.Sinks[0].Err.Error(), "daily report")
+}
+
+// capturingSink records the digest it was handed, keyed by sink id.
+type capturingSink struct {
+	id   string
+	into map[string]Digest
+}
+
+func (c *capturingSink) Deliver(_ context.Context, digest Digest) error {
+	c.into[c.id] = digest
+	return nil
 }
