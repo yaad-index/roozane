@@ -1,5 +1,16 @@
 # Changelog
 
+## [0.4.0](https://github.com/yaad-index/roozane/compare/v0.3.0...v0.4.0) (2026-09-07)
+
+
+### Features
+
+* editions and the sink binding ([#47](https://github.com/yaad-index/roozane/issues/47)) ([a5c27ea](https://github.com/yaad-index/roozane/commit/a5c27eabe30ad0151145410d1c89da5d34f7e7d4))
+* empty digests carry their sources' collection outcomes ([#53](https://github.com/yaad-index/roozane/issues/53)) ([14742f9](https://github.com/yaad-index/roozane/commit/14742f9210b1f7f796d7a018555ac4077f34b2ed))
+* neutral enrichment pass, then per-edition selection ([#49](https://github.com/yaad-index/roozane/issues/49)) ([626daae](https://github.com/yaad-index/roozane/commit/626daaece5a9e88d6853eee6a81a80a3f14ee6e9))
+* persist per-source collection outcomes as telemetry ([#51](https://github.com/yaad-index/roozane/issues/51)) ([f895fb6](https://github.com/yaad-index/roozane/commit/f895fb62b23325c3d4b9bd3be169ecfe5adebefb))
+* the daily report, and a sink that can name it ([#54](https://github.com/yaad-index/roozane/issues/54)) ([c985316](https://github.com/yaad-index/roozane/commit/c98531604ac759a2f590546ddfb1d2590d22fc6f))
+
 ## [0.3.0](https://github.com/yaad-index/roozane/compare/v0.2.0...v0.3.0) (2026-09-05)
 
 
