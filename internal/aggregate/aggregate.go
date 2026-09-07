@@ -345,7 +345,7 @@ func (r *Runner) writeDigest(ctx context.Context, day time.Time, profile string,
 		return "", usage, fmt.Errorf("encode digest: %w", err)
 	}
 
-	mdPath, jsonPath := r.store.DigestPaths(day)
+	mdPath, jsonPath := r.store.DigestPaths(day, config.DefaultEdition)
 	if err := r.store.WriteAtomic(mdPath, []byte(markdown)); err != nil {
 		return "", usage, fmt.Errorf("write digest markdown: %w", err)
 	}

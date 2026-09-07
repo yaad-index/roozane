@@ -158,7 +158,7 @@ func (r *Runner) Run(ctx context.Context, day time.Time) (Result, error) {
 
 // readDigest loads both digest files for a day.
 func (r *Runner) readDigest(day time.Time) (Digest, error) {
-	mdPath, jsonPath := r.store.DigestPaths(day)
+	mdPath, jsonPath := r.store.DigestPaths(day, config.DefaultEdition)
 
 	markdown, err := os.ReadFile(mdPath) //nolint:gosec // path is inside the engine's own data root
 	if err != nil {

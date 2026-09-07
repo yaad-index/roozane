@@ -48,7 +48,7 @@ func fixture(t *testing.T, d time.Time, empty bool, sinksYAML string) (*config.C
 	structured := `{"schema":1,"day":"` + store.Day(d) + `","generated_at":"2026-09-04T07:00:00Z","empty":` +
 		map[bool]string{true: "true", false: "false"}[empty] + `,"items":` + items + `}`
 
-	mdPath, jsonPath := s.DigestPaths(d)
+	mdPath, jsonPath := s.DigestPaths(d, config.DefaultEdition)
 	require.NoError(t, s.WriteAtomic(mdPath, []byte(markdown)))
 	require.NoError(t, s.WriteAtomic(jsonPath, []byte(structured)))
 
@@ -227,7 +227,7 @@ func TestFileSinkJSONFormatPassesTheBytesThrough(t *testing.T) {
 	require.NoError(t, err)
 	require.NoError(t, result.Sinks[0].Err)
 
-	_, jsonPath := store.New(filepath.Join(root, "data")).DigestPaths(d)
+	_, jsonPath := store.New(filepath.Join(root, "data")).DigestPaths(d, config.DefaultEdition)
 	onDisk, err := os.ReadFile(jsonPath) //nolint:gosec // test-controlled path
 	require.NoError(t, err)
 	delivered, err := os.ReadFile(out) //nolint:gosec // test-controlled path
@@ -372,7 +372,7 @@ func TestTelegramSinkSplitsALongDigest(t *testing.T) {
 
 	// Overwrite the digest with one past the platform's message ceiling.
 	long := "# Digest\n\n" + strings.Repeat("A line of the digest that the reader wants.\n", 200)
-	mdPath, _ := store.New(filepath.Join(root, "data")).DigestPaths(d)
+	mdPath, _ := store.New(filepath.Join(root, "data")).DigestPaths(d, config.DefaultEdition)
 	require.NoError(t, store.New(filepath.Join(root, "data")).WriteAtomic(mdPath, []byte(long)))
 	require.Greater(t, len(long), telegramLimit, "the fixture must exceed the ceiling to exercise splitting")
 
@@ -491,7 +491,7 @@ func TestTelegramSinkDeliversMultiByteTextIntact(t *testing.T) {
 		"sinks:\n  chat: {type: telegram, params: {chat_id: \"1\", token_env: TEST_BOT_TOKEN, api_base: \""+srv.URL+"\"}}\n")
 
 	digest := strings.Repeat("روزنه", 1200)
-	mdPath, _ := store.New(filepath.Join(root, "data")).DigestPaths(d)
+	mdPath, _ := store.New(filepath.Join(root, "data")).DigestPaths(d, config.DefaultEdition)
 	require.NoError(t, store.New(filepath.Join(root, "data")).WriteAtomic(mdPath, []byte(digest)))
 
 	result, err := NewRunner(cfg, WithLogger(quietLogger())).Run(context.Background(), d)

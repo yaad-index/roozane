@@ -121,7 +121,7 @@ func TestRunWritesBothDigestFiles(t *testing.T) {
 	assert.False(t, result.Empty)
 	assert.Equal(t, 150, result.Usage.PromptTokens, "both passes are accounted for")
 
-	mdPath, jsonPath := store.New(root).DigestPaths(day)
+	mdPath, jsonPath := store.New(root).DigestPaths(day, config.DefaultEdition)
 
 	md, err := os.ReadFile(mdPath) //nolint:gosec // test-controlled path
 	require.NoError(t, err)
@@ -165,7 +165,7 @@ func TestQuietDayWritesAnExplicitEmptyDigest(t *testing.T) {
 	// asking a model to write about nothing is how filler gets produced.
 	assert.Len(t, client.calls, 1, "a quiet day must not spend a digest call")
 
-	mdPath, jsonPath := store.New(root).DigestPaths(day)
+	mdPath, jsonPath := store.New(root).DigestPaths(day, config.DefaultEdition)
 
 	md, err := os.ReadFile(mdPath) //nolint:gosec // test-controlled path
 	require.NoError(t, err)
@@ -319,7 +319,7 @@ func TestNoItemsStillWritesAnEmptyDigest(t *testing.T) {
 	assert.True(t, result.Empty)
 	assert.Empty(t, client.calls)
 
-	mdPath, _ := store.New(root).DigestPaths(day)
+	mdPath, _ := store.New(root).DigestPaths(day, config.DefaultEdition)
 	assert.FileExists(t, mdPath, "a day that collected nothing is still a day the engine ran")
 }
 
@@ -365,7 +365,7 @@ func TestDigestFilesAreWrittenAtomically(t *testing.T) {
 	_, err := runner(t, cfg, client, day).Run(context.Background(), day)
 	require.NoError(t, err)
 
-	entries, err := os.ReadDir(store.New(root).DigestsDir())
+	entries, err := os.ReadDir(store.New(root).EditionDir(config.DefaultEdition))
 	require.NoError(t, err)
 	require.Len(t, entries, 2)
 	for _, e := range entries {
@@ -432,7 +432,7 @@ func TestAFailureIsNeverReusedAsAVerdict(t *testing.T) {
 	assert.Zero(t, result.Reused, "a failed entry must be re-judged, not reused")
 	require.Len(t, client.calls, 2)
 
-	_, jsonPath := store.New(root).DigestPaths(day)
+	_, jsonPath := store.New(root).DigestPaths(day, config.DefaultEdition)
 	digestRaw, err := os.ReadFile(jsonPath) //nolint:gosec // test-controlled path
 	require.NoError(t, err)
 	assert.Contains(t, string(digestRaw), "fresh point")
@@ -476,7 +476,7 @@ func TestStateFromADifferentSchemaIsNotReused(t *testing.T) {
 	assert.Zero(t, result.Reused)
 	require.Len(t, client.calls, 2)
 
-	_, jsonPath := store.New(root).DigestPaths(day)
+	_, jsonPath := store.New(root).DigestPaths(day, config.DefaultEdition)
 	digest, err := os.ReadFile(jsonPath) //nolint:gosec // test-controlled path
 	require.NoError(t, err)
 	assert.Contains(t, string(digest), "fresh")
