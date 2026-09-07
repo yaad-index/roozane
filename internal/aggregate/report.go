@@ -29,8 +29,11 @@ const (
 // pipeline, and no amount of reporting can describe what was never fetched. The
 // report prints per-source yield so the gap is legible, and says plainly that
 // these reasons do not explain every absence.
+//
+// Enrichment failure is deliberately not among them. It happens before any
+// edition sees the item, so it is not a per-edition absence: ADR-0005 §7 answers
+// that case at item level, where the report records StatusFailed with the error.
 const (
-	ReasonEnrichFailed = "enrichment failed"
 	ReasonBelowFloor   = "below the generic salience floor"
 	ReasonNotInSources = "not in this edition's source list"
 	ReasonNotSelected  = "not selected by this edition's profile"
