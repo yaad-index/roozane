@@ -934,3 +934,110 @@ sinks:
 	assert.Empty(t, id)
 	assert.True(t, cfg.Sinks["reporting"].Report)
 }
+
+// --- prices and the report window (ADR-0005 §7) ---
+
+func TestPricesAreOptional(t *testing.T) {
+	cfg, err := Load(write(t, validConfig))
+	require.NoError(t, err)
+
+	assert.False(t, cfg.Aggregator.Prices.Configured(),
+		"no prices means the report counts tokens and says nothing about money")
+	assert.Zero(t, cfg.Retention.Reports, "an absent report window keeps reports forever")
+}
+
+func TestLoadPrices(t *testing.T) {
+	cfg, err := Load(write(t, replaceLine(validConfig, "  digests: 365", "  digests: 365\n  reports: 30")))
+	require.NoError(t, err)
+	assert.Equal(t, 30, cfg.Retention.Reports)
+
+	cfg, err = Load(write(t, replaceLine(validConfig, "  timeout: 45s", `  timeout: 45s
+  prices:
+    currency: "ZWL"
+    per_million_tokens:
+      small: {input: 0.15, output: 0.60}`)))
+	require.NoError(t, err)
+
+	require.True(t, cfg.Aggregator.Prices.Configured())
+	assert.Equal(t, "ZWL", cfg.Aggregator.Prices.Currency)
+
+	price, ok := cfg.Aggregator.Prices.For("small")
+	require.True(t, ok)
+	assert.InDelta(t, 0.15, price.Input, 0.0001)
+	assert.InDelta(t, 0.60, price.Output, 0.0001)
+
+	// A model with no entry reports false rather than pricing at zero: a total
+	// that silently omits a model understates the day and looks like a cheap one.
+	_, ok = cfg.Aggregator.Prices.For("large")
+	assert.False(t, ok)
+}
+
+// TestModelPriceCostUsesThePerMillionUnitInItsKey is the arithmetic the config
+// key promises. Getting the unit wrong is not a visible failure — it is a money
+// figure off by a factor of a thousand.
+func TestModelPriceCostUsesThePerMillionUnitInItsKey(t *testing.T) {
+	price := ModelPrice{Input: 2, Output: 8}
+
+	assert.InDelta(t, 10.0, price.Cost(1_000_000, 1_000_000), 0.0001,
+		"one million each way at 2 and 8 is 10, not 10,000,000")
+	assert.InDelta(t, 0.00001, price.Cost(5, 0), 0.0000001)
+	assert.Zero(t, price.Cost(0, 0))
+}
+
+func TestPriceValidation(t *testing.T) {
+	pricesConfig := func(body string) string {
+		return replaceLine(validConfig, "  timeout: 45s", "  timeout: 45s\n"+body)
+	}
+
+	for name, tc := range map[string]struct {
+		body string
+		want string // empty means accepted
+	}{
+		"rates with a currency": {
+			body: "  prices:\n    currency: \"ZWL\"\n    per_million_tokens:\n      small: {input: 1, output: 2}\n",
+		},
+		"a rate for a model this config does not use is allowed": {
+			body: "  prices:\n    currency: \"ZWL\"\n    per_million_tokens:\n      some-other-model: {input: 1, output: 2}\n",
+		},
+		"zero rates are allowed": {
+			body: "  prices:\n    currency: \"ZWL\"\n    per_million_tokens:\n      small: {input: 0, output: 0}\n",
+		},
+		"rates with no currency": {
+			body: "  prices:\n    per_million_tokens:\n      small: {input: 1, output: 2}\n",
+			want: "prices.currency must not be empty",
+		},
+		"a currency with no rates": {
+			body: "  prices:\n    currency: \"ZWL\"\n",
+			want: "no per_million_tokens rates are",
+		},
+		"negative input rate": {
+			body: "  prices:\n    currency: \"ZWL\"\n    per_million_tokens:\n      small: {input: -1, output: 2}\n",
+			want: "per_million_tokens.small.input must not be negative",
+		},
+		"negative output rate": {
+			body: "  prices:\n    currency: \"ZWL\"\n    per_million_tokens:\n      small: {input: 1, output: -2}\n",
+			want: "per_million_tokens.small.output must not be negative",
+		},
+		"unknown price field": {
+			body: "  prices:\n    currency: \"ZWL\"\n    per_thousand_tokens:\n      small: {input: 1}\n",
+			want: "per_thousand_tokens",
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			_, err := Load(write(t, pricesConfig(tc.body)))
+
+			if tc.want == "" {
+				require.NoError(t, err)
+				return
+			}
+			require.Error(t, err)
+			assert.Contains(t, err.Error(), tc.want)
+		})
+	}
+}
+
+func TestNegativeReportRetentionIsRejected(t *testing.T) {
+	_, err := Load(write(t, replaceLine(validConfig, "  digests: 365", "  digests: 365\n  reports: -1")))
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "retention.reports must not be negative")
+}

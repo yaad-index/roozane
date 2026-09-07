@@ -397,6 +397,22 @@ func (s *Store) StatePath(t time.Time) string {
 	return filepath.Join(s.DayDir(t), "state.json")
 }
 
+// ReportsDir is the tree the daily operator report lives in.
+//
+// It is a sibling of digests/ rather than an edition inside it, because the
+// report is not an audience: it has no sources and no profile, it describes the
+// editions rather than being one, and every rule editions carry would need an
+// exception for it (ADR-0005 §7). Keeping it a distinct path is also what lets
+// it have a retention window of its own.
+func (s *Store) ReportsDir() string { return filepath.Join(s.root, "reports") }
+
+// ReportPaths are the two files one day's report is written to.
+func (s *Store) ReportPaths(t time.Time) (markdown, structured string) {
+	day := Day(t)
+	dir := s.ReportsDir()
+	return filepath.Join(dir, day+".md"), filepath.Join(dir, day+".json")
+}
+
 // CollectedPath is the collector's per-day outcome record (ADR-0005 §6).
 //
 // It lives inside the day folder, so item retention carries it away with the
@@ -506,6 +522,10 @@ func parseItem(name, raw string) (StoredItem, error) {
 type PruneResult struct {
 	Days    int
 	Digests int
+
+	// Reports is how many report files were removed. It is counted separately
+	// from digests because reports/ is a sibling tree with its own window.
+	Reports int
 }
 
 // Prune enforces ADR-0002 §6's two retention windows, both counted in UTC days.
@@ -529,7 +549,7 @@ type PruneResult struct {
 // A window below 1 prunes nothing rather than everything: validation already
 // rejects it, and a bug that reached here should not be the one that deletes
 // the day collectors are writing into.
-func (s *Store) Prune(itemDays, digestDays int, now time.Time) (PruneResult, error) {
+func (s *Store) Prune(itemDays, digestDays, reportDays int, now time.Time) (PruneResult, error) {
 	var result PruneResult
 	var problems []error
 
@@ -545,7 +565,26 @@ func (s *Store) Prune(itemDays, digestDays int, now time.Time) (PruneResult, err
 		problems = append(problems, err)
 	}
 
+	reports, err := s.pruneReports(reportDays, now)
+	result.Reports = reports
+	if err != nil {
+		problems = append(problems, err)
+	}
+
 	return result, errors.Join(problems...)
+}
+
+// pruneReports removes report files past the report window.
+//
+// reports/ is flat — one report per day, no edition dimension — so this is the
+// day-keyed sweep the digest tree had before it gained one, and it shipped with
+// the tree rather than after it for the same reason: a retention window that
+// silently never applies is noticed by a full disk.
+func (s *Store) pruneReports(reportDays int, now time.Time) (int, error) {
+	if reportDays < 1 {
+		return 0, nil
+	}
+	return pruneDayKeyedFiles(s.ReportsDir(), reportDays, now)
 }
 
 // pruneDays removes whole day folders past the item window.
@@ -628,13 +667,25 @@ func (s *Store) pruneDigests(digestDays int, now time.Time) (int, error) {
 
 // pruneEditionDigests removes one edition's digest files past the window.
 func (s *Store) pruneEditionDigests(edition string, digestDays int, now time.Time) (int, error) {
-	dir := s.EditionDir(edition)
+	removed, err := pruneDayKeyedFiles(s.EditionDir(edition), digestDays, now)
+	if err != nil {
+		return removed, fmt.Errorf("edition %s: %w", edition, err)
+	}
+	return removed, nil
+}
+
+// pruneDayKeyedFiles removes the day-named .md/.json files in one directory
+// that are older than the window. Anything it does not recognise — a
+// subdirectory, another extension, a name that is not a day key — is left
+// exactly where it is: deleting whatever happens to sit in a directory the
+// engine writes to is not the pruner's business.
+func pruneDayKeyedFiles(dir string, days int, now time.Time) (int, error) {
 	entries, err := os.ReadDir(dir)
 	if err != nil {
 		if os.IsNotExist(err) {
 			return 0, nil
 		}
-		return 0, fmt.Errorf("read digests directory for edition %s: %w", edition, err)
+		return 0, fmt.Errorf("read directory %s: %w", dir, err)
 	}
 
 	var removed int
@@ -648,11 +699,11 @@ func (s *Store) pruneEditionDigests(edition string, digestDays int, now time.Tim
 			continue
 		}
 		age, ok := dayAge(strings.TrimSuffix(e.Name(), ext), now)
-		if !ok || age < digestDays {
+		if !ok || age < days {
 			continue
 		}
 		if err := os.Remove(filepath.Join(dir, e.Name())); err != nil {
-			problems = append(problems, fmt.Errorf("remove digest %s/%s: %w", edition, e.Name(), err))
+			problems = append(problems, fmt.Errorf("remove %s: %w", e.Name(), err))
 			continue
 		}
 		removed++

@@ -77,6 +77,16 @@ type Retention struct {
 	// the default, so absent and explicit zero mean the same thing here and no
 	// pointer is needed.
 	Digests int `yaml:"digests"`
+
+	// Reports prunes the reports/ tree, on the same zero-keeps-forever terms.
+	//
+	// It is a rule of its own rather than a share of the digest window because
+	// reports/ is a sibling tree, not part of digests/ (ADR-0005 §7). The two
+	// answer different questions and are wanted for different lengths of time:
+	// a digest is the record a reader keeps, while a report is operator
+	// telemetry that is interesting for as long as you are tuning and dead
+	// weight afterwards.
+	Reports int `yaml:"reports"`
 }
 
 // Aggregator describes the one layer with a brain (ADR-0001 §3). It is
@@ -95,6 +105,12 @@ type Aggregator struct {
 
 	Models Models `yaml:"models"`
 
+	// Prices is the optional cost table the daily report needs to turn tokens
+	// into money. Absent means the report counts tokens and says nothing about
+	// cost, which is the default: the engine is provider-agnostic and cannot
+	// know what a model charges.
+	Prices Prices `yaml:"prices"`
+
 	// Timeout is a pointer for the same reason Retention.Items is: an absent
 	// timeout should take the default, while an explicit `timeout: 0s` is a
 	// request for no timeout at all and must be rejected rather than silently
@@ -107,6 +123,52 @@ type Aggregator struct {
 type Models struct {
 	Item   string `yaml:"item"`
 	Digest string `yaml:"digest"`
+}
+
+// Prices is what a model charges, supplied by the operator because the engine
+// refuses to assume a provider (ADR-0005 §7).
+type Prices struct {
+	// Currency is printed verbatim wherever a cost appears. The engine does not
+	// interpret it, convert it, or default it: an engine that will not assume a
+	// provider has no business assuming a denomination, and an unlabelled number
+	// means whatever the reader guesses.
+	Currency string `yaml:"currency"`
+
+	// PerMillionTokens is keyed by model name.
+	//
+	// The unit is in the key on purpose. A rate is meaningless without one, and
+	// getting it wrong is not a visible failure — it is a money figure wrong by
+	// a factor of a thousand, in a report whose whole job is to be trusted.
+	// Naming the unit where the numbers are written makes that unmissable
+	// instead of a convention someone has to know.
+	PerMillionTokens map[string]ModelPrice `yaml:"per_million_tokens"`
+}
+
+// ModelPrice is one model's rates, split by direction because llm.Usage already
+// splits prompt from completion tokens and every real provider charges them
+// differently. A single blended figure would misprice every model and throw
+// away data already collected.
+type ModelPrice struct {
+	Input  float64 `yaml:"input"`
+	Output float64 `yaml:"output"`
+}
+
+// Configured reports whether any prices were supplied.
+func (p Prices) Configured() bool { return len(p.PerMillionTokens) > 0 }
+
+// For returns a model's rates. The second result is false when the model has no
+// entry, so a caller reports the gap rather than silently pricing it at zero —
+// a total that quietly omits an unpriced model understates spend and looks
+// exactly like a cheap day.
+func (p Prices) For(model string) (ModelPrice, bool) {
+	price, ok := p.PerMillionTokens[model]
+	return price, ok
+}
+
+// Cost converts token counts to money at this model's rates.
+func (p ModelPrice) Cost(promptTokens, completionTokens int) float64 {
+	const perMillion = 1_000_000.0
+	return (float64(promptTokens)*p.Input + float64(completionTokens)*p.Output) / perMillion
 }
 
 // Edition is one audience's view of the shared item pool (ADR-0005 §2). It
@@ -472,6 +534,9 @@ func (c *Config) Validate() error {
 	if c.Retention.Digests < 0 {
 		problems = append(problems, fmt.Errorf("retention.digests must not be negative, got %d (0 means keep forever)", c.Retention.Digests))
 	}
+	if c.Retention.Reports < 0 {
+		problems = append(problems, fmt.Errorf("retention.reports must not be negative, got %d (0 means keep forever)", c.Retention.Reports))
+	}
 
 	problems = append(problems, c.validateAggregator()...)
 	problems = append(problems, c.validateSources()...)
@@ -520,6 +585,41 @@ func (c *Config) validateAggregator() []error {
 		problems = append(problems, fmt.Errorf("aggregator.timeout must be positive, got %s", timeout))
 	}
 
+	problems = append(problems, validatePrices(a.Prices)...)
+
+	return problems
+}
+
+// validatePrices checks the optional cost table.
+//
+// An entry for a model the config does not currently use is deliberately
+// allowed: keeping rates for models you switch between is legitimate, and it is
+// not the silent-typo class that a sink's edition id is, because an unused rate
+// changes no output. What is refused is a table that cannot produce a
+// meaningful figure — a rate with no currency to print beside it, or a negative
+// one.
+func validatePrices(prices Prices) []error {
+	if !prices.Configured() {
+		if prices.Currency != "" {
+			return []error{errors.New("aggregator.prices.currency is set but no per_million_tokens rates are: the report would have a denomination and nothing to print in it")}
+		}
+		return nil
+	}
+
+	var problems []error
+	if strings.TrimSpace(prices.Currency) == "" {
+		problems = append(problems, errors.New(
+			"aggregator.prices.currency must not be empty: the engine prints it verbatim beside every cost and will not assume a denomination"))
+	}
+	for _, model := range sortedKeys(prices.PerMillionTokens) {
+		price := prices.PerMillionTokens[model]
+		if price.Input < 0 {
+			problems = append(problems, fmt.Errorf("aggregator.prices.per_million_tokens.%s.input must not be negative, got %v", model, price.Input))
+		}
+		if price.Output < 0 {
+			problems = append(problems, fmt.Errorf("aggregator.prices.per_million_tokens.%s.output must not be negative, got %v", model, price.Output))
+		}
+	}
 	return problems
 }
 

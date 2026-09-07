@@ -502,7 +502,7 @@ func TestPruneKeepsExactlyTheNewestNDays(t *testing.T) {
 		seedDay(t, s, now.AddDate(0, 0, -age))
 	}
 
-	result, err := s.Prune(7, 0, now)
+	result, err := s.Prune(7, 0, 0, now)
 	require.NoError(t, err)
 	assert.Equal(t, 3, result.Days, "ages 7, 8 and 9 are past a 7-day window")
 
@@ -526,7 +526,7 @@ func TestPruneWithAWindowOfOneKeepsTodayAlone(t *testing.T) {
 	seedDay(t, s, now)
 	seedDay(t, s, now.AddDate(0, 0, -1))
 
-	result, err := s.Prune(1, 0, now)
+	result, err := s.Prune(1, 0, 0, now)
 	require.NoError(t, err)
 	assert.Equal(t, 1, result.Days)
 
@@ -544,7 +544,7 @@ func TestPruneWithAWindowBelowOneRemovesNothing(t *testing.T) {
 	seedDay(t, s, now.AddDate(0, 0, -400))
 
 	for _, window := range []int{0, -1} {
-		result, err := s.Prune(window, 0, now)
+		result, err := s.Prune(window, 0, 0, now)
 		require.NoError(t, err)
 		assert.Zero(t, result.Days, "window %d must prune nothing", window)
 		assert.DirExists(t, s.DayDir(now.AddDate(0, 0, -400)))
@@ -562,7 +562,7 @@ func TestPruneLeavesUnrecognisedEntriesAlone(t *testing.T) {
 	stray := filepath.Join(root, "days", "notes-from-the-operator")
 	require.NoError(t, os.MkdirAll(stray, 0o755))
 
-	result, err := s.Prune(7, 0, now)
+	result, err := s.Prune(7, 0, 0, now)
 	require.NoError(t, err)
 	assert.Equal(t, 1, result.Days, "only the real day folder counts as pruned")
 	assert.DirExists(t, stray, "a name that is not a day key must not be touched")
@@ -583,7 +583,7 @@ func TestPruneDigestsUsesItsOwnWindow(t *testing.T) {
 	keptMD, keptJSON := write(now.AddDate(0, 0, -2))
 	goneMD, goneJSON := write(now.AddDate(0, 0, -3))
 
-	result, err := s.Prune(90, 3, now)
+	result, err := s.Prune(90, 3, 0, now)
 	require.NoError(t, err)
 	assert.Equal(t, 2, result.Digests, "both files of one day are one day's digest")
 	assert.Zero(t, result.Days, "the item window is separate and untouched here")
@@ -604,7 +604,7 @@ func TestPruneDigestsZeroKeepsForever(t *testing.T) {
 	md, _ := s.DigestPaths(now.AddDate(0, 0, -4000), "default")
 	require.NoError(t, os.WriteFile(md, []byte("# ancient"), 0o644))
 
-	result, err := s.Prune(90, 0, now)
+	result, err := s.Prune(90, 0, 0, now)
 	require.NoError(t, err)
 	assert.Zero(t, result.Digests)
 	assert.FileExists(t, md, "zero means keep forever, not keep nothing")
@@ -627,7 +627,7 @@ func TestPruneDigestsLeavesOtherFilesAlone(t *testing.T) {
 	strayAtRoot := filepath.Join(s.DigestsDir(), "2026-01-01.md")
 	require.NoError(t, os.WriteFile(strayAtRoot, []byte("old layout"), 0o644))
 
-	result, err := s.Prune(90, 1, now)
+	result, err := s.Prune(90, 1, 0, now)
 	require.NoError(t, err)
 	assert.Zero(t, result.Digests)
 	assert.FileExists(t, readme)
@@ -637,7 +637,7 @@ func TestPruneDigestsLeavesOtherFilesAlone(t *testing.T) {
 
 func TestPruneOnAnEmptyDataRootIsNotAnError(t *testing.T) {
 	s := New(t.TempDir())
-	result, err := s.Prune(7, 7, mustTime(t, "2026-09-30T12:00:00Z"))
+	result, err := s.Prune(7, 7, 0, mustTime(t, "2026-09-30T12:00:00Z"))
 	require.NoError(t, err, "a fresh install has neither tree yet")
 	assert.Zero(t, result.Days)
 	assert.Zero(t, result.Digests)
@@ -681,7 +681,7 @@ func TestPruneDigestsDescendsIntoEveryEdition(t *testing.T) {
 	boardKept, _ := write("boardgames", now.AddDate(0, 0, -1))
 	boardGone, boardGoneJSON := write("boardgames", now.AddDate(0, 0, -9))
 
-	result, err := s.Prune(90, 3, now)
+	result, err := s.Prune(90, 3, 0, now)
 	require.NoError(t, err)
 
 	// Four files across two editions: the window has to be applied inside each
@@ -693,4 +693,91 @@ func TestPruneDigestsDescendsIntoEveryEdition(t *testing.T) {
 	assert.NoFileExists(t, personalGoneJSON)
 	assert.NoFileExists(t, boardGone)
 	assert.NoFileExists(t, boardGoneJSON)
+}
+
+// --- the report tree (ADR-0005 §7) ---
+
+func TestReportPathsAreASiblingOfDigests(t *testing.T) {
+	s := New("/srv/roozane")
+	day := mustTime(t, "2026-09-04T00:00:00Z")
+
+	md, structured := s.ReportPaths(day)
+	assert.Equal(t, "/srv/roozane/reports/2026-09-04.md", md)
+	assert.Equal(t, "/srv/roozane/reports/2026-09-04.json", structured)
+
+	// Not under digests/: the report is not an edition, and keeping it a
+	// distinct path is what lets it have a retention window of its own.
+	assert.NotContains(t, md, s.DigestsDir())
+}
+
+// TestPruneReportsUsesItsOwnWindow keeps the report window independent of the
+// digest one. The two are wanted for different lengths of time.
+func TestPruneReportsUsesItsOwnWindow(t *testing.T) {
+	root := t.TempDir()
+	s := New(root)
+	now := mustTime(t, "2026-09-30T12:00:00Z")
+
+	writeReport := func(day time.Time) (string, string) {
+		require.NoError(t, os.MkdirAll(s.ReportsDir(), 0o755))
+		md, structured := s.ReportPaths(day)
+		require.NoError(t, os.WriteFile(md, []byte("# report"), 0o644))
+		require.NoError(t, os.WriteFile(structured, []byte("{}"), 0o644))
+		return md, structured
+	}
+	writeDigest := func(day time.Time) string {
+		require.NoError(t, os.MkdirAll(s.EditionDir("default"), 0o755))
+		md, _ := s.DigestPaths(day, "default")
+		require.NoError(t, os.WriteFile(md, []byte("# digest"), 0o644))
+		return md
+	}
+
+	keptReport, keptReportJSON := writeReport(now.AddDate(0, 0, -2))
+	goneReport, goneReportJSON := writeReport(now.AddDate(0, 0, -5))
+	oldDigest := writeDigest(now.AddDate(0, 0, -5))
+
+	// Reports pruned at 3 days; digests kept forever.
+	result, err := s.Prune(90, 0, 3, now)
+	require.NoError(t, err)
+
+	assert.Equal(t, 2, result.Reports)
+	assert.Zero(t, result.Digests, "the digest window is separate and zero here")
+
+	assert.FileExists(t, keptReport)
+	assert.FileExists(t, keptReportJSON)
+	assert.NoFileExists(t, goneReport)
+	assert.NoFileExists(t, goneReportJSON)
+	assert.FileExists(t, oldDigest, "a report window must not reach into the digest tree")
+}
+
+func TestPruneReportsZeroKeepsForever(t *testing.T) {
+	root := t.TempDir()
+	s := New(root)
+	now := mustTime(t, "2026-09-30T12:00:00Z")
+
+	require.NoError(t, os.MkdirAll(s.ReportsDir(), 0o755))
+	md, _ := s.ReportPaths(now.AddDate(0, 0, -4000))
+	require.NoError(t, os.WriteFile(md, []byte("# ancient"), 0o644))
+
+	result, err := s.Prune(90, 0, 0, now)
+	require.NoError(t, err)
+	assert.Zero(t, result.Reports)
+	assert.FileExists(t, md, "zero means keep forever, not keep nothing")
+}
+
+func TestPruneReportsLeavesUnrecognisedNamesAlone(t *testing.T) {
+	root := t.TempDir()
+	s := New(root)
+	now := mustTime(t, "2026-09-30T12:00:00Z")
+
+	require.NoError(t, os.MkdirAll(s.ReportsDir(), 0o755))
+	readme := filepath.Join(s.ReportsDir(), "NOTES.md")
+	require.NoError(t, os.WriteFile(readme, []byte("mine"), 0o644))
+	notADay := filepath.Join(s.ReportsDir(), "summary-2026.json")
+	require.NoError(t, os.WriteFile(notADay, []byte("{}"), 0o644))
+
+	result, err := s.Prune(90, 0, 1, now)
+	require.NoError(t, err)
+	assert.Zero(t, result.Reports)
+	assert.FileExists(t, readme)
+	assert.FileExists(t, notADay)
 }

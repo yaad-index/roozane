@@ -228,7 +228,7 @@ func (r *Runner) Run(ctx context.Context) Result {
 	// Housekeeping before work: retention is enforced against the layout the
 	// cadence checks below are about to read, so a pass never decides due-ness
 	// from folders it is about to delete.
-	pruned, err := r.store.Prune(r.cfg.Retention.ItemDays(), r.cfg.Retention.Digests, now)
+	pruned, err := r.store.Prune(r.cfg.Retention.ItemDays(), r.cfg.Retention.Digests, r.cfg.Retention.Reports, now)
 	result.Pruned = pruned
 	if err != nil {
 		// Retention failing does not make the collection wrong, and refusing to
@@ -236,8 +236,9 @@ func (r *Runner) Run(ctx context.Context) Result {
 		result.PruneErr = err
 		r.log.Error("retention prune failed", "error", err)
 	}
-	if pruned.Days > 0 || pruned.Digests > 0 {
-		r.log.Info("pruned past the retention window", "days", pruned.Days, "digests", pruned.Digests)
+	if pruned.Days > 0 || pruned.Digests > 0 || pruned.Reports > 0 {
+		r.log.Info("pruned past the retention window",
+			"days", pruned.Days, "digests", pruned.Digests, "reports", pruned.Reports)
 	}
 
 	drained, err := r.drainInbox(now)

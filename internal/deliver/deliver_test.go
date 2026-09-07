@@ -667,7 +667,57 @@ func TestAReportSinkIsNotGivenAnEditionsDigest(t *testing.T) {
 	assert.Empty(t, got, "a report sink must receive nothing rather than the default edition's digest")
 	require.Len(t, result.Sinks, 1)
 	require.Error(t, result.Sinks[0].Err)
-	assert.Contains(t, result.Sinks[0].Err.Error(), "daily report")
+	assert.Contains(t, result.Sinks[0].Err.Error(), "no report",
+		"an absent report is reported as absent, never substituted with an edition's digest")
+}
+
+// writeReport puts a day's report on disk, as the aggregator would.
+func writeReport(t *testing.T, root string, d time.Time) {
+	t.Helper()
+	s := store.New(root)
+	mdPath, jsonPath := s.ReportPaths(d)
+	require.NoError(t, s.WriteAtomic(mdPath, []byte("# Report — "+store.Day(d)+"\n\nREPORT-BODY\n")))
+	require.NoError(t, s.WriteAtomic(jsonPath, []byte(`{"schema":1,"day":"`+store.Day(d)+`"}`)))
+}
+
+// TestAReportSinkGetsTheReport is the delivery half of ADR-0005 §7: a sink may
+// be pointed at the report exactly as it is pointed at an edition.
+func TestAReportSinkGetsTheReport(t *testing.T) {
+	d := day(t, "2026-09-04")
+	cfg, _ := fixture(t, d, false, `sinks:
+  telemetry: {type: file, report: true}
+  reader:    {type: file}
+`)
+	writeReport(t, cfg.DataRootPath(), d)
+
+	got := map[string]Digest{}
+	result, err := NewRunner(cfg,
+		WithLogger(quietLogger()),
+		WithSinkBuilder(func(id string, _ config.Sink) (Sink, error) {
+			return &capturingSink{id: id, into: got}, nil
+		}),
+	).Run(context.Background(), d)
+	require.NoError(t, err)
+	assert.False(t, result.Failed())
+
+	require.Contains(t, got, "telemetry")
+	assert.Contains(t, got["telemetry"].Markdown, "REPORT-BODY")
+	assert.True(t, got["telemetry"].IsReport)
+	assert.Empty(t, got["telemetry"].Edition, "the report is not an edition")
+
+	// The edition sink on the same run is unaffected and gets its digest.
+	require.Contains(t, got, "reader")
+	assert.False(t, got["reader"].IsReport)
+	assert.Equal(t, "default", got["reader"].Edition)
+	assert.NotContains(t, got["reader"].Markdown, "REPORT-BODY",
+		"an edition sink must never receive the report")
+
+	byID := map[string]SinkResult{}
+	for _, s := range result.Sinks {
+		byID[s.ID] = s
+	}
+	assert.True(t, byID["telemetry"].Report)
+	assert.False(t, byID["reader"].Report)
 }
 
 // capturingSink records the digest it was handed, keyed by sink id.

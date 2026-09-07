@@ -337,10 +337,14 @@ func (r *Runner) Run(ctx context.Context, day time.Time) (Result, error) {
 
 	state := r.loadState(day)
 
+	ledger := newSpendLedger()
+	report := Report{Sources: r.loadCollectedOutcomes(day)}
+
 	// Pass one: enrich every item once, for nobody in particular.
 	var enriched []enrichedItem
+	var belowFloor []enrichedItem
 	for _, item := range items {
-		outcome, prior, err := r.enrich(ctx, item, state)
+		outcome, prior, err := r.enrich(ctx, item, state, ledger)
 		if err != nil {
 			result.Failed++
 			state.Items[item.Filename] = ItemState{
@@ -349,6 +353,13 @@ func (r *Runner) Run(ctx context.Context, day time.Time) (Result, error) {
 				PromptVersion: enrichPromptVersion,
 				Error:         err.Error(),
 			}
+			report.Items = append(report.Items, ReportItem{
+				Item:   item.Filename,
+				Source: item.Source,
+				Title:  item.Title,
+				Status: StatusFailed,
+				Error:  err.Error(),
+			})
 			r.log.Error("item enrichment failed", "item", item.Filename, "error", err)
 			continue
 		}
@@ -368,8 +379,19 @@ func (r *Runner) Run(ctx context.Context, day time.Time) (Result, error) {
 			Enrichment:    &record,
 		}
 
+		report.Items = append(report.Items, ReportItem{
+			Item:     item.Filename,
+			Source:   item.Source,
+			Title:    item.Title,
+			Status:   StatusEnriched,
+			Tags:     record.Tags,
+			Category: record.Category,
+			Salience: record.Salience,
+		})
+
 		if record.Salience < r.salienceFloor {
 			result.BelowFloor++
+			belowFloor = append(belowFloor, enrichedItem{Item: item, Enrichment: record})
 			continue
 		}
 		enriched = append(enriched, enrichedItem{Item: item, Enrichment: record})
@@ -384,13 +406,12 @@ func (r *Runner) Run(ctx context.Context, day time.Time) (Result, error) {
 	// not take the others down with it — its digest is the one lost, and the
 	// error is reported after the rest have been written.
 	var problems []error
-	// Read once for the whole run: every edition reports a subset of the same
-	// record, and it does not change while the pass is running.
-	collected := r.loadCollectedOutcomes(day)
 
 	for _, id := range sortedEditionIDs(r.cfg.Editions) {
-		editionResult, err := r.runEdition(ctx, day, id, r.cfg.Editions[id], enriched, collected)
+		edition := r.cfg.Editions[id]
+		editionResult, editionReport, err := r.runEdition(ctx, day, id, edition, enriched, belowFloor, report.Sources, ledger)
 		result.Editions = append(result.Editions, editionResult)
+		report.Editions = append(report.Editions, editionReport)
 		addUsage(&result.Usage, editionResult.Usage)
 		if err != nil {
 			problems = append(problems, fmt.Errorf("edition %q: %w", id, err))
@@ -403,6 +424,17 @@ func (r *Runner) Run(ctx context.Context, day time.Time) (Result, error) {
 			"empty", editionResult.Empty)
 	}
 
+	// The report comes last, always. It describes what the editions selected,
+	// which is the one ordering this design imposes.
+	report.Spend, report.UnpricedModels = ledger.priced(r.cfg.Aggregator.Prices)
+	if err := r.writeReport(day, report); err != nil {
+		// The digests are written and correct; losing the report costs
+		// telemetry, not the day's output. Same trade as a failed retention
+		// sweep, and reported the same way rather than swallowed.
+		problems = append(problems, err)
+		r.log.Error("could not write the daily report", "error", err)
+	}
+
 	r.log.Info("aggregation complete",
 		"day", result.Day, "items", result.Items, "enriched", result.Enriched,
 		"failed", result.Failed, "reused", result.Reused, "below_floor", result.BelowFloor,
@@ -412,29 +444,69 @@ func (r *Runner) Run(ctx context.Context, day time.Time) (Result, error) {
 }
 
 // runEdition performs one edition's selection pass and writes its digest.
-func (r *Runner) runEdition(ctx context.Context, day time.Time, id string, edition config.Edition, enriched []enrichedItem, collected map[string]collect.SourceOutcome) (EditionResult, error) {
+func (r *Runner) runEdition(ctx context.Context, day time.Time, id string, edition config.Edition,
+	enriched, belowFloor []enrichedItem, collected map[string]collect.SourceOutcome, ledger *spendLedger,
+) (EditionResult, ReportEdition, error) {
 	editionResult := EditionResult{ID: id}
+	editionReport := ReportEdition{ID: id}
+
+	// Every enriched item this edition does not carry gets a reason, including
+	// the ones stopped before the edition ever saw them. ADR-0005 §7 reserves
+	// "no reason at all" for items that never entered the pipeline, so an item
+	// that did enter and then disappears from the accounting is the one outcome
+	// this section must not produce.
+	//
+	// The source list is checked against BOTH pools. Checking it only against
+	// the above-floor pool left an item that was both below the floor and out
+	// of scope with no reason at all, while an identical above-floor item got
+	// one — an asymmetry that is dormant only because the shipped floor is 0.
+	for _, excluded := range excludedBySources(enriched, edition) {
+		editionReport.Absent = append(editionReport.Absent, ReportAbsence{
+			Item: excluded.Item.Filename, Source: excluded.Item.Source, Reason: ReasonNotInSources,
+		})
+	}
+	for _, excluded := range excludedBySources(belowFloor, edition) {
+		// Out of scope AND below the floor: both are true, and the source list
+		// is the one reported. It is the answer scoped to this edition — the
+		// item was never in its pool — where the floor is a global setting whose
+		// effect is already visible per item in the report's item list. Naming
+		// the floor here would tell a narrow edition's reader about a source
+		// they do not draw on.
+		editionReport.Absent = append(editionReport.Absent, ReportAbsence{
+			Item: excluded.Item.Filename, Source: excluded.Item.Source, Reason: ReasonNotInSources,
+		})
+	}
+	for _, held := range admittedBySources(belowFloor, edition) {
+		editionReport.Absent = append(editionReport.Absent, ReportAbsence{
+			Item: held.Item.Filename, Source: held.Item.Source, Reason: ReasonBelowFloor,
+		})
+	}
 
 	profilePath, ok := r.cfg.EditionProfilePath(id)
 	if !ok {
 		// Unreachable through Load, which materialises every edition it
 		// validates. Reported rather than ignored so a hand-built Config fails
 		// loudly instead of writing a digest judged against nothing.
-		return editionResult, fmt.Errorf("no profile for edition %q", id)
+		err := fmt.Errorf("no profile for edition %q", id)
+		editionReport.Failed = err.Error()
+		return editionResult, editionReport, err
 	}
 	profile, err := readProfile(profilePath)
 	if err != nil {
-		return editionResult, err
+		editionReport.Failed = err.Error()
+		return editionResult, editionReport, err
 	}
 
 	candidates := admittedBySources(enriched, edition)
 	editionResult.Candidates = len(candidates)
+	editionReport.Candidates = len(candidates)
 
 	var selected []selectedItem
 	for _, candidate := range candidates {
-		selection, usage, err := r.selectItem(ctx, profile, candidate)
+		selection, usage, err := r.selectItem(ctx, profile, candidate, ledger)
 		if err != nil {
-			return editionResult, fmt.Errorf("select %s: %w", candidate.Item.Filename, err)
+			editionReport.Failed = err.Error()
+			return editionResult, editionReport, fmt.Errorf("select %s: %w", candidate.Item.Filename, err)
 		}
 		addUsage(&editionResult.Usage, usage)
 		if selection.Selected {
@@ -443,17 +515,46 @@ func (r *Runner) runEdition(ctx context.Context, day time.Time, id string, editi
 				Enrichment: candidate.Enrichment,
 				Selection:  selection,
 			})
+			editionReport.Selected = append(editionReport.Selected, candidate.Item.Filename)
+			continue
 		}
+		editionReport.Absent = append(editionReport.Absent, ReportAbsence{
+			Item: candidate.Item.Filename, Source: candidate.Item.Source, Reason: ReasonNotSelected,
+		})
 	}
 	editionResult.Selected = len(selected)
 	editionResult.Empty = len(selected) == 0
+	editionReport.Empty = editionResult.Empty
 
-	usage, err := r.writeDigest(ctx, day, id, profile, selected, r.editionSources(edition, collected))
+	usage, err := r.writeDigest(ctx, day, id, profile, selected, r.editionSources(edition, collected), ledger)
 	addUsage(&editionResult.Usage, usage)
 	if err != nil {
-		return editionResult, err
+		editionReport.Failed = err.Error()
+		return editionResult, editionReport, err
 	}
-	return editionResult, nil
+	return editionResult, editionReport, nil
+}
+
+// excludedBySources is the complement of admittedBySources: the enriched items
+// an edition's source list kept out. An edition drawing on the whole pool
+// excludes nothing.
+func excludedBySources(enriched []enrichedItem, edition config.Edition) []enrichedItem {
+	if edition.SelectsAll() {
+		return nil
+	}
+
+	allowed := make(map[string]bool, len(edition.SourceIDs()))
+	for _, id := range edition.SourceIDs() {
+		allowed[id] = true
+	}
+
+	var excluded []enrichedItem
+	for _, e := range enriched {
+		if !allowed[e.Item.Source] {
+			excluded = append(excluded, e)
+		}
+	}
+	return excluded
 }
 
 // admittedBySources narrows the enriched pool to what an edition's source list
@@ -620,7 +721,7 @@ type enrichOutcome struct {
 // NOT keyed on is what produced it, so the model and prompt version are checked
 // before a record is trusted — a changed prompt would otherwise be served stale
 // results indefinitely, with nothing in the config looking different.
-func (r *Runner) enrich(ctx context.Context, item store.StoredItem, state State) (enrichOutcome, bool, error) {
+func (r *Runner) enrich(ctx context.Context, item store.StoredItem, state State, ledger *spendLedger) (enrichOutcome, bool, error) {
 	if prior, ok := state.Items[item.Filename]; ok && prior.Enrichment != nil &&
 		prior.Status != StatusFailed &&
 		prior.Model == r.cfg.Aggregator.Models.Item &&
@@ -628,10 +729,18 @@ func (r *Runner) enrich(ctx context.Context, item store.StoredItem, state State)
 		return enrichOutcome{enrichment: *prior.Enrichment, usage: prior.Usage}, true, nil
 	}
 
+	started := r.now()
 	resp, err := r.client.Complete(ctx, llm.Request{
 		Model:    r.cfg.Aggregator.Models.Item,
 		Messages: buildEnrichMessages(item),
 	})
+	// Recorded before the parse check: the call was made and billed whether or
+	// not its answer turned out to be usable, and a report that hid the spend
+	// on failed calls would understate a day of malformed replies.
+	if err == nil {
+		ledger.record(PassEnrich, r.cfg.Aggregator.Models.Item,
+			resp.Usage.PromptTokens, resp.Usage.CompletionTokens, r.now().Sub(started))
+	}
 	if err != nil {
 		return enrichOutcome{}, false, err
 	}
@@ -646,11 +755,16 @@ func (r *Runner) enrich(ctx context.Context, item store.StoredItem, state State)
 // selectItem asks one edition whether it wants an enriched item. It is given
 // the neutral summary and data points rather than the full item, which is what
 // makes a selection pass cheaper than the judgement it replaces.
-func (r *Runner) selectItem(ctx context.Context, profile string, candidate enrichedItem) (Selection, llm.Usage, error) {
+func (r *Runner) selectItem(ctx context.Context, profile string, candidate enrichedItem, ledger *spendLedger) (Selection, llm.Usage, error) {
+	started := r.now()
 	resp, err := r.client.Complete(ctx, llm.Request{
 		Model:    r.cfg.Aggregator.Models.Item,
 		Messages: buildSelectMessages(profile, candidate),
 	})
+	if err == nil {
+		ledger.record(PassSelect, r.cfg.Aggregator.Models.Item,
+			resp.Usage.PromptTokens, resp.Usage.CompletionTokens, r.now().Sub(started))
+	}
 	if err != nil {
 		return Selection{}, llm.Usage{}, err
 	}
@@ -667,17 +781,22 @@ func (r *Runner) selectItem(ctx context.Context, profile string, candidate enric
 // A day with nothing relevant skips the model entirely: there is nothing to
 // write a digest from, the correct output is the empty marker, and asking a
 // model to write about nothing is exactly how filler gets produced.
-func (r *Runner) writeDigest(ctx context.Context, day time.Time, edition, profile string, selected []selectedItem, sources map[string]collect.SourceOutcome) (llm.Usage, error) {
+func (r *Runner) writeDigest(ctx context.Context, day time.Time, edition, profile string, selected []selectedItem, sources map[string]collect.SourceOutcome, ledger *spendLedger) (llm.Usage, error) {
 	var markdown string
 	var usage llm.Usage
 
 	if len(selected) == 0 {
 		markdown = fmt.Sprintf("# Digest — %s\n\n%s%s\n", store.Day(day), emptyDigestMarker, silentSourcesNote(sources))
 	} else {
+		started := r.now()
 		resp, err := r.client.Complete(ctx, llm.Request{
 			Model:    r.cfg.Aggregator.Models.Digest,
 			Messages: buildDigestMessages(profile, selected),
 		})
+		if err == nil {
+			ledger.record(PassDigest, r.cfg.Aggregator.Models.Digest,
+				resp.Usage.PromptTokens, resp.Usage.CompletionTokens, r.now().Sub(started))
+		}
 		if err != nil {
 			return usage, fmt.Errorf("digest pass: %w", err)
 		}

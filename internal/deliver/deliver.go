@@ -29,8 +29,15 @@ type Digest struct {
 	Day string
 
 	// Edition names the audience this digest was written for, so a sink and its
-	// logs can say which of several they carried.
+	// logs can say which of several they carried. It is empty for the daily
+	// report, which is not an edition.
 	Edition string
+
+	// IsReport says this payload is the daily operator report rather than an
+	// edition's digest. A sink is told rather than left to infer it from an
+	// empty Edition, because "no edition" and "the report" would otherwise be
+	// the same reading — the exact conflation the config binding refuses.
+	IsReport bool
 
 	// Markdown is the human-readable artifact.
 	Markdown string
@@ -93,6 +100,9 @@ type SinkResult struct {
 	// daily report.
 	Edition string
 
+	// Report says this sink carried the daily report rather than an edition.
+	Report bool
+
 	// Empty says the digest this sink delivered was a quiet day. It lives here
 	// rather than on the run because editions differ: one audience can have a
 	// full digest on a day another has nothing, and a single run-level flag
@@ -154,27 +164,32 @@ func (r *Runner) Run(ctx context.Context, day time.Time) (Result, error) {
 	for _, id := range ids {
 		configured := r.cfg.Sinks[id]
 
-		edition, ok := configured.EditionID()
-		if !ok {
-			// A report sink. The report itself is a later change; until it
-			// exists there is nothing on disk to deliver, and saying so is
-			// better than delivering an edition's digest in its place, which
-			// is the one thing the binding was written to prevent.
-			err := errors.New("this sink is bound to the daily report, which is not generated yet")
-			result.Sinks = append(result.Sinks, SinkResult{ID: id, Err: err})
-			r.log.Error("cannot deliver", "sink", id, "error", err)
-			continue
+		// The report is keyed under a name no edition can have, since an
+		// edition id cannot contain a slash. Sharing one cache with the
+		// editions is safe because of that, not by luck.
+		const reportKey = "/report"
+
+		edition, isEdition := configured.EditionID()
+		key := edition
+		if !isEdition {
+			key = reportKey
 		}
 
-		digest, cached := digests[edition]
+		digest, cached := digests[key]
 		if !cached {
-			loaded, err := r.readDigest(day, edition)
+			var loaded Digest
+			var err error
+			if isEdition {
+				loaded, err = r.readDigest(day, edition)
+			} else {
+				loaded, err = r.readReport(day)
+			}
 			if err != nil {
 				result.Sinks = append(result.Sinks, SinkResult{ID: id, Edition: edition, Err: err})
 				r.log.Error("cannot deliver", "sink", id, "edition", edition, "error", err)
 				continue
 			}
-			digests[edition] = loaded
+			digests[key] = loaded
 			digest = loaded
 		}
 
@@ -189,15 +204,47 @@ func (r *Runner) Run(ctx context.Context, day time.Time) (Result, error) {
 		err = sink.Deliver(sinkCtx, digest)
 		cancel()
 
-		result.Sinks = append(result.Sinks, SinkResult{ID: id, Edition: edition, Empty: digest.Empty, Err: err})
+		result.Sinks = append(result.Sinks, SinkResult{
+			ID: id, Edition: edition, Report: digest.IsReport, Empty: digest.Empty, Err: err,
+		})
 		if err != nil {
 			r.log.Error("delivery failed", "sink", id, "edition", edition, "error", err)
 			continue
 		}
-		r.log.Info("delivered", "sink", id, "edition", edition, "day", result.Day, "empty", digest.Empty)
+		r.log.Info("delivered", "sink", id, "edition", edition,
+			"report", digest.IsReport, "day", result.Day, "empty", digest.Empty)
 	}
 
 	return result, nil
+}
+
+// readReport loads both of the day's report files.
+//
+// An absent report is reported the same way an absent digest is: the aggregator
+// has not run. Delivering nothing in its place would tell the operator their
+// telemetry is empty when in fact it was never written.
+func (r *Runner) readReport(day time.Time) (Digest, error) {
+	mdPath, jsonPath := r.store.ReportPaths(day)
+
+	markdown, err := os.ReadFile(mdPath) //nolint:gosec // path is inside the engine's own data root
+	if err != nil {
+		if os.IsNotExist(err) {
+			return Digest{}, fmt.Errorf("no report for %s: the aggregator has not run for that day", store.Day(day))
+		}
+		return Digest{}, fmt.Errorf("read report: %w", err)
+	}
+
+	structured, err := os.ReadFile(jsonPath) //nolint:gosec // path is inside the engine's own data root
+	if err != nil {
+		return Digest{}, fmt.Errorf("read structured report: %w", err)
+	}
+
+	return Digest{
+		Day:        store.Day(day),
+		IsReport:   true,
+		Markdown:   string(markdown),
+		Structured: structured,
+	}, nil
 }
 
 // readDigest loads both of one edition's digest files for a day.

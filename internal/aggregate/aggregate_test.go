@@ -953,3 +953,508 @@ func TestDigestSchemaIsCurrent(t *testing.T) {
 	assert.Equal(t, 2, digest.Schema,
 		"the digest JSON gained an edition and collection outcomes; the version has to move with the shape")
 }
+
+// --- the daily report (ADR-0005 §7) ---
+
+func readReport(t *testing.T, root string, day time.Time) (string, Report) {
+	t.Helper()
+	mdPath, jsonPath := store.New(root).ReportPaths(day)
+
+	markdown, err := os.ReadFile(mdPath)
+	require.NoError(t, err)
+
+	raw, err := os.ReadFile(jsonPath)
+	require.NoError(t, err)
+	var report Report
+	require.NoError(t, json.Unmarshal(raw, &report))
+
+	return string(markdown), report
+}
+
+func TestReportRecordsSourcesItemsAndEditions(t *testing.T) {
+	day := at(t, "2026-09-04T06:00:00Z")
+	cfg, root := fixture(t, day, "profile", "\neditions:\n  narrow: {sources: [a-source]}\n",
+		store.Item{Source: "a-source", URL: "https://example.com/a", Title: "A", Content: "body a"},
+		store.Item{Source: "b-source", URL: "https://example.com/b", Title: "B", Content: "body b"})
+
+	writeCollected(t, root, day, map[string]collect.SourceOutcome{
+		"a-source": {Ran: true, Items: 1},
+		"b-source": {Ran: true, Items: 1, Error: "flaky upstream"},
+	})
+
+	_, err := runner(t, cfg, &stubClient{}, day).Run(context.Background(), day)
+	require.NoError(t, err)
+
+	markdown, report := readReport(t, root, day)
+	assert.Equal(t, ReportSchema, report.Schema)
+	assert.Equal(t, store.Day(day), report.Day)
+
+	// Per source, from the collection record.
+	assert.Len(t, report.Sources, 2)
+	assert.Contains(t, markdown, "flaky upstream",
+		"the report is for the operator, so it carries the error text the digest markdown must not")
+
+	// Per item: tags, category, salience.
+	require.Len(t, report.Items, 2)
+	assert.Equal(t, StatusEnriched, report.Items[0].Status)
+	assert.Equal(t, "announcement", report.Items[0].Category)
+	assert.InDelta(t, 0.8, report.Items[0].Salience, 0.0001)
+
+	// Per edition: what it selected, and why each enriched item is absent.
+	require.Len(t, report.Editions, 1)
+	edition := report.Editions[0]
+	assert.Equal(t, "narrow", edition.ID)
+	assert.Len(t, edition.Selected, 1)
+	require.Len(t, edition.Absent, 1)
+	assert.Equal(t, ReasonNotInSources, edition.Absent[0].Reason,
+		"the b-source item is absent because this edition's source list excluded it")
+}
+
+func TestReportNamesWhyAnItemWasNotSelected(t *testing.T) {
+	day := at(t, "2026-09-04T06:00:00Z")
+	cfg, root := fixture(t, day, "profile", "",
+		store.Item{Source: "a-source", URL: "https://example.com/a", Content: "body"})
+
+	client := &stubClient{
+		sel: func(llm.Request) (llm.Response, error) {
+			return llm.Response{Content: selectionJSON(false, 0.1)}, nil
+		},
+	}
+	_, err := runner(t, cfg, client, day).Run(context.Background(), day)
+	require.NoError(t, err)
+
+	_, report := readReport(t, root, day)
+	require.Len(t, report.Editions, 1)
+	require.Len(t, report.Editions[0].Absent, 1)
+	assert.Equal(t, ReasonNotSelected, report.Editions[0].Absent[0].Reason)
+}
+
+func TestReportNamesTheSalienceFloorAsAnAbsenceReason(t *testing.T) {
+	day := at(t, "2026-09-04T06:00:00Z")
+	cfg, root := fixture(t, day, "profile", "",
+		store.Item{Source: "a-source", URL: "https://example.com/a", Content: "junk"})
+
+	client := &stubClient{
+		enrich: func(llm.Request) (llm.Response, error) {
+			return llm.Response{Content: enrichJSON("navigation chrome", 0.05)}, nil
+		},
+	}
+	_, err := runner(t, cfg, client, day, WithSalienceFloor(0.5)).Run(context.Background(), day)
+	require.NoError(t, err)
+
+	_, report := readReport(t, root, day)
+	require.Len(t, report.Editions, 1)
+	require.Len(t, report.Editions[0].Absent, 1)
+	assert.Equal(t, ReasonBelowFloor, report.Editions[0].Absent[0].Reason,
+		"an item the floor held back is absent from the edition, and the report says so rather than "+
+			"leaving the reader to know the floor runs earlier")
+}
+
+func TestReportRecordsEnrichmentFailures(t *testing.T) {
+	day := at(t, "2026-09-04T06:00:00Z")
+	cfg, root := fixture(t, day, "profile", "",
+		store.Item{Source: "a-source", URL: "https://example.com/a", Content: "body"})
+
+	client := &stubClient{
+		enrich: func(llm.Request) (llm.Response, error) {
+			return llm.Response{}, errors.New("upstream is down")
+		},
+	}
+	_, err := runner(t, cfg, client, day).Run(context.Background(), day)
+	require.NoError(t, err)
+
+	markdown, report := readReport(t, root, day)
+	require.Len(t, report.Items, 1)
+	assert.Equal(t, StatusFailed, report.Items[0].Status)
+	assert.Contains(t, report.Items[0].Error, "upstream is down")
+	assert.Contains(t, markdown, "ENRICHMENT FAILED")
+}
+
+// TestReportSpendIsPerPassPerModel is the breakdown ADR-0005 §7 asks for.
+func TestReportSpendIsPerPassPerModel(t *testing.T) {
+	day := at(t, "2026-09-04T06:00:00Z")
+	cfg, root := fixture(t, day, "profile", "",
+		store.Item{Source: "a-source", URL: "https://example.com/a", Content: "body"})
+
+	client := &stubClient{
+		enrich: func(llm.Request) (llm.Response, error) {
+			return llm.Response{
+				Content: enrichJSON("summary", 0.8),
+				Usage:   llm.Usage{PromptTokens: 100, CompletionTokens: 10},
+			}, nil
+		},
+		sel: func(llm.Request) (llm.Response, error) {
+			return llm.Response{
+				Content: selectionJSON(true, 0.9),
+				Usage:   llm.Usage{PromptTokens: 20, CompletionTokens: 5},
+			}, nil
+		},
+		digest: func(llm.Request) (llm.Response, error) {
+			return llm.Response{
+				Content: "- body",
+				Usage:   llm.Usage{PromptTokens: 50, CompletionTokens: 200},
+			}, nil
+		},
+	}
+	_, err := runner(t, cfg, client, day).Run(context.Background(), day)
+	require.NoError(t, err)
+
+	_, report := readReport(t, root, day)
+	byPass := map[string]PassSpend{}
+	for _, spend := range report.Spend {
+		byPass[spend.Pass] = spend
+	}
+
+	require.Contains(t, byPass, PassEnrich)
+	assert.Equal(t, "small-model", byPass[PassEnrich].Model)
+	assert.Equal(t, 100, byPass[PassEnrich].PromptTokens)
+	assert.Equal(t, 10, byPass[PassEnrich].CompletionTokens,
+		"prompt and completion are kept apart, because every provider charges them differently")
+
+	require.Contains(t, byPass, PassSelect)
+	assert.Equal(t, "small-model", byPass[PassSelect].Model)
+	assert.Equal(t, 20, byPass[PassSelect].PromptTokens)
+
+	require.Contains(t, byPass, PassDigest)
+	assert.Equal(t, "large-model", byPass[PassDigest].Model,
+		"enrich and select share the small model; only the writing pass uses the large one")
+	assert.Equal(t, 200, byPass[PassDigest].CompletionTokens)
+
+	assert.True(t, report.SpendIsPerRun)
+}
+
+// TestReRunReportsNearZeroSpend is the consequence worth stating in the output,
+// because it reads like a bug: a reused enrichment is not paid for again and so
+// is not counted.
+func TestReRunReportsNearZeroSpend(t *testing.T) {
+	day := at(t, "2026-09-04T06:00:00Z")
+	cfg, root := fixture(t, day, "profile", "",
+		store.Item{Source: "a-source", URL: "https://example.com/a", Content: "body"})
+
+	usage := llm.Usage{PromptTokens: 100, CompletionTokens: 10}
+	withUsage := func() *stubClient {
+		return &stubClient{
+			enrich: func(llm.Request) (llm.Response, error) {
+				return llm.Response{Content: enrichJSON("summary", 0.8), Usage: usage}, nil
+			},
+		}
+	}
+
+	_, err := runner(t, cfg, withUsage(), day).Run(context.Background(), day)
+	require.NoError(t, err)
+	_, first := readReport(t, root, day)
+
+	byPass := func(report Report, pass string) (PassSpend, bool) {
+		for _, spend := range report.Spend {
+			if spend.Pass == pass {
+				return spend, true
+			}
+		}
+		return PassSpend{}, false
+	}
+	enrichSpend, ok := byPass(first, PassEnrich)
+	require.True(t, ok)
+	assert.Equal(t, 100, enrichSpend.PromptTokens)
+
+	// Second run over the same day: the enrichment is reused, so nothing is
+	// paid for and nothing is counted.
+	_, err = runner(t, cfg, withUsage(), day).Run(context.Background(), day)
+	require.NoError(t, err)
+	markdown, second := readReport(t, root, day)
+
+	_, ok = byPass(second, PassEnrich)
+	assert.False(t, ok, "a reused enrichment costs nothing and so is not counted")
+
+	assert.Contains(t, markdown, "THIS RUN",
+		"the output has to say the figures are per run, or near-zero tokens reads as a bug someone fixes into a double-count")
+}
+
+func TestReportPricesSpendOnlyWhenConfigured(t *testing.T) {
+	day := at(t, "2026-09-04T06:00:00Z")
+	cfg, root := fixture(t, day, "profile", "",
+		store.Item{Source: "a-source", URL: "https://example.com/a", Content: "body"})
+
+	client := &stubClient{
+		enrich: func(llm.Request) (llm.Response, error) {
+			return llm.Response{
+				Content: enrichJSON("summary", 0.8),
+				Usage:   llm.Usage{PromptTokens: 1_000_000, CompletionTokens: 1_000_000},
+			}, nil
+		},
+	}
+
+	// Without prices the report counts tokens and says nothing about money.
+	_, err := runner(t, cfg, client, day).Run(context.Background(), day)
+	require.NoError(t, err)
+	markdown, unpriced := readReport(t, root, day)
+	for _, spend := range unpriced.Spend {
+		assert.False(t, spend.Priced)
+		assert.Zero(t, spend.Cost)
+		assert.Empty(t, spend.Currency)
+	}
+	assert.NotContains(t, markdown, "ZWL")
+
+	// With prices, every priced line carries the currency verbatim.
+	cfg.Aggregator.Prices = config.Prices{
+		Currency: "ZWL",
+		PerMillionTokens: map[string]config.ModelPrice{
+			"small-model": {Input: 2, Output: 8},
+			"large-model": {Input: 3, Output: 9},
+		},
+	}
+	// Force a fresh enrichment so there is spend to price.
+	require.NoError(t, os.Remove(store.New(root).StatePath(day)))
+
+	_, err = runner(t, cfg, client, day).Run(context.Background(), day)
+	require.NoError(t, err)
+	markdown, priced := readReport(t, root, day)
+
+	var enrich PassSpend
+	for _, spend := range priced.Spend {
+		if spend.Pass == PassEnrich {
+			enrich = spend
+		}
+	}
+	require.True(t, enrich.Priced)
+	assert.InDelta(t, 10.0, enrich.Cost, 0.0001, "1M prompt at 2 plus 1M completion at 8")
+	assert.Equal(t, "ZWL", enrich.Currency)
+	assert.Contains(t, markdown, "ZWL")
+	assert.Empty(t, priced.UnpricedModels)
+}
+
+// TestAnUnpricedModelIsNamedRatherThanCountedAsFree is the silent-understatement
+// this refuses: a total that quietly omits a model looks like a cheap day.
+func TestAnUnpricedModelIsNamedRatherThanCountedAsFree(t *testing.T) {
+	day := at(t, "2026-09-04T06:00:00Z")
+	cfg, root := fixture(t, day, "profile", "",
+		store.Item{Source: "a-source", URL: "https://example.com/a", Content: "body"})
+
+	cfg.Aggregator.Prices = config.Prices{
+		Currency:         "ZWL",
+		PerMillionTokens: map[string]config.ModelPrice{"small-model": {Input: 2, Output: 8}},
+	}
+
+	_, err := runner(t, cfg, &stubClient{}, day).Run(context.Background(), day)
+	require.NoError(t, err)
+
+	markdown, report := readReport(t, root, day)
+	assert.Equal(t, []string{"large-model"}, report.UnpricedModels)
+	assert.Contains(t, markdown, "No configured rate for: large-model")
+
+	for _, spend := range report.Spend {
+		if spend.Model == "large-model" {
+			assert.False(t, spend.Priced)
+			assert.Zero(t, spend.Cost, "an unpriced model must not be priced at zero")
+		}
+	}
+}
+
+// TestReportStatesTheLimitItCannotSee keeps ADR-0005 §7's honest limit in the
+// output rather than only in the ADR.
+func TestReportStatesTheLimitItCannotSee(t *testing.T) {
+	day := at(t, "2026-09-04T06:00:00Z")
+	cfg, root := fixture(t, day, "profile", "")
+
+	_, err := runner(t, cfg, &stubClient{}, day).Run(context.Background(), day)
+	require.NoError(t, err)
+
+	markdown, _ := readReport(t, root, day)
+	assert.Contains(t, markdown, "cannot explain a topic no configured source covers",
+		"four of the five absence reasons are recoverable; the fifth is invisible by construction, "+
+			"and the report must not imply its reasons are a complete account")
+}
+
+// TestTheReportIsWrittenAfterEveryEdition is the one ordering the design
+// imposes, since the report describes what the editions selected.
+func TestTheReportIsWrittenAfterEveryEdition(t *testing.T) {
+	day := at(t, "2026-09-04T06:00:00Z")
+	cfg, root := fixture(t, day, "profile", "\neditions:\n  alpha: {}\n  zulu: {}\n",
+		store.Item{Source: "a-source", URL: "https://example.com/a", Content: "body"})
+
+	_, err := runner(t, cfg, &stubClient{}, day).Run(context.Background(), day)
+	require.NoError(t, err)
+
+	_, report := readReport(t, root, day)
+	require.Len(t, report.Editions, 2, "the report describes every edition, so all of them ran first")
+
+	// Both digests exist on disk by the time the report does.
+	for _, id := range []string{"alpha", "zulu"} {
+		_, digest := readDigest(t, root, day, id)
+		assert.Equal(t, id, digest.Edition)
+	}
+}
+
+// TestAFailedEditionStillAppearsInTheReport keeps the report honest about an
+// edition whose digest was never written.
+func TestAFailedEditionStillAppearsInTheReport(t *testing.T) {
+	day := at(t, "2026-09-04T06:00:00Z")
+	cfg, root := fixture(t, day, "profile", "", store.Item{Source: "a-source", Content: "body"})
+
+	cfg.Editions = map[string]config.Edition{
+		"broken": {Profile: filepath.Join(t.TempDir(), "absent.md")},
+		"works":  {Profile: cfg.RelevanceProfile},
+	}
+
+	_, err := runner(t, cfg, &stubClient{}, day).Run(context.Background(), day)
+	require.Error(t, err)
+
+	markdown, report := readReport(t, root, day)
+	require.Len(t, report.Editions, 2)
+
+	byID := map[string]ReportEdition{}
+	for _, edition := range report.Editions {
+		byID[edition.ID] = edition
+	}
+	assert.NotEmpty(t, byID["broken"].Failed, "an edition that failed says so rather than reading as empty")
+	assert.Empty(t, byID["works"].Failed)
+	assert.Contains(t, markdown, "FAILED")
+}
+
+// TestReportRecordsWallTime covers the figure a frozen clock hides: with a
+// clock that never advances every duration is zero, so nothing would notice the
+// measurement being dropped altogether.
+func TestReportRecordsWallTime(t *testing.T) {
+	day := at(t, "2026-09-04T06:00:00Z")
+	cfg, root := fixture(t, day, "profile", "",
+		store.Item{Source: "a-source", URL: "https://example.com/a", Content: "body"})
+
+	// The clock advances ONLY while a call is in flight, never on a bare
+	// reading. That is what makes this test able to tell "timed the call" from
+	// "timed nothing": a clock that ticked on every read would report a
+	// plausible duration even if the timer started after the call returned.
+	tick := day
+	clock := func() time.Time { return tick }
+
+	client := &stubClient{}
+	timed := &clockAdvancingClient{inner: client, advance: func() { tick = tick.Add(500 * time.Millisecond) }}
+
+	r, err := NewRunner(cfg,
+		WithClient(timed),
+		WithClock(clock),
+		WithLogger(quietLogger()),
+	)
+	require.NoError(t, err)
+	_, err = r.Run(context.Background(), day)
+	require.NoError(t, err)
+
+	markdown, report := readReport(t, root, day)
+	require.NotEmpty(t, report.Spend)
+	for _, spend := range report.Spend {
+		assert.Equal(t, int64(500*spend.Calls), spend.WallMillis,
+			"each call takes exactly 500ms of clock, so the total is the call count times that: %s/%s",
+			spend.Pass, spend.Model)
+	}
+	assert.NotContains(t, markdown, ", 0ms")
+}
+
+// clockAdvancingClient moves the test clock forward while a call is in flight,
+// so a measured duration can only be non-zero if the timer bracketed the call.
+type clockAdvancingClient struct {
+	inner   Completer
+	advance func()
+}
+
+func (c *clockAdvancingClient) Complete(ctx context.Context, req llm.Request) (llm.Response, error) {
+	c.advance()
+	return c.inner.Complete(ctx, req)
+}
+
+// TestReportPluralisesCounts keeps the operator-facing document reading like
+// writing rather than output.
+func TestReportPluralisesCounts(t *testing.T) {
+	day := at(t, "2026-09-04T06:00:00Z")
+	cfg, root := fixture(t, day, "profile", "",
+		store.Item{Source: "a-source", URL: "https://example.com/a", Content: "body a"},
+		store.Item{Source: "b-source", URL: "https://example.com/b", Content: "body b"})
+
+	writeCollected(t, root, day, map[string]collect.SourceOutcome{
+		"a-source": {Ran: true, Items: 1},
+		"b-source": {Ran: true, Items: 4},
+	})
+
+	_, err := runner(t, cfg, &stubClient{}, day).Run(context.Background(), day)
+	require.NoError(t, err)
+
+	markdown, _ := readReport(t, root, day)
+	assert.Contains(t, markdown, "1 item\n", "one is singular")
+	assert.Contains(t, markdown, "4 items", "more than one is plural")
+	assert.Contains(t, markdown, "2 candidates")
+	assert.NotContains(t, markdown, "1 items")
+	assert.NotContains(t, markdown, "1 calls")
+}
+
+// TestEveryEnrichedItemGetsAnAbsenceReason closes the one hole ADR-0005 §7 does
+// not allow: "no reason at all" is reserved for items that never entered the
+// pipeline, so an item that was enriched and then vanishes from an edition's
+// accounting is the outcome this section must never produce.
+//
+// The case is an item that is BOTH below the salience floor and outside a
+// narrowed edition's source list. It is dormant while the shipped floor is 0
+// and starts firing the moment a real floor is set — which is the next planned
+// change to this code.
+func TestEveryEnrichedItemGetsAnAbsenceReason(t *testing.T) {
+	day := at(t, "2026-09-04T06:00:00Z")
+	cfg, root := fixture(t, day, "profile", "\neditions:\n  narrow: {sources: [a-source]}\n  wide: {}\n",
+		store.Item{Source: "a-source", URL: "https://example.com/a", Content: "substantive"},
+		store.Item{Source: "b-source", URL: "https://example.com/b", Content: "junk"})
+
+	client := &stubClient{
+		enrich: func(req llm.Request) (llm.Response, error) {
+			if strings.Contains(req.Messages[1].Content, "junk") {
+				return llm.Response{Content: enrichJSON("navigation chrome", 0.05)}, nil
+			}
+			return llm.Response{Content: enrichJSON("real substance", 0.9)}, nil
+		},
+	}
+	_, err := runner(t, cfg, client, day, WithSalienceFloor(0.5)).Run(context.Background(), day)
+	require.NoError(t, err)
+
+	_, report := readReport(t, root, day)
+
+	// Every item that reached enrichment is accounted for by every edition,
+	// either as selected or with a reason.
+	enrichedNames := map[string]bool{}
+	for _, item := range report.Items {
+		if item.Status == StatusEnriched {
+			enrichedNames[item.Item] = true
+		}
+	}
+	require.Len(t, enrichedNames, 2)
+
+	for _, edition := range report.Editions {
+		accounted := map[string]string{}
+		for _, name := range edition.Selected {
+			accounted[name] = "selected"
+		}
+		for _, absence := range edition.Absent {
+			accounted[absence.Item] = absence.Reason
+		}
+		for name := range enrichedNames {
+			assert.Contains(t, accounted, name,
+				"edition %q leaves %s unaccounted for; an item that entered the pipeline must never "+
+					"disappear from the report without a reason", edition.ID, name)
+		}
+	}
+
+	byID := map[string]ReportEdition{}
+	for _, edition := range report.Editions {
+		byID[edition.ID] = edition
+	}
+
+	// The narrow edition: the junk item is below the floor AND out of scope.
+	// Both are true; the source list is what gets reported, because it is the
+	// answer scoped to this edition.
+	narrow := map[string]string{}
+	for _, absence := range byID["narrow"].Absent {
+		narrow[absence.Source] = absence.Reason
+	}
+	assert.Equal(t, ReasonNotInSources, narrow["b-source"])
+
+	// The wide edition draws on everything, so there the same item's absence is
+	// the floor — which is the reason that actually applies to it there.
+	wide := map[string]string{}
+	for _, absence := range byID["wide"].Absent {
+		wide[absence.Source] = absence.Reason
+	}
+	assert.Equal(t, ReasonBelowFloor, wide["b-source"])
+}

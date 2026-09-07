@@ -20,7 +20,9 @@ Three layers, one binary, files in between ([ADR-0001](docs/adr/0001-foundations
 ```
 collectors ─► days/<utc-day>/items/*.md ─► enrich ─► select ─► digests/<edition>/<day>.{md,json} ─► sinks
   (dumb)         raw text, provenance      (once)   (per       one digest per audience            (dumb)
-                                                    edition)
+                                                    edition)          │
+                                                                      └─► reports/<day>.{md,json}
+                                                                            why each item is or is not there
 ```
 
 1. **Collectors** are deliberately dumb: a YAML config lists your sources, each with its own cadence
@@ -37,8 +39,14 @@ collectors ─► days/<utc-day>/items/*.md ─► enrich ─► select ─► d
    newsletter alongside a private brief. The same item may legitimately appear in both, and with no
    audience in the per-item record there is no private reasoning that could leak into a public
    digest. A config with no `editions:` block behaves as a single edition named `default`.
-4. **Sinks** deliver: a file, a chat message, later a podcast render. Each names the edition it
-   carries. Dumb by design.
+4. **The daily report** at `reports/<day>.{md,json}` is written after every edition, because it
+   describes them. It says what each source yielded or how it failed, what the neutral pass made of
+   each item, what every edition selected and why each remaining item was not, and what the run
+   spent per pass and per model — in money too, if you tell it what your models cost. It is the
+   first thing the engine writes for its owner rather than for a reader, and it is what makes the
+   relevance profile tunable instead of guessed at.
+5. **Sinks** deliver: a file, a chat message, later a podcast render. Each names either the edition
+   it carries or the report. Dumb by design.
 
 Collectors and sinks are **exec-pluggable** ([ADR-0003](docs/adr/0003-plugin-contract.md)): an
 external program in any language can extend the edges over stdin/stdout, while the engine alone

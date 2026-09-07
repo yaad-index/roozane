@@ -30,6 +30,12 @@ retention:
   # Prunes the digests/ tree. 0 keeps them forever, which is the default:
   # digests are small and are the record worth keeping.
   digests: 0
+  # Prunes the reports/ tree. 0 keeps them forever, same as above.
+  #
+  # A window of its own, not a share of the digest one: a digest is the record
+  # a reader keeps, while a report is operator telemetry — interesting while you
+  # are tuning the profile and dead weight once you have stopped.
+  reports: 0
 
 # The one layer with a brain. It speaks the standard chat-completions API shape
 # and is described by endpoint and model names only — point it at whichever
@@ -52,6 +58,28 @@ aggregator:
 
   # Per-request timeout. Default: 60s
   timeout: 60s
+
+  # Optional. What your models charge, so the daily report can turn tokens into
+  # money. Leave it out and the report counts tokens and says nothing about
+  # cost — the engine is provider-agnostic and will not guess a price.
+  #
+  # The unit is in the key: rates are PER MILLION TOKENS, which is how pricing
+  # pages quote them, so the number you copy is the number you paste. Input and
+  # output are separate because every provider charges them differently.
+  #
+  # `currency` is printed verbatim beside every figure. The engine does not
+  # interpret or convert it: an engine that will not assume a provider has no
+  # business assuming a denomination.
+  #
+  # A model used but not listed here has its tokens counted and its cost left
+  # out, and the report names it — an unpriced model is never quietly costed at
+  # zero, which would make a day look cheap rather than unmeasured.
+  #
+  # prices:
+  #   currency: "USD"
+  #   per_million_tokens:
+  #     your-small-model: {input: 0.15, output: 0.60}
+  #     your-large-model: {input: 2.50, output: 10.00}
 
 # The source list. Each key is a source id: it becomes a path component of every
 # item that source collects (ADR-0002), so it is restricted to lower-case
