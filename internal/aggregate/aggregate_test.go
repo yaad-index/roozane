@@ -15,6 +15,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/yaad-index/roozane/internal/collect"
 	"github.com/yaad-index/roozane/internal/config"
 	"github.com/yaad-index/roozane/internal/llm"
 	"github.com/yaad-index/roozane/internal/store"
@@ -807,4 +808,148 @@ func TestEnrichmentIsSavedBeforeSelectionRuns(t *testing.T) {
 		assert.Equal(t, StatusEnriched, item.Status)
 		require.NotNil(t, item.Enrichment)
 	}
+}
+
+// --- empty digests carry collection outcomes (ADR-0005 §8) ---
+
+// writeCollected drops a collection record for the day, as the collector would.
+func writeCollected(t *testing.T, root string, day time.Time, sources map[string]collect.SourceOutcome) {
+	t.Helper()
+	raw, err := json.Marshal(collect.Outcomes{
+		Schema:  1,
+		Day:     store.Day(day),
+		Sources: sources,
+	})
+	require.NoError(t, err)
+	s := store.New(root)
+	require.NoError(t, s.WriteAtomic(s.CollectedPath(day), raw))
+}
+
+// TestAnEmptyDigestNamesItsSilentSources is the confusion §8 exists to prevent:
+// a narrow edition whose only source was down produces exactly the same digest
+// as one whose source simply had nothing to say.
+func TestAnEmptyDigestNamesItsSilentSources(t *testing.T) {
+	day := at(t, "2026-09-04T06:00:00Z")
+	cfg, root := fixture(t, day, "profile", "\neditions:\n  narrow: {sources: [a-source]}\n")
+
+	writeCollected(t, root, day, map[string]collect.SourceOutcome{
+		"a-source": {Ran: true, Items: 0, Error: "dial tcp 10.0.0.5:443: connect: connection refused"},
+		"b-source": {Ran: true, Items: 12},
+	})
+
+	_, err := runner(t, cfg, &stubClient{}, day).Run(context.Background(), day)
+	require.NoError(t, err)
+
+	markdown, digest := readDigest(t, root, day, "narrow")
+	require.True(t, digest.Empty)
+
+	// The markdown says a selected source produced nothing...
+	assert.Contains(t, markdown, "a-source")
+	assert.Contains(t, markdown, "No items were collected today")
+
+	// ...and never the raw error. This markdown is what a public newsletter
+	// delivers; it must not end with a fetch exception naming an internal host.
+	assert.NotContains(t, markdown, "connection refused")
+	assert.NotContains(t, markdown, "10.0.0.5")
+
+	// The structured file carries the error, for sinks and tooling.
+	require.Contains(t, digest.Sources, "a-source")
+	assert.Contains(t, digest.Sources["a-source"].Error, "connection refused")
+
+	// An edition reports only its own sources: naming another edition's feed
+	// would be reporting on somebody else's pipeline.
+	assert.NotContains(t, digest.Sources, "b-source")
+	assert.NotContains(t, markdown, "b-source")
+}
+
+// TestAnEditionOverTheWholePoolReportsEverySource is the other half of the
+// narrowing: no source list means every configured source is in scope.
+func TestAnEditionOverTheWholePoolReportsEverySource(t *testing.T) {
+	day := at(t, "2026-09-04T06:00:00Z")
+	cfg, root := fixture(t, day, "profile", "")
+
+	writeCollected(t, root, day, map[string]collect.SourceOutcome{
+		"a-source": {Ran: true, Items: 0},
+		"b-source": {Ran: false},
+	})
+
+	_, err := runner(t, cfg, &stubClient{}, day).Run(context.Background(), day)
+	require.NoError(t, err)
+
+	markdown, digest := readDigest(t, root, day, config.DefaultEdition)
+	assert.Len(t, digest.Sources, 2)
+	assert.Contains(t, markdown, "a-source, b-source")
+}
+
+// TestASourceThatProducedItemsIsNotCalledSilent keeps the note about what
+// actually failed rather than listing every source in scope.
+func TestASourceThatProducedItemsIsNotCalledSilent(t *testing.T) {
+	day := at(t, "2026-09-04T06:00:00Z")
+	cfg, root := fixture(t, day, "profile", "")
+
+	writeCollected(t, root, day, map[string]collect.SourceOutcome{
+		"a-source": {Ran: true, Items: 4},
+		"b-source": {Ran: true, Items: 0},
+	})
+
+	_, err := runner(t, cfg, &stubClient{}, day).Run(context.Background(), day)
+	require.NoError(t, err)
+
+	markdown, _ := readDigest(t, root, day, config.DefaultEdition)
+	assert.Contains(t, markdown, "b-source")
+	assert.NotContains(t, markdown, "a-source",
+		"a source that produced items is not one that produced nothing")
+	assert.Contains(t, markdown, "1 selected source", "the count follows the list")
+}
+
+// TestANonEmptyDigestStillCarriesOutcomesStructurally keeps the JSON shape
+// uniform, so a reader never has to treat the field's absence as a signal.
+func TestANonEmptyDigestStillCarriesOutcomesStructurally(t *testing.T) {
+	day := at(t, "2026-09-04T06:00:00Z")
+	cfg, root := fixture(t, day, "profile", "",
+		store.Item{Source: "a-source", URL: "https://example.com/a", Content: "body"})
+
+	writeCollected(t, root, day, map[string]collect.SourceOutcome{
+		"a-source": {Ran: true, Items: 1},
+		"b-source": {Ran: true, Items: 0, Error: "boom"},
+	})
+
+	_, err := runner(t, cfg, &stubClient{}, day).Run(context.Background(), day)
+	require.NoError(t, err)
+
+	markdown, digest := readDigest(t, root, day, config.DefaultEdition)
+	require.False(t, digest.Empty)
+	assert.Len(t, digest.Sources, 2, "the structured file carries outcomes whether or not the digest is empty")
+
+	// The note belongs to the empty case: a digest with items is not ambiguous,
+	// and a delivered newsletter should not carry engine telemetry in its prose.
+	assert.NotContains(t, markdown, "No items were collected today")
+}
+
+// TestAMissingCollectionRecordIsNotAnError covers a day collected by an older
+// build. "Not known" is honest; a fabricated all-clear would not be.
+func TestAMissingCollectionRecordIsNotAnError(t *testing.T) {
+	day := at(t, "2026-09-04T06:00:00Z")
+	cfg, root := fixture(t, day, "profile", "")
+
+	_, err := runner(t, cfg, &stubClient{}, day).Run(context.Background(), day)
+	require.NoError(t, err)
+
+	markdown, digest := readDigest(t, root, day, config.DefaultEdition)
+	assert.True(t, digest.Empty)
+	assert.Empty(t, digest.Sources)
+	assert.NotContains(t, markdown, "No items were collected today",
+		"with no record, the digest claims nothing about collection either way")
+}
+
+func TestDigestSchemaIsCurrent(t *testing.T) {
+	day := at(t, "2026-09-04T06:00:00Z")
+	cfg, root := fixture(t, day, "profile", "")
+
+	_, err := runner(t, cfg, &stubClient{}, day).Run(context.Background(), day)
+	require.NoError(t, err)
+
+	_, digest := readDigest(t, root, day, config.DefaultEdition)
+	assert.Equal(t, 2, digest.Schema,
+		"the digest JSON gained an edition and collection outcomes; the version has to move with the shape")
 }
