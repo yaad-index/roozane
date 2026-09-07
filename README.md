@@ -54,6 +54,25 @@ tracker for what exists yet.
 See [`config.example.yaml`](config.example.yaml) — it is the product surface, and its comments are
 the documentation.
 
+### Upgrading from before editions
+
+Digests used to be written flat, as `digests/<day>.md`. They now live under an
+edition — `digests/<edition-id>/<day>.md`, and `digests/default/` for a config with no `editions:`
+block.
+
+**Files written by the older layout stay where they are, and the pruner will not touch them.** It
+descends into edition directories and deliberately leaves anything sitting directly under `digests/`
+alone, so a configured `retention.digests` window silently never applies to them — they accumulate
+with no error. Move them once:
+
+```
+mkdir -p digests/default
+find digests -maxdepth 1 -type f \( -name '*.md' -o -name '*.json' \) -exec mv {} digests/default/ \;
+```
+
+It moves only files sitting directly under `digests/`, so editions you already have are untouched,
+and it stays quiet when there is nothing to move.
+
 ## File permissions: the engine refuses to start on a writable config
 
 **Roozane requires that its config file, and every plugin executable named in it, is not writable by
