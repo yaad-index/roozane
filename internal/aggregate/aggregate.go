@@ -30,6 +30,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/yaad-index/roozane/internal/collect"
 	"github.com/yaad-index/roozane/internal/config"
 	"github.com/yaad-index/roozane/internal/llm"
 	"github.com/yaad-index/roozane/internal/store"
@@ -43,8 +44,14 @@ import (
 // record answers "does this reader care", which the new one deliberately never
 // asks — so the existing schema-mismatch path starts the day fresh rather than
 // relabelling one as the other. That costs one re-enriched day, not a converter.
+//
+// DigestSchema is 2 because the digest JSON gained the edition it was written
+// for and the collection outcomes of the sources its edition drew on. Both are
+// additive, so an existing reader keeps working — but a version whose shape has
+// changed underneath it tells a reader nothing, which is the whole job of
+// carrying one.
 const (
-	DigestSchema = 1
+	DigestSchema = 2
 	stateSchema  = 2
 
 	// enrichPromptVersion is bumped whenever the enrichment prompt changes in a
@@ -165,6 +172,20 @@ type Digest struct {
 	// rather than implied by an absent file, so "quiet day" and "the aggregator
 	// never ran" stay distinguishable (ADR-0002 §4).
 	Empty bool `json:"empty"`
+
+	// Sources is what collection did today for the sources this edition drew
+	// on, keyed by source id (ADR-0005 §8).
+	//
+	// It matters most when Items is empty. A narrow edition otherwise dilutes a
+	// total upstream failure into something that reads exactly like a quiet
+	// day: one source, that source down, nothing selected — indistinguishable
+	// from one source that simply had nothing. It is carried on every digest
+	// rather than only on empty ones, so the field's presence never has to be
+	// interpreted as a signal in itself.
+	//
+	// This is the structural half of ADR-0005 §8's split: error text belongs
+	// here, where sinks and tooling read it, and never in the markdown.
+	Sources map[string]collect.SourceOutcome `json:"sources,omitempty"`
 
 	Items []DigestItem `json:"items"`
 }
@@ -363,8 +384,12 @@ func (r *Runner) Run(ctx context.Context, day time.Time) (Result, error) {
 	// not take the others down with it — its digest is the one lost, and the
 	// error is reported after the rest have been written.
 	var problems []error
+	// Read once for the whole run: every edition reports a subset of the same
+	// record, and it does not change while the pass is running.
+	collected := r.loadCollectedOutcomes(day)
+
 	for _, id := range sortedEditionIDs(r.cfg.Editions) {
-		editionResult, err := r.runEdition(ctx, day, id, r.cfg.Editions[id], enriched)
+		editionResult, err := r.runEdition(ctx, day, id, r.cfg.Editions[id], enriched, collected)
 		result.Editions = append(result.Editions, editionResult)
 		addUsage(&result.Usage, editionResult.Usage)
 		if err != nil {
@@ -387,7 +412,7 @@ func (r *Runner) Run(ctx context.Context, day time.Time) (Result, error) {
 }
 
 // runEdition performs one edition's selection pass and writes its digest.
-func (r *Runner) runEdition(ctx context.Context, day time.Time, id string, edition config.Edition, enriched []enrichedItem) (EditionResult, error) {
+func (r *Runner) runEdition(ctx context.Context, day time.Time, id string, edition config.Edition, enriched []enrichedItem, collected map[string]collect.SourceOutcome) (EditionResult, error) {
 	editionResult := EditionResult{ID: id}
 
 	profilePath, ok := r.cfg.EditionProfilePath(id)
@@ -423,7 +448,7 @@ func (r *Runner) runEdition(ctx context.Context, day time.Time, id string, editi
 	editionResult.Selected = len(selected)
 	editionResult.Empty = len(selected) == 0
 
-	usage, err := r.writeDigest(ctx, day, id, profile, selected)
+	usage, err := r.writeDigest(ctx, day, id, profile, selected, r.editionSources(edition, collected))
 	addUsage(&editionResult.Usage, usage)
 	if err != nil {
 		return editionResult, err
@@ -451,6 +476,98 @@ func admittedBySources(enriched []enrichedItem, edition config.Edition) []enrich
 		}
 	}
 	return admitted
+}
+
+// loadCollectedOutcomes reads the day's collection record, returning nil when
+// there is none.
+//
+// Absent is not an error: a day collected by an older build has no such file,
+// and an aggregation that refused to run over it would be trading a digest for
+// telemetry. A digest whose Sources is empty says "not known", which is honest,
+// where a fabricated all-clear would not be.
+func (r *Runner) loadCollectedOutcomes(day time.Time) map[string]collect.SourceOutcome {
+	raw, err := os.ReadFile(r.store.CollectedPath(day)) //nolint:gosec // path is inside the engine's own data root
+	if err != nil {
+		return nil
+	}
+
+	var outcomes collect.Outcomes
+	if err := json.Unmarshal(raw, &outcomes); err != nil {
+		r.log.Warn("collection outcomes unreadable; digests will not carry them", "error", err)
+		return nil
+	}
+	return outcomes.Sources
+}
+
+// editionSources narrows the day's collection outcomes to the sources one
+// edition actually drew on.
+//
+// An edition reports only its own sources on purpose. A boardgames newsletter
+// naming an unrelated feed's failure would be reporting on somebody else's
+// pipeline, and the reason §8 wants outcomes at all is that a NARROW edition
+// cannot otherwise tell a total upstream failure from a quiet day.
+func (r *Runner) editionSources(edition config.Edition, collected map[string]collect.SourceOutcome) map[string]collect.SourceOutcome {
+	if len(collected) == 0 {
+		return nil
+	}
+
+	if edition.SelectsAll() {
+		// Every configured source, not every recorded one: a source dropped
+		// from the config mid-day is no longer part of this edition's pool.
+		return pickSources(collected, sortedSourceIDs(r.cfg.Sources))
+	}
+	return pickSources(collected, edition.SourceIDs())
+}
+
+func pickSources(collected map[string]collect.SourceOutcome, ids []string) map[string]collect.SourceOutcome {
+	picked := make(map[string]collect.SourceOutcome, len(ids))
+	for _, id := range ids {
+		if outcome, ok := collected[id]; ok {
+			picked[id] = outcome
+		}
+	}
+	if len(picked) == 0 {
+		return nil
+	}
+	return picked
+}
+
+func sortedSourceIDs(sources map[string]config.Source) []string {
+	ids := make([]string, 0, len(sources))
+	for id := range sources {
+		ids = append(ids, id)
+	}
+	sort.Strings(ids)
+	return ids
+}
+
+// silentSourcesNote is the markdown half of ADR-0005 §8: it names the selected
+// sources that produced nothing today, so an empty digest cannot be mistaken for
+// a quiet day when the real answer is that the pipeline was down.
+//
+// 🚨 It never carries the error text, and that is not an oversight to be tidied
+// away later. This markdown is what a public newsletter delivers, and a
+// newsletter must not end with a fetch exception naming an internal host or
+// path. The structured half carries the error for sinks and tooling; the two
+// files are split by audience, which is the older rule this follows.
+func silentSourcesNote(sources map[string]collect.SourceOutcome) string {
+	var silent []string
+	for id, outcome := range sources {
+		if outcome.Items == 0 {
+			silent = append(silent, id)
+		}
+	}
+	if len(silent) == 0 {
+		return ""
+	}
+	sort.Strings(silent)
+
+	noun := "source"
+	if len(silent) > 1 {
+		noun = "sources"
+	}
+	return fmt.Sprintf("\nNo items were collected today from %d selected %s: %s.\n",
+		len(silent), noun, strings.Join(silent, ", "))
 }
 
 // sortedEditionIDs gives editions a stable order, so two runs over the same day
@@ -550,12 +667,12 @@ func (r *Runner) selectItem(ctx context.Context, profile string, candidate enric
 // A day with nothing relevant skips the model entirely: there is nothing to
 // write a digest from, the correct output is the empty marker, and asking a
 // model to write about nothing is exactly how filler gets produced.
-func (r *Runner) writeDigest(ctx context.Context, day time.Time, edition, profile string, selected []selectedItem) (llm.Usage, error) {
+func (r *Runner) writeDigest(ctx context.Context, day time.Time, edition, profile string, selected []selectedItem, sources map[string]collect.SourceOutcome) (llm.Usage, error) {
 	var markdown string
 	var usage llm.Usage
 
 	if len(selected) == 0 {
-		markdown = fmt.Sprintf("# Digest — %s\n\n%s\n", store.Day(day), emptyDigestMarker)
+		markdown = fmt.Sprintf("# Digest — %s\n\n%s%s\n", store.Day(day), emptyDigestMarker, silentSourcesNote(sources))
 	} else {
 		resp, err := r.client.Complete(ctx, llm.Request{
 			Model:    r.cfg.Aggregator.Models.Digest,
@@ -578,6 +695,7 @@ func (r *Runner) writeDigest(ctx context.Context, day time.Time, edition, profil
 		Edition:     edition,
 		GeneratedAt: r.now().UTC().Format(time.RFC3339),
 		Empty:       len(selected) == 0,
+		Sources:     sources,
 		Items:       make([]DigestItem, 0, len(selected)),
 	}
 	for _, s := range selected {
