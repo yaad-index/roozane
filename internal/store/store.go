@@ -373,11 +373,22 @@ type StoredItem struct {
 // what lets a digest outlive the raw items it came from (ADR-0002).
 func (s *Store) DigestsDir() string { return filepath.Join(s.root, "digests") }
 
-// DigestPaths are the two files one day's digest is written to: the
-// human-readable artifact and the structured sink input.
-func (s *Store) DigestPaths(t time.Time) (markdown, structured string) {
+// EditionDir is where one edition's digests live (ADR-0005 §4).
+//
+// Every edition gets a directory, including the single-reader case, which
+// becomes digests/default/. The default edition is deliberately not
+// special-cased back into a flat path: a layout with one rule stays greppable
+// and "which file is today's digest" keeps one answer, whereas an exception
+// leaves two shapes on disk forever.
+func (s *Store) EditionDir(edition string) string {
+	return filepath.Join(s.DigestsDir(), edition)
+}
+
+// DigestPaths are the two files one edition's digest for one day is written to:
+// the human-readable artifact and the structured sink input.
+func (s *Store) DigestPaths(t time.Time, edition string) (markdown, structured string) {
 	day := Day(t)
-	dir := s.DigestsDir()
+	dir := s.EditionDir(edition)
 	return filepath.Join(dir, day+".md"), filepath.Join(dir, day+".json")
 }
 
@@ -565,18 +576,56 @@ func (s *Store) pruneDays(itemDays int, now time.Time) (int, error) {
 // pruneDigests removes digest files past the digest window. Zero keeps them
 // forever, which is the default: the digests are small and are the record worth
 // keeping once the items behind them are gone.
+// Digests are nested one level under an edition directory, so the pruner
+// descends into each rather than skipping directories outright as it did when
+// the tree was flat.
+//
+// 🚨 The skip is why this could not be deferred. Left alone, a configured
+// retention.digests would silently become keep-forever the moment digests moved
+// — no error, nothing in a log, just a tree that grows until a disk fills. The
+// guard itself was right in spirit, being the same instinct that leaves
+// unrecognised names alone, so it is narrowed to "descend one level, then apply
+// the same rules" rather than dropped.
 func (s *Store) pruneDigests(digestDays int, now time.Time) (int, error) {
 	if digestDays < 1 {
 		return 0, nil
 	}
 
-	dir := s.DigestsDir()
-	entries, err := os.ReadDir(dir)
+	editions, err := os.ReadDir(s.DigestsDir())
 	if err != nil {
 		if os.IsNotExist(err) {
 			return 0, nil
 		}
 		return 0, fmt.Errorf("read digests directory: %w", err)
+	}
+
+	var removed int
+	var problems []error
+	for _, edition := range editions {
+		// A stray file directly under digests/ is left alone. It is not a
+		// digest under the current layout, and deleting whatever happens to
+		// sit there is not the pruner's business.
+		if !edition.IsDir() {
+			continue
+		}
+		count, err := s.pruneEditionDigests(edition.Name(), digestDays, now)
+		removed += count
+		if err != nil {
+			problems = append(problems, err)
+		}
+	}
+	return removed, errors.Join(problems...)
+}
+
+// pruneEditionDigests removes one edition's digest files past the window.
+func (s *Store) pruneEditionDigests(edition string, digestDays int, now time.Time) (int, error) {
+	dir := s.EditionDir(edition)
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return 0, nil
+		}
+		return 0, fmt.Errorf("read digests directory for edition %s: %w", edition, err)
 	}
 
 	var removed int
@@ -594,7 +643,7 @@ func (s *Store) pruneDigests(digestDays int, now time.Time) (int, error) {
 			continue
 		}
 		if err := os.Remove(filepath.Join(dir, e.Name())); err != nil {
-			problems = append(problems, fmt.Errorf("remove digest %s: %w", e.Name(), err))
+			problems = append(problems, fmt.Errorf("remove digest %s/%s: %w", edition, e.Name(), err))
 			continue
 		}
 		removed++

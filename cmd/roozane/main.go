@@ -173,10 +173,15 @@ func runAggregate(args []string, stdout, stderr io.Writer) int {
 		return 1
 	}
 
-	_, _ = fmt.Fprintf(stdout, "%s: %d items, %d relevant, %d suppressed, %d failed, %d reused\n",
-		result.Day, result.Items, result.Relevant, result.Suppressed, result.Failed, result.Reused)
-	if result.Empty {
-		_, _ = fmt.Fprintln(stdout, "digest: empty (nothing cleared the relevance bar)")
+	_, _ = fmt.Fprintf(stdout, "%s: %d items, %d enriched, %d failed, %d reused, %d below the salience floor\n",
+		result.Day, result.Items, result.Enriched, result.Failed, result.Reused, result.BelowFloor)
+	for _, edition := range result.Editions {
+		line := fmt.Sprintf("edition %s: %d candidates, %d selected",
+			edition.ID, edition.Candidates, edition.Selected)
+		if edition.Empty {
+			line += " (empty: nothing cleared the relevance bar)"
+		}
+		_, _ = fmt.Fprintln(stdout, line)
 	}
 	_, _ = fmt.Fprintf(stdout, "tokens: %d prompt, %d completion\n",
 		result.Usage.PromptTokens, result.Usage.CompletionTokens)
@@ -236,10 +241,11 @@ func runDeliver(args []string, stdout, stderr io.Writer) int {
 			_, _ = fmt.Fprintf(stdout, "%s: FAILED: %v\n", s.ID, s.Err)
 			continue
 		}
-		_, _ = fmt.Fprintf(stdout, "%s: delivered\n", s.ID)
-	}
-	if result.Empty {
-		_, _ = fmt.Fprintln(stdout, "(the digest was empty; a quiet day is still delivered)")
+		line := fmt.Sprintf("%s: delivered (edition %s)", s.ID, s.Edition)
+		if s.Empty {
+			line += " — empty; a quiet day is still delivered"
+		}
+		_, _ = fmt.Fprintln(stdout, line)
 	}
 
 	if result.Failed() {
