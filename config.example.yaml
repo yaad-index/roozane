@@ -102,12 +102,61 @@ sources:
 # into <data_root>/inbox/ and the next collector run takes them from there
 # (ADR-0002) — the engine never reaches outside its data root for input.
 
+# Editions: one entry per audience, each drawing on the same pool of collected
+# items (ADR-0005). Items are read and summarised once, audience-agnostically;
+# an edition then picks from that enriched pool and writes its own digest in its
+# own voice, so the same item can legitimately appear in two of them.
+#
+# This block is optional and left out below. Without it the engine behaves as a
+# single edition named `default` over all sources and the `relevance_profile`
+# above — so one reader needs no ceremony here at all.
+#
+# Each key is an edition id, same shape as a source id, because it becomes a
+# path component of that edition's digests.
+#
+# Per edition, both keys are optional:
+#   sources: narrows the pool to these source ids. LEAVE IT OUT for the whole
+#            pool — including sources you add later. An empty list `[]` is the
+#            opposite: it selects nothing, which is how you park an edition
+#            without deleting it. There is no `all` keyword, because `all` is a
+#            legal source id and a magic token would collide with a real source.
+#   profile: this edition's own relevance profile. Falls back to the top-level
+#            `relevance_profile` when absent.
+#
+# ⚠️ Once you define this block, the `default` edition exists only if you write
+# it. Every sink then has to say which edition it delivers, and a sink that says
+# nothing is rejected at load rather than delivering an edition you did not
+# choose — so uncommenting this is a two-part edit, editions AND sinks:
+#
+# editions:
+#   personal:
+#     profile: profile.md
+#   boardgames:
+#     sources: [example-feed]
+#     profile: boardgames.md
+#
+# sinks:
+#   local-file:     {type: file, edition: personal, params: {path: ...}}
+#   chat:           {type: telegram, edition: personal, params: {...}}
+#   newsletter:     {command: [/usr/local/bin/mailer], edition: boardgames}
+#   telemetry:      {type: file, report: true, params: {path: reports/{day}.md}}
+
 # Where the digest goes. Optional: with no sinks the digest is still written
 # under <data_root>/digests/, which is a complete pipeline if files are all you
 # want. Each key is a sink id, same shape as a source id.
 #
 # Give each sink EITHER `type` (a built-in delivery) OR `command` (an external
 # program run under the ADR-0003 contract) — never both.
+#
+# A sink also says WHAT it carries: `edition: <id>` for that edition's digest,
+# or `report: true` for the daily report — one or the other, never both. With no
+# `editions:` block above, saying neither means the `default` edition, which is
+# why none of the sinks below name one. Many sinks may name the same edition;
+# that is how one digest reaches both a chat and a file.
+#
+# The report is not an edition — it has no sources and no profile — so it is a
+# separate thing to point at rather than a reserved id. An edition of your own
+# may be called `report` without any conflict.
 sinks:
   # Built-in: write the digest to a path. `{day}` is replaced with the digest's
   # UTC day, so this keeps one file per day; leave it out to overwrite one file.

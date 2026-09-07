@@ -698,3 +698,239 @@ func TestExecIsAKnownCollector(t *testing.T) {
 	assert.Equal(t, "exec", cfg.Sources["example-feed"].Collector)
 	assert.Equal(t, []string{"/bin/true"}, cfg.Sources["example-feed"].Command)
 }
+
+// --- editions and the sink binding (ADR-0005 §3, §4, §5) ---
+
+func TestNoEditionsBlockYieldsTheDefaultEdition(t *testing.T) {
+	cfg, err := Load(write(t, validConfig))
+	require.NoError(t, err)
+
+	// One audience is the degenerate case of the general rule, not a second
+	// code path: a config that never mentions editions still has one, so no
+	// caller downstream has to special-case its absence.
+	require.Len(t, cfg.Editions, 1)
+	require.Contains(t, cfg.Editions, DefaultEdition)
+
+	def := cfg.Editions[DefaultEdition]
+	assert.True(t, def.SelectsAll(), "the default edition draws on the whole pool")
+	assert.Equal(t, "/srv/roozane/profile.md", def.Profile, "and on the top-level profile")
+}
+
+func TestEmptyEditionsBlockIsTreatedAsAbsent(t *testing.T) {
+	cfg, err := Load(write(t, configWith("\neditions: {}\n")))
+	require.NoError(t, err)
+
+	// The alternative reading — a pipeline with no audiences — can only ever
+	// produce nothing, which is what the "at least one source" rule already
+	// refuses. Absent and empty therefore mean the same thing.
+	require.Len(t, cfg.Editions, 1)
+	assert.Contains(t, cfg.Editions, DefaultEdition)
+}
+
+// TestEditionSourcesOmittedVersusEmpty is the distinction the pointer exists
+// for. Both cases have an empty effective list, so asserting on the list alone
+// would pass either way: the assertion has to be on SelectsAll, which is the
+// only thing that tells them apart.
+func TestEditionSourcesOmittedVersusEmpty(t *testing.T) {
+	cfg, err := Load(write(t, configWith(`
+editions:
+  whole-pool: {}
+  parked: {sources: []}
+  narrowed: {sources: [example-feed]}
+`)))
+	require.NoError(t, err)
+
+	assert.True(t, cfg.Editions["whole-pool"].SelectsAll(), "omitted sources selects the whole pool")
+	assert.Nil(t, cfg.Editions["whole-pool"].SourceIDs())
+
+	assert.False(t, cfg.Editions["parked"].SelectsAll(), "an explicit empty list selects nothing")
+	assert.Empty(t, cfg.Editions["parked"].SourceIDs())
+
+	assert.False(t, cfg.Editions["narrowed"].SelectsAll())
+	assert.Equal(t, []string{"example-feed"}, cfg.Editions["narrowed"].SourceIDs())
+}
+
+func TestEditionProfileFallsBackToTheTopLevel(t *testing.T) {
+	cfg, err := Load(write(t, configWith(`
+editions:
+  inherits: {}
+  owns-one: {profile: /srv/roozane/boardgames.md}
+`)))
+	require.NoError(t, err)
+
+	assert.Equal(t, "/srv/roozane/profile.md", cfg.Editions["inherits"].Profile)
+	assert.Equal(t, "/srv/roozane/boardgames.md", cfg.Editions["owns-one"].Profile)
+}
+
+func TestEditionProfilePath(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "roozane.yaml")
+	require.NoError(t, os.WriteFile(path, []byte(`
+data_root: data
+relevance_profile: profile.md
+aggregator:
+  base_url: https://api.example.com/v1
+  api_key_env: ROOZANE_API_KEY
+  models: {item: small, digest: large}
+sources:
+  example-feed: {collector: feed, cadence: daily}
+editions:
+  inherits: {}
+  owns-one: {profile: boardgames.md}
+`), 0o600))
+
+	cfg, err := Load(path)
+	require.NoError(t, err)
+
+	// An edition profile resolves against the config's directory exactly as the
+	// top-level one does, including when it was inherited.
+	got, ok := cfg.EditionProfilePath("inherits")
+	require.True(t, ok)
+	assert.Equal(t, filepath.Join(dir, "profile.md"), got)
+
+	got, ok = cfg.EditionProfilePath("owns-one")
+	require.True(t, ok)
+	assert.Equal(t, filepath.Join(dir, "boardgames.md"), got)
+
+	// An unknown edition reports false rather than an empty path, so a caller
+	// cannot silently judge an edition against nothing.
+	got, ok = cfg.EditionProfilePath("no-such-edition")
+	assert.False(t, ok)
+	assert.Empty(t, got)
+}
+
+func TestEditionIDConstraints(t *testing.T) {
+	for name, tc := range map[string]struct {
+		body string
+		want string // empty means the config is accepted
+	}{
+		"plain id":                    {body: "\neditions:\n  personal: {}\n"},
+		"digits and interior hyphens": {body: "\neditions:\n  board-games-2: {}\n"},
+		"upper case": {
+			body: "\neditions:\n  Personal: {}\n",
+			want: `edition id "Personal" must match [a-z0-9-]`,
+		},
+		"leading hyphen": {
+			body: "\neditions:\n  -personal: {}\n",
+			want: `edition id "-personal" must match`,
+		},
+		// An edition id is a directory name, never part of an item filename, so
+		// the doubled-hyphen rule that guards `<source-id>--<key>.md` does not
+		// apply to it — the same reasoning that exempts sink ids.
+		"doubled hyphen is fine for an edition": {body: "\neditions:\n  board--games: {}\n"},
+		// Nothing reserves the report's name: a sink says `report: true`, never
+		// `edition: report`, so the two namespaces cannot collide.
+		"an edition may be called report": {body: "\neditions:\n  report: {}\n"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			_, err := Load(write(t, configWith(tc.body)))
+
+			if tc.want == "" {
+				require.NoError(t, err)
+				return
+			}
+			require.Error(t, err)
+			assert.Contains(t, err.Error(), tc.want)
+		})
+	}
+}
+
+// TestEditionRejectsUnknownSource covers a typo that would otherwise not fail
+// at all: the edition would select nothing and write an empty digest, which
+// reads exactly like a quiet day.
+func TestEditionRejectsUnknownSource(t *testing.T) {
+	_, err := Load(write(t, configWith("\neditions:\n  personal: {sources: [example-feed, absent-site]}\n")))
+
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), `edition "personal": sources[1] names unknown source "absent-site"`)
+	assert.Contains(t, err.Error(), "configured sources are example-feed, example-site")
+}
+
+func TestSinkBinding(t *testing.T) {
+	// editions defines two, neither of them "default", so a sink that names
+	// nothing has nothing to fall back to.
+	const editions = "\neditions:\n  personal: {}\n  boardgames: {sources: [example-feed]}\n"
+
+	for name, tc := range map[string]struct {
+		body string
+		want string // empty means the config is accepted
+	}{
+		"names an edition": {
+			body: editions + "sinks:\n  a-sink: {type: file, edition: personal}\n",
+		},
+		"names the report": {
+			body: editions + "sinks:\n  a-sink: {type: file, report: true}\n",
+		},
+		"many sinks may name one edition": {
+			body: editions + "sinks:\n  a-sink: {type: file, edition: personal}\n  b-sink: {type: telegram, edition: personal}\n",
+		},
+		"names both": {
+			body: editions + "sinks:\n  a-sink: {type: file, edition: personal, report: true}\n",
+			want: "set edition or report, not both",
+		},
+		"unknown edition": {
+			body: editions + "sinks:\n  a-sink: {type: file, edition: absent-edition}\n",
+			want: `sink "a-sink": unknown edition "absent-edition"; configured editions are boardgames, personal`,
+		},
+		// The default binding is silent and correct when the config never
+		// mentions editions...
+		"names neither, with no editions block": {
+			body: "\nsinks:\n  a-sink: {type: file}\n",
+		},
+		// ...and a loud failure when it defines its own and forgot this sink,
+		// rather than delivering an edition its author never chose.
+		"names neither, with editions that exclude default": {
+			body: editions + "sinks:\n  a-sink: {type: file}\n",
+			want: "names neither an edition nor the report",
+		},
+		// A config that defines editions may still call one of them "default",
+		// in which case the fallback resolves as usual.
+		"names neither, with an edition called default": {
+			body: "\neditions:\n  default: {}\n  extra: {}\nsinks:\n  a-sink: {type: file}\n",
+		},
+		"report: false is not a binding": {
+			body: editions + "sinks:\n  a-sink: {type: file, report: false, edition: personal}\n",
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			_, err := Load(write(t, configWith(tc.body)))
+
+			if tc.want == "" {
+				require.NoError(t, err)
+				return
+			}
+			require.Error(t, err)
+			assert.Contains(t, err.Error(), tc.want)
+		})
+	}
+}
+
+func TestSinkEditionID(t *testing.T) {
+	cfg, err := Load(write(t, configWith(`
+editions:
+  default: {}
+  personal: {}
+sinks:
+  bound:    {type: file, edition: personal}
+  unbound:  {type: file}
+  reporting: {type: file, report: true}
+`)))
+	require.NoError(t, err)
+
+	id, ok := cfg.Sinks["bound"].EditionID()
+	assert.True(t, ok)
+	assert.Equal(t, "personal", id)
+
+	id, ok = cfg.Sinks["unbound"].EditionID()
+	assert.True(t, ok)
+	assert.Equal(t, DefaultEdition, id, "an unbound sink resolves to the default edition")
+
+	// A report sink carries no edition. It must not read as the default one:
+	// that is the same string an unbound sink returns, so a caller that skipped
+	// the check would deliver the default edition to the report and never see
+	// a difference in a config that names no editions.
+	id, ok = cfg.Sinks["reporting"].EditionID()
+	assert.False(t, ok, "a report sink resolves to no edition")
+	assert.Empty(t, id)
+	assert.True(t, cfg.Sinks["reporting"].Report)
+}
