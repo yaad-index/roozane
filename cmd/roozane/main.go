@@ -108,6 +108,11 @@ func runCollect(args []string, stdout, stderr io.Writer) int {
 	if result.InboxDrained > 0 {
 		_, _ = fmt.Fprintf(stdout, "inbox: %d drained\n", result.InboxDrained)
 	}
+	if result.OutcomesErr != nil {
+		// Reported rather than fatal: the day's items are collected either way,
+		// and the cost of losing this is a gap in the report.
+		_, _ = fmt.Fprintf(stdout, "outcomes: FAILED: %v\n", result.OutcomesErr)
+	}
 	for _, s := range result.Sources {
 		switch {
 		case s.Err != nil:

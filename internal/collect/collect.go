@@ -9,10 +9,12 @@ package collect
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
 	"net/http"
+	"os"
 	"sort"
 	"time"
 
@@ -127,6 +129,48 @@ type SourceResult struct {
 	Err     error
 }
 
+// outcomesSchema versions days/<day>/collected.json. It carries one from the
+// start for the same reason the digest does: something other than this package
+// reads it.
+const outcomesSchema = 1
+
+// SourceOutcome is one source's line in the day's collection record.
+type SourceOutcome struct {
+	// Ran says the collector was invoked, which is false for a source that was
+	// not due. It is not the same as succeeding — a source that ran and failed
+	// has Ran true and an Error.
+	Ran bool `json:"ran"`
+
+	// Items is how many items reached disk, which can be non-zero alongside an
+	// error: a partial success is visible rather than rounded down.
+	Items int `json:"items"`
+
+	// Error is the failure text, empty when there was none.
+	Error string `json:"error,omitempty"`
+}
+
+// Outcomes is `days/<day>/collected.json` (ADR-0005 §6): what each source did
+// today, written for humans and for the daily report.
+//
+// 🚨 This exists because the information genuinely does not exist anywhere else.
+// ADR-0004 §1 decides deliberately that a failed fetch writes no ran/ marker, so
+// a failed source stays indistinguishable from one that was never due and is
+// retried on the next pass. That ambiguity is load-bearing for due(), not an
+// oversight — which is exactly why ran/ cannot answer "what failed", and why
+// this file has to.
+//
+// ⚠️ due() must never read this file. The moment scheduling consults it,
+// ADR-0004's retry property changes meaning silently: a source that failed would
+// start looking like one that had run, and stop being retried. The invariant is
+// held by a test rather than only by this comment, because the file looks useful
+// to due() and the damage would be invisible.
+type Outcomes struct {
+	Schema    int                      `json:"schema"`
+	Day       string                   `json:"day"`
+	UpdatedAt string                   `json:"updated_at"`
+	Sources   map[string]SourceOutcome `json:"sources"`
+}
+
 // Result is the outcome of a whole pass.
 type Result struct {
 	Sources []SourceResult
@@ -147,6 +191,13 @@ type Result struct {
 	// per-file failures are logged and skipped so one bad drop cannot block the
 	// queue.
 	InboxErr error
+
+	// OutcomesErr is a failure to record the day's collection outcomes. It is
+	// reported beside the collection rather than folded into it, on the same
+	// reasoning as PruneErr: telemetry that would not write does not make what
+	// was collected wrong, and refusing the pass over it would be the wrong
+	// trade.
+	OutcomesErr error
 }
 
 // Failed reports whether anything in the pass failed. A pass with failures
@@ -196,23 +247,32 @@ func (r *Runner) Run(ctx context.Context) Result {
 		r.log.Error("inbox drain failed", "error", err)
 	}
 
+	// The day's record so far. A pass merges into it rather than replacing it,
+	// because collection runs more than once a day: a source that ran at one
+	// slot is usually not due at the next, and rewriting the file from this
+	// pass alone would erase what the earlier one recorded.
+	outcomes := r.loadOutcomes(now)
+
 	for _, id := range sortedSourceIDs(r.cfg.Sources) {
 		src := r.cfg.Sources[id]
 
 		due, err := r.due(id, src.Cadence, now)
 		if err != nil {
 			result.Sources = append(result.Sources, SourceResult{ID: id, Err: err})
+			noteNotRun(outcomes, id, err)
 			r.log.Error("cadence check failed", "source", id, "error", err)
 			continue
 		}
 		if !due {
 			result.Sources = append(result.Sources, SourceResult{ID: id, Skipped: true})
+			noteNotRun(outcomes, id, nil)
 			r.log.Debug("source not due", "source", id, "cadence", string(src.Cadence))
 			continue
 		}
 
 		written, err := r.collectSource(ctx, id, src, now)
 		result.Sources = append(result.Sources, SourceResult{ID: id, Written: written, Err: err})
+		outcomes.Sources[id] = SourceOutcome{Ran: true, Items: written, Error: errorText(err)}
 		if err != nil {
 			// No marker on a failure: its absence has to keep meaning "not due
 			// yet, or broken" so the source is retried rather than treated as
@@ -235,7 +295,75 @@ func (r *Runner) Run(ctx context.Context) Result {
 		r.log.Info("source collected", "source", id, "items", written)
 	}
 
+	if err := r.saveOutcomes(now, outcomes); err != nil {
+		result.OutcomesErr = err
+		r.log.Error("could not record collection outcomes", "error", err)
+	}
+
 	return result
+}
+
+// noteNotRun records a source the collector did not invoke this pass.
+//
+// It never overwrites an existing entry: a source that ran earlier today and is
+// simply not due now must keep the record of what it did, and a "not run" line
+// written over it would turn a real collection into a blank.
+func noteNotRun(outcomes Outcomes, id string, err error) {
+	if _, recorded := outcomes.Sources[id]; recorded {
+		return
+	}
+	outcomes.Sources[id] = SourceOutcome{Ran: false, Error: errorText(err)}
+}
+
+func errorText(err error) string {
+	if err == nil {
+		return ""
+	}
+	return err.Error()
+}
+
+// loadOutcomes reads the day's record so far, returning an empty one when there
+// is nothing usable. An unreadable or foreign-schema file is started over rather
+// than merged into: this is telemetry, so the cost of losing it is a gap in a
+// report, and the cost of merging into a shape that may mean something else is a
+// report that misdescribes the day.
+func (r *Runner) loadOutcomes(now time.Time) Outcomes {
+	fresh := Outcomes{Schema: outcomesSchema, Day: store.Day(now), Sources: map[string]SourceOutcome{}}
+
+	raw, err := os.ReadFile(r.store.CollectedPath(now)) //nolint:gosec // path is inside the engine's own data root
+	if err != nil {
+		return fresh
+	}
+
+	var loaded Outcomes
+	if err := json.Unmarshal(raw, &loaded); err != nil {
+		r.log.Warn("collection outcomes unreadable, starting the day's record fresh", "error", err)
+		return fresh
+	}
+	if loaded.Schema != outcomesSchema {
+		r.log.Warn("collection outcomes were written by a different schema, starting the day's record fresh",
+			"found", loaded.Schema, "want", outcomesSchema)
+		return fresh
+	}
+	if loaded.Sources == nil {
+		loaded.Sources = map[string]SourceOutcome{}
+	}
+	loaded.Day = fresh.Day
+	return loaded
+}
+
+func (r *Runner) saveOutcomes(now time.Time, outcomes Outcomes) error {
+	outcomes.Schema = outcomesSchema
+	outcomes.UpdatedAt = now.UTC().Format(time.RFC3339)
+
+	raw, err := json.MarshalIndent(outcomes, "", "  ")
+	if err != nil {
+		return fmt.Errorf("encode collection outcomes: %w", err)
+	}
+	if err := r.store.WriteAtomic(r.store.CollectedPath(now), append(raw, '\n')); err != nil {
+		return fmt.Errorf("write collection outcomes: %w", err)
+	}
+	return nil
 }
 
 // collectSource runs one source's collector and writes what it returns. It
