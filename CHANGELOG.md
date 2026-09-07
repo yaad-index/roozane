@@ -1,5 +1,14 @@
 # Changelog
 
+## [0.4.0](https://github.com/yaad-index/roozane/compare/v0.3.0...v0.4.0) (2026-09-07)
+
+
+### Features
+
+* editions and the sink binding ([#47](https://github.com/yaad-index/roozane/issues/47)) ([a5c27ea](https://github.com/yaad-index/roozane/commit/a5c27eabe30ad0151145410d1c89da5d34f7e7d4))
+* neutral enrichment pass, then per-edition selection ([#49](https://github.com/yaad-index/roozane/issues/49)) ([626daae](https://github.com/yaad-index/roozane/commit/626daaece5a9e88d6853eee6a81a80a3f14ee6e9))
+* persist per-source collection outcomes as telemetry ([#51](https://github.com/yaad-index/roozane/issues/51)) ([f895fb6](https://github.com/yaad-index/roozane/commit/f895fb62b23325c3d4b9bd3be169ecfe5adebefb))
+
 ## [0.3.0](https://github.com/yaad-index/roozane/compare/v0.2.0...v0.3.0) (2026-09-05)
 
 
