@@ -43,6 +43,17 @@ type Config struct {
 	// validateSourceID is strict about it.
 	Sources map[string]Source `yaml:"sources"`
 
+	// Editions is keyed by edition id, one entry per audience (ADR-0005 §2).
+	// The key becomes a path component of that edition's digests, which is why
+	// it carries the same shape constraint as a source id.
+	//
+	// An absent block means a single edition named DefaultEdition over the
+	// whole pool and the top-level profile. Load materialises that edition
+	// rather than leaving every caller to special-case its absence, so one
+	// audience is the degenerate case of the general rule instead of a second
+	// code path (ADR-0005 §4).
+	Editions map[string]Edition `yaml:"editions"`
+
 	// Sinks is keyed by sink id and is optional: with none configured the
 	// aggregator still writes digests to disk, which is a complete pipeline for
 	// a reader who only wants the files.
@@ -98,6 +109,43 @@ type Models struct {
 	Digest string `yaml:"digest"`
 }
 
+// Edition is one audience's view of the shared item pool (ADR-0005 §2). It
+// narrows the pool by source list first, then applies its own relevance
+// profile, and writes its own digest.
+type Edition struct {
+	// Sources narrows the pool to these source ids.
+	//
+	// It is a pointer so that an absent list and an explicit `sources: []` stay
+	// distinguishable, which is the whole point of the field: omitted selects
+	// the whole pool, empty selects nothing — a legitimate way to park an
+	// edition without deleting it (ADR-0005 §3). There is deliberately no `all`
+	// keyword, because source ids are `[a-z0-9-]` and `all` is a legal one, so
+	// a magic token would collide with a real source the day someone names one.
+	// Absence cannot collide.
+	Sources *[]string `yaml:"sources"`
+
+	// Profile is this edition's relevance profile, falling back to the
+	// top-level RelevanceProfile when absent. Load always leaves this set.
+	Profile string `yaml:"profile"`
+}
+
+// SelectsAll reports whether this edition draws on the whole pool, which is
+// what an omitted `sources:` means. It is distinct from an edition whose
+// explicit list happens to name every source: that one stops covering the pool
+// the moment a new source is configured, and this one does not.
+func (e Edition) SelectsAll() bool { return e.Sources == nil }
+
+// SourceIDs is the explicit source list, or nil when the edition draws on the
+// whole pool. Callers must consult SelectsAll rather than reading a nil result
+// as "selects nothing" — the two are opposites, and conflating them is the one
+// mistake this field's pointer exists to make impossible.
+func (e Edition) SourceIDs() []string {
+	if e.Sources == nil {
+		return nil
+	}
+	return *e.Sources
+}
+
 // Source is one entry in the source list: what to run, how often, and whatever
 // that collector needs.
 type Source struct {
@@ -146,9 +194,45 @@ type Sink struct {
 	// a delivery credential, by variable name (ADR-0003 §6).
 	Env []string `yaml:"env"`
 
+	// Edition names the edition whose digest this sink delivers. A sink names
+	// exactly one of Edition and Report, and DefaultEdition applies only when
+	// it names neither (ADR-0005 §5) — without that clause an absent edition
+	// would silently give every report-only sink the default edition as well,
+	// so one sink would claim one of each.
+	Edition string `yaml:"edition"`
+
+	// Report points this sink at the daily report instead of an edition.
+	//
+	// The report is not an edition and is deliberately not modelled as one: it
+	// has no sources and no profile, selects nothing, and runs after every
+	// edition because it describes them. What widens here is what a sink may be
+	// pointed at, not what an edition is — which is also why no edition id is
+	// reserved. A user may have an edition called `report`; the two namespaces
+	// never meet (ADR-0005 §7).
+	Report bool `yaml:"report"`
+
 	// Params carries sink-specific settings — a destination id, a path — and is
 	// held undecoded for the same reason a source's params are.
 	Params yaml.Node `yaml:"params"`
+}
+
+// EditionID is the edition whose digest this sink delivers: the one it names,
+// or DefaultEdition when it names neither an edition nor the report.
+//
+// The second result is false for a report sink, which delivers no edition at
+// all. Returning DefaultEdition for one would give a report sink and a
+// default-bound sink the same reading, and a caller that forgot to consult
+// Report would then deliver the default edition to the report — silently, and
+// only in configs that never named an edition. The pair makes that
+// unrepresentable instead of documenting it.
+func (s Sink) EditionID() (string, bool) {
+	if s.Report {
+		return "", false
+	}
+	if s.Edition == "" {
+		return DefaultEdition, true
+	}
+	return s.Edition, true
 }
 
 // DecodeParams decodes a sink's delivery-specific params into v, with the same
@@ -248,6 +332,13 @@ const (
 	defaultTimeout          = 60 * time.Second
 )
 
+// DefaultEdition is the edition a config with no `editions:` block gets, and
+// the one a sink binds to when it names neither an edition nor the report
+// (ADR-0005 §4, §5). It is a normal edition id in every other respect: nothing
+// reserves the name, and a config that defines its own editions may use it or
+// not.
+const DefaultEdition = "default"
+
 // idPattern is ADR-0002's `[a-z0-9-]` constraint, anchored, and refusing a
 // leading or trailing hyphen. Shared by source and sink ids.
 var idPattern = regexp.MustCompile(`^[a-z0-9]([a-z0-9-]*[a-z0-9])?$`)
@@ -323,6 +414,23 @@ func (c *Config) applyDefaults() {
 		timeout := Duration(defaultTimeout)
 		c.Aggregator.Timeout = &timeout
 	}
+
+	// An empty `editions: {}` is treated as an absent block rather than as a
+	// config with no audiences. The distinction would only let someone express
+	// a pipeline that can never produce a digest, which is the same thing the
+	// "sources must contain at least one entry" rule already refuses.
+	if len(c.Editions) == 0 {
+		c.Editions = map[string]Edition{DefaultEdition: {}}
+	}
+
+	// Runs after RelevanceProfile has been defaulted above, so an edition
+	// inheriting it can never inherit an empty string.
+	for id, e := range c.Editions {
+		if e.Profile == "" {
+			e.Profile = c.RelevanceProfile
+			c.Editions[id] = e
+		}
+	}
 }
 
 // ItemDays is the item-retention window in UTC days. Load guarantees the
@@ -368,6 +476,7 @@ func (c *Config) Validate() error {
 	problems = append(problems, c.validateAggregator()...)
 	problems = append(problems, c.validateSources()...)
 	problems = append(problems, c.validateRetentionCoversCadences()...)
+	problems = append(problems, c.validateEditions()...)
 	problems = append(problems, c.validateSinks()...)
 
 	return errors.Join(problems...)
@@ -473,6 +582,37 @@ func (c *Config) validateRetentionCoversCadences() []error {
 		items, longestSource, c.Sources[longestSource].Cadence, longestDays)}
 }
 
+// validateEditions checks the edition list. Load materialises the default
+// edition before this runs, so the map is never empty here.
+//
+// An edition naming a source that does not exist is rejected for the same
+// reason ADR-0005 §5 rejects an unknown edition id on a sink: the source list
+// is closed and known locally, so a typo is answerable at load. Left to run
+// time it would not error at all — the edition would simply select nothing and
+// write an empty digest, which is indistinguishable from a quiet day.
+func (c *Config) validateEditions() []error {
+	var problems []error
+
+	for _, id := range sortedKeys(c.Editions) {
+		if err := validateID("edition", id); err != nil {
+			problems = append(problems, fmt.Errorf("%w: it becomes a path component of that edition's digests (ADR-0005)", err))
+			// The source cross-check below reports against this id, and
+			// repeating a name already called malformed adds noise rather than
+			// information.
+			continue
+		}
+		for i, src := range c.Editions[id].SourceIDs() {
+			if _, ok := c.Sources[src]; !ok {
+				problems = append(problems, fmt.Errorf(
+					"edition %q: sources[%d] names unknown source %q; configured sources are %s",
+					id, i, src, strings.Join(sortedKeys(c.Sources), ", ")))
+			}
+		}
+	}
+
+	return problems
+}
+
 // validateSinks checks the optional sink list. An empty one is fine: without
 // sinks the aggregator still writes digests to disk.
 func (c *Config) validateSinks() []error {
@@ -481,7 +621,7 @@ func (c *Config) validateSinks() []error {
 		if err := validateID("sink", id); err != nil {
 			problems = append(problems, err)
 		}
-		problems = append(problems, validateSink(id, c.Sinks[id])...)
+		problems = append(problems, validateSink(id, c.Sinks[id], c.Editions)...)
 	}
 	return problems
 }
@@ -556,7 +696,7 @@ func validateSource(id string, s Source) []error {
 	return problems
 }
 
-func validateSink(id string, s Sink) []error {
+func validateSink(id string, s Sink, editions map[string]Edition) []error {
 	var problems []error
 
 	// Exactly one of the two. Neither leaves nothing to run; both leaves the
@@ -571,9 +711,49 @@ func validateSink(id string, s Sink) []error {
 		problems = append(problems, fmt.Errorf("sink %q: command's first element must be the program to run, not an empty string", id))
 	}
 
+	problems = append(problems, validateSinkBinding(id, s, editions)...)
 	problems = append(problems, validateEnv(fmt.Sprintf("sink %q", id), s.Env)...)
 
 	return problems
+}
+
+// validateSinkBinding checks what a sink is pointed at: one edition, or the
+// report, and never both (ADR-0005 §5).
+func validateSinkBinding(id string, s Sink, editions map[string]Edition) []error {
+	switch {
+	case s.Edition != "" && s.Report:
+		return []error{fmt.Errorf(
+			"sink %q: set edition or report, not both — a sink delivers one edition's digest or the daily report", id)}
+
+	case s.Report:
+		// The report is not an edition, so there is no id to resolve. Nothing
+		// reserves the name either: an edition may legitimately be called
+		// "report" and is unrelated to this flag.
+		return nil
+
+	case s.Edition != "":
+		if _, ok := editions[s.Edition]; !ok {
+			return []error{fmt.Errorf(
+				"sink %q: unknown edition %q; configured editions are %s",
+				id, s.Edition, strings.Join(sortedKeys(editions), ", "))}
+		}
+		return nil
+
+	default:
+		// The sink named neither, so it binds to the default edition. That is
+		// silent and correct for a config that never mentions editions, and a
+		// loud failure for one that defines its own and forgot to bind this
+		// sink — the alternative being a sink that delivers an edition its
+		// author never chose.
+		if _, ok := editions[DefaultEdition]; !ok {
+			return []error{fmt.Errorf(
+				"sink %q: names neither an edition nor the report, so it binds to edition %q — "+
+					"but this config defines editions and none of them is %q. "+
+					"Name one of %s explicitly, or set report: true",
+				id, DefaultEdition, DefaultEdition, strings.Join(sortedKeys(editions), ", "))}
+		}
+		return nil
+	}
 }
 
 // validateEnv checks an ADR-0003 §6 allow-list. Every entry must look like a
@@ -618,6 +798,21 @@ func (c *Config) DataRootPath() string { return c.resolve(c.DataRoot) }
 // RelevanceProfilePath is the absolute path to the relevance profile, resolved
 // the same way as the data root.
 func (c *Config) RelevanceProfilePath() string { return c.resolve(c.RelevanceProfile) }
+
+// EditionProfilePath is the absolute path to an edition's relevance profile,
+// resolved the same way as the top-level one. Load has already applied the
+// fallback to relevance_profile, so this reports what the edition will actually
+// be judged against rather than only what it named.
+//
+// The second result is false for an unknown edition id, so a caller cannot read
+// a missing edition as the empty path and silently judge against nothing.
+func (c *Config) EditionProfilePath(id string) (string, bool) {
+	e, ok := c.Editions[id]
+	if !ok {
+		return "", false
+	}
+	return c.resolve(e.Profile), true
+}
 
 func (c *Config) resolve(path string) string {
 	if filepath.IsAbs(path) || c.dir == "" {
