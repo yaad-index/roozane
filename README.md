@@ -18,8 +18,9 @@ Roozane inverts both:
 Three layers, one binary, files in between ([ADR-0001](docs/adr/0001-foundations.md)):
 
 ```
-collectors  ──►  days/<utc-day>/items/*.md  ──►  aggregator  ──►  digests/<day>.{md,json}  ──►  sinks
- (dumb)              raw text, provenance        (the brain)          the day's digest         (dumb)
+collectors ─► days/<utc-day>/items/*.md ─► enrich ─► select ─► digests/<edition>/<day>.{md,json} ─► sinks
+  (dumb)         raw text, provenance      (once)   (per       one digest per audience            (dumb)
+                                                    edition)
 ```
 
 1. **Collectors** are deliberately dumb: a YAML config lists your sources, each with its own cadence
@@ -27,9 +28,17 @@ collectors  ──►  days/<utc-day>/items/*.md  ──►  aggregator  ──�
    config change, never a code change. Newsletters arrive via a watched inbox folder that external
    tooling fills — the engine never touches a mailbox.
 2. **The aggregator** is the only layer with a brain. It speaks the standard chat-completions API —
-   strictly provider-agnostic, configured by endpoint and model names — reads the day's items one at
-   a time against your relevance profile, and writes the digest. Suppression is the default.
-3. **Sinks** deliver: a file, a chat message, later a podcast render. Dumb by design.
+   strictly provider-agnostic, configured by endpoint and model names — and runs in two passes
+   ([ADR-0005](docs/adr/0005-editions.md)). It reads each item **once, for nobody in particular**,
+   recording a neutral summary, tags and a generic "is this substantive at all" score. Then it
+   **selects per edition**: each audience narrows the shared pool by its own source list and its own
+   relevance profile, and gets its own digest in its own voice. Suppression is the default.
+3. **Editions** are how one deployment serves several audiences from one pool of items — a public
+   newsletter alongside a private brief. The same item may legitimately appear in both, and with no
+   audience in the per-item record there is no private reasoning that could leak into a public
+   digest. A config with no `editions:` block behaves as a single edition named `default`.
+4. **Sinks** deliver: a file, a chat message, later a podcast render. Each names the edition it
+   carries. Dumb by design.
 
 Collectors and sinks are **exec-pluggable** ([ADR-0003](docs/adr/0003-plugin-contract.md)): an
 external program in any language can extend the edges over stdin/stdout, while the engine alone

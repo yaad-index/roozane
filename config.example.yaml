@@ -8,7 +8,8 @@
 # move together.
 
 # Root for everything on disk: collected items, digests, aggregator state
-# (ADR-0002). Default: data
+# (ADR-0002). The engine owns this tree — point file sinks somewhere else.
+# Default: data
 data_root: data
 
 # The reader-owned description of what matters to them. Prose, in a file you
@@ -139,11 +140,11 @@ sources:
 #   local-file:     {type: file, edition: personal, params: {path: ...}}
 #   chat:           {type: telegram, edition: personal, params: {...}}
 #   newsletter:     {command: [/usr/local/bin/mailer], edition: boardgames}
-#   telemetry:      {type: file, report: true, params: {path: reports/{day}.md}}
+#   telemetry:      {type: file, report: true, params: {path: exports/report-{day}.md}}
 
-# Where the digest goes. Optional: with no sinks the digest is still written
-# under <data_root>/digests/, which is a complete pipeline if files are all you
-# want. Each key is a sink id, same shape as a source id.
+# Where the digest goes. Optional: with no sinks each edition's digest is still
+# written under <data_root>/digests/<edition-id>/, which is a complete pipeline
+# if files are all you want. Each key is a sink id, same shape as a source id.
 #
 # Give each sink EITHER `type` (a built-in delivery) OR `command` (an external
 # program run under the ADR-0003 contract) — never both.
@@ -164,7 +165,12 @@ sinks:
   local-file:
     type: file
     params:
-      path: digests/{day}.md
+      # ⚠️ This path is resolved AS GIVEN — it is not relative to data_root.
+      # Deliberately not under digests/: the engine writes its own digests to
+      # <data_root>/digests/<edition>/<day>.md, and a sink pointed there would
+      # scatter files through the layout the engine owns. Point a file sink at
+      # a directory of your own.
+      path: exports/{day}.md
       format: markdown
 
   # Built-in: send the digest as a chat message. `token_env` names the variable
