@@ -45,6 +45,51 @@ tracker for what exists yet.
 See [`config.example.yaml`](config.example.yaml) — it is the product surface, and its comments are
 the documentation.
 
+## File permissions: the engine refuses to start on a writable config
+
+**Roozane requires that its config file, and every plugin executable named in it, is not writable by
+group or other.** If either is, it refuses to start rather than warning
+([ADR-0003 §8](docs/adr/0003-plugin-contract.md)).
+
+This is not a hardening suggestion. **The config is the trust boundary**: whoever can edit it can
+make the engine run any program as your user, and whoever can overwrite a configured plugin binary
+gets the same thing without touching the config at all. A group-writable config file is therefore an
+arbitrary-code-execution path for everyone in that group.
+
+The check:
+
+```
+stat -c '%a %n' roozane.yaml
+chmod go-w roozane.yaml
+```
+
+The refusal names the file, its mode and the fix, so a cron log is enough to act on:
+
+```
+config file (roozane.yaml) is writable by other users (mode 0664): whoever can write it can run
+arbitrary code as this user, so the engine refuses to start (ADR-0003 §8) — fix with:
+chmod go-w roozane.yaml
+```
+
+**The most common way to meet this is a first run, with no upgrade involved.** Git tracks only the
+executable bit, so a fresh clone's files take their mode from your umask: `0644` under the usual
+`022`, but `0664` under `002`. Copy `config.example.yaml` to `roozane.yaml` on a `umask 002` machine
+and the very first run refuses.
+
+The others:
+
+- editing the config later on a machine with a different umask;
+- restoring from a backup, or an `rsync` that dropped modes;
+- mounting a config into the container from a host directory with looser modes;
+- a plugin binary living in a group-writable directory — every source and sink `command[0]` is
+  resolved through `PATH` and checked where it actually resolves to.
+
+**Two limits, stated rather than implied away.** The check looks at the files, not at the
+directories holding them — a world-writable directory still lets someone replace a `0644` file, and
+directory hardening is deployment advice. And a command that cannot be found is not reported here: a
+missing plugin fails at run time with a clearer message than this check could give, and refusing to
+start over it would turn a broken sink into a dead engine.
+
 ## License
 
 MIT.
