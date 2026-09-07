@@ -397,6 +397,15 @@ func (s *Store) StatePath(t time.Time) string {
 	return filepath.Join(s.DayDir(t), "state.json")
 }
 
+// CollectedPath is the collector's per-day outcome record (ADR-0005 §6).
+//
+// It lives inside the day folder, so item retention carries it away with the
+// items it describes rather than leaving a record of a day whose contents are
+// gone.
+func (s *Store) CollectedPath(t time.Time) string {
+	return filepath.Join(s.DayDir(t), "collected.json")
+}
+
 // WriteAtomic writes data to path, creating parent directories, via the same
 // temp-then-rename used for items. Callers own their file formats; the atomic
 // guarantee stays in one place.

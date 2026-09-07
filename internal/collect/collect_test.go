@@ -2,6 +2,7 @@ package collect
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"io"
 	"log/slog"
@@ -740,4 +741,212 @@ func TestCollectPassPrunesAndStillCollects(t *testing.T) {
 	require.Len(t, result.Sources, 1)
 	require.NoError(t, result.Sources[0].Err)
 	assert.Equal(t, 1, result.Sources[0].Written, "and the pass still collected")
+}
+
+// --- collection outcomes (ADR-0005 §6) ---
+
+// readOutcomes loads the day's collection record.
+func readOutcomes(t *testing.T, root string, day time.Time) Outcomes {
+	t.Helper()
+	raw, err := os.ReadFile(store.New(root).CollectedPath(day))
+	require.NoError(t, err)
+	var outcomes Outcomes
+	require.NoError(t, json.Unmarshal(raw, &outcomes))
+	return outcomes
+}
+
+func TestOutcomesRecordWhatEachSourceDid(t *testing.T) {
+	root := t.TempDir()
+	now := at(t, "2026-09-04T06:00:00Z")
+	cfg := testConfig(t, root, `  ok-source: {collector: feed, cadence: daily}
+  bad-source: {collector: http, cadence: daily}
+`)
+
+	result := NewRunner(cfg,
+		WithLogger(quietLogger()),
+		WithClock(func() time.Time { return now }),
+		WithCollector("feed", &stubCollector{items: []Collected{
+			{URL: "https://example.com/a", Content: "body a"},
+			{URL: "https://example.com/b", Content: "body b"},
+		}}),
+		WithCollector("http", &stubCollector{err: errors.New("upstream refused the connection")}),
+	).Run(context.Background())
+	require.NoError(t, result.OutcomesErr)
+
+	outcomes := readOutcomes(t, root, now)
+	assert.Equal(t, outcomesSchema, outcomes.Schema)
+	assert.Equal(t, store.Day(now), outcomes.Day)
+	assert.NotEmpty(t, outcomes.UpdatedAt)
+
+	require.Contains(t, outcomes.Sources, "ok-source")
+	assert.True(t, outcomes.Sources["ok-source"].Ran)
+	assert.Equal(t, 2, outcomes.Sources["ok-source"].Items)
+	assert.Empty(t, outcomes.Sources["ok-source"].Error)
+
+	// A failed source ran: the distinction between "ran and failed" and "was
+	// never due" is the whole reason this file exists, since the ran/ marker
+	// deliberately cannot express it.
+	require.Contains(t, outcomes.Sources, "bad-source")
+	assert.True(t, outcomes.Sources["bad-source"].Ran)
+	assert.Zero(t, outcomes.Sources["bad-source"].Items)
+	assert.Contains(t, outcomes.Sources["bad-source"].Error, "upstream refused the connection")
+}
+
+// TestOutcomesDistinguishFailedFromNotDue is the pair the ran/ marker cannot
+// tell apart. Both leave no marker on disk; only this file separates them.
+func TestOutcomesDistinguishFailedFromNotDue(t *testing.T) {
+	root := t.TempDir()
+	now := at(t, "2026-09-04T06:00:00Z")
+	cfg := testConfig(t, root, `  weekly-source: {collector: feed, cadence: weekly}
+  failing-source: {collector: http, cadence: daily}
+`)
+
+	// Give the weekly source a run yesterday so it is not due today.
+	require.NoError(t, store.New(root).MarkRan("weekly-source", now.AddDate(0, 0, -1)))
+
+	result := NewRunner(cfg,
+		WithLogger(quietLogger()),
+		WithClock(func() time.Time { return now }),
+		WithCollector("feed", &stubCollector{}),
+		WithCollector("http", &stubCollector{err: errors.New("boom")}),
+	).Run(context.Background())
+	require.NoError(t, result.OutcomesErr)
+
+	outcomes := readOutcomes(t, root, now)
+	assert.False(t, outcomes.Sources["weekly-source"].Ran, "not due means it did not run")
+	assert.Empty(t, outcomes.Sources["weekly-source"].Error, "and not due is not a failure")
+
+	assert.True(t, outcomes.Sources["failing-source"].Ran)
+	assert.Contains(t, outcomes.Sources["failing-source"].Error, "boom")
+}
+
+// TestOutcomesSurviveALaterPassThatSkipsTheSource is why a pass merges into the
+// day's record rather than rewriting it. Collection runs on more than one slot,
+// and a source that ran at the first is usually not due at the second.
+func TestOutcomesSurviveALaterPassThatSkipsTheSource(t *testing.T) {
+	root := t.TempDir()
+	morning := at(t, "2026-09-04T06:00:00Z")
+	evening := at(t, "2026-09-04T18:00:00Z")
+	cfg := testConfig(t, root, "  a-source: {collector: feed, cadence: daily}\n")
+
+	stub := &stubCollector{items: []Collected{{URL: "https://example.com/a", Content: "body"}}}
+	NewRunner(cfg,
+		WithLogger(quietLogger()),
+		WithClock(func() time.Time { return morning }),
+		WithCollector("feed", stub),
+	).Run(context.Background())
+
+	require.Equal(t, 1, readOutcomes(t, root, morning).Sources["a-source"].Items)
+
+	// Second pass the same day: the source is no longer due, so it does not run.
+	NewRunner(cfg,
+		WithLogger(quietLogger()),
+		WithClock(func() time.Time { return evening }),
+		WithCollector("feed", stub),
+	).Run(context.Background())
+
+	after := readOutcomes(t, root, evening)
+	assert.True(t, after.Sources["a-source"].Ran, "the morning's run must not be erased by the evening's skip")
+	assert.Equal(t, 1, after.Sources["a-source"].Items)
+}
+
+// TestALaterRunOverwritesAnEarlierFailure keeps the record on the latest truth
+// for a source that actually ran again.
+func TestALaterRunOverwritesAnEarlierFailure(t *testing.T) {
+	root := t.TempDir()
+	morning := at(t, "2026-09-04T06:00:00Z")
+	evening := at(t, "2026-09-04T18:00:00Z")
+	cfg := testConfig(t, root, "  a-source: {collector: feed, cadence: daily}\n")
+
+	NewRunner(cfg,
+		WithLogger(quietLogger()),
+		WithClock(func() time.Time { return morning }),
+		WithCollector("feed", &stubCollector{err: errors.New("first attempt failed")}),
+	).Run(context.Background())
+	require.Contains(t, readOutcomes(t, root, morning).Sources["a-source"].Error, "first attempt failed")
+
+	// The failure left no marker, so the source is due again and runs.
+	NewRunner(cfg,
+		WithLogger(quietLogger()),
+		WithClock(func() time.Time { return evening }),
+		WithCollector("feed", &stubCollector{items: []Collected{{URL: "https://example.com/a", Content: "body"}}}),
+	).Run(context.Background())
+
+	after := readOutcomes(t, root, evening)
+	assert.Empty(t, after.Sources["a-source"].Error, "the retry succeeded, so the day's record says so")
+	assert.Equal(t, 1, after.Sources["a-source"].Items)
+}
+
+// 🚨 TestDueIgnoresTheOutcomesFile is the invariant ADR-0005 §6 states and this
+// package must never lose.
+//
+// A failed fetch deliberately writes no ran/ marker so the source stays "not
+// run" and is retried (ADR-0004 §1). collected.json now records that the source
+// DID run — which is exactly the record that would make due() stop retrying it
+// if scheduling ever consulted this file. The comment is not enough: the file
+// looks useful to due(), and the damage would be a source that silently stops
+// being fetched after its first failure.
+func TestDueIgnoresTheOutcomesFile(t *testing.T) {
+	root := t.TempDir()
+	now := at(t, "2026-09-04T06:00:00Z")
+	cfg := testConfig(t, root, "  a-source: {collector: feed, cadence: daily}\n")
+
+	// A first pass that fails: no ran/ marker, but an outcome saying it ran.
+	NewRunner(cfg,
+		WithLogger(quietLogger()),
+		WithClock(func() time.Time { return now }),
+		WithCollector("feed", &stubCollector{err: errors.New("upstream is down")}),
+	).Run(context.Background())
+
+	recorded := readOutcomes(t, root, now)
+	require.True(t, recorded.Sources["a-source"].Ran,
+		"precondition: the file has to claim the source ran, or this test proves nothing")
+	require.NoDirExists(t, filepath.Join(store.New(root).RanDir(now), "a-source"),
+		"precondition: a failed fetch leaves no marker")
+
+	// Same day, a second pass. If due() read collected.json it would see a
+	// source that already ran today and skip it.
+	retry := &stubCollector{items: []Collected{{URL: "https://example.com/a", Content: "body"}}}
+	result := NewRunner(cfg,
+		WithLogger(quietLogger()),
+		WithClock(func() time.Time { return now.Add(2 * time.Hour) }),
+		WithCollector("feed", retry),
+	).Run(context.Background())
+
+	assert.Equal(t, 1, retry.calls, "a failed source is retried; scheduling must not consult the outcomes file")
+	require.Len(t, result.Sources, 1)
+	assert.False(t, result.Sources[0].Skipped)
+	assert.Equal(t, 1, result.Sources[0].Written)
+}
+
+// TestOutcomesFromAnotherSchemaAreNotMergedInto keeps a differently-shaped
+// record from being half-read into this one.
+func TestOutcomesFromAnotherSchemaAreNotMergedInto(t *testing.T) {
+	root := t.TempDir()
+	now := at(t, "2026-09-04T06:00:00Z")
+	cfg := testConfig(t, root, "  a-source: {collector: feed, cadence: daily}\n")
+
+	s := store.New(root)
+	stale := `{"schema":99,"day":"2026-09-04","sources":{"ghost-source":{"ran":true,"items":7}}}`
+	require.NoError(t, s.WriteAtomic(s.CollectedPath(now), []byte(stale)))
+
+	NewRunner(cfg,
+		WithLogger(quietLogger()),
+		WithClock(func() time.Time { return now }),
+		WithCollector("feed", &stubCollector{}),
+	).Run(context.Background())
+
+	outcomes := readOutcomes(t, root, now)
+	assert.Equal(t, outcomesSchema, outcomes.Schema)
+	assert.NotContains(t, outcomes.Sources, "ghost-source",
+		"another schema's entries may mean something else; the day's record starts fresh")
+	assert.Contains(t, outcomes.Sources, "a-source")
+}
+
+// TestOutcomesLiveInsideTheDayFolder ties the record's lifetime to the items it
+// describes, so item retention carries it away with them.
+func TestOutcomesLiveInsideTheDayFolder(t *testing.T) {
+	s := store.New("/srv/roozane")
+	day := at(t, "2026-09-04T06:00:00Z")
+	assert.Equal(t, filepath.Join(s.DayDir(day), "collected.json"), s.CollectedPath(day))
 }
