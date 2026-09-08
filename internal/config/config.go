@@ -35,6 +35,24 @@ type Config struct {
 	// to them. It is prompt input for the aggregator, never inferred state.
 	RelevanceProfile string `yaml:"relevance_profile"`
 
+	// Language is the language every edition's digest is written in, unless
+	// that edition names its own. It is free text handed to a model — "English",
+	// "Deutsch", "fa" — because the set of things a reader might name is not one
+	// this engine can enumerate.
+	//
+	// 🚨 Empty means NO language is stated anywhere, which is this engine's
+	// behaviour before the key existed: the output language is emergent from the
+	// model and the sources. That is the correct default precisely because it is
+	// a no-op. A default of "English" would silently rewrite the output of every
+	// config already in use, including an edition whose reader wants German.
+	//
+	// It is config rather than a line in the relevance profile because the
+	// profile is fed to the SELECT pass once per candidate item, where it reads
+	// as a matching criterion: "select items matching this profile" plus "in
+	// English" invites the model to score a German item lower for being German.
+	// Language is a property of the digest, not a property of what belongs in it.
+	Language string `yaml:"language"`
+
 	Retention  Retention  `yaml:"retention"`
 	Aggregator Aggregator `yaml:"aggregator"`
 
@@ -189,6 +207,12 @@ type Edition struct {
 	// Profile is this edition's relevance profile, falling back to the
 	// top-level RelevanceProfile when absent. Load always leaves this set.
 	Profile string `yaml:"profile"`
+
+	// Language is this edition's digest language, falling back to the top-level
+	// Language when absent. Unlike Profile it can legitimately end up empty:
+	// stating no language at all is a supported configuration and the default
+	// one (see Config.Language).
+	Language string `yaml:"language"`
 }
 
 // SelectsAll reports whether this edition draws on the whole pool, which is
@@ -487,11 +511,20 @@ func (c *Config) applyDefaults() {
 
 	// Runs after RelevanceProfile has been defaulted above, so an edition
 	// inheriting it can never inherit an empty string.
+	//
+	// Language inherits by the same rule but has no default behind it, so an
+	// edition can inherit an empty string — which is the "state no language"
+	// configuration rather than a missing value.
+	c.Language = strings.TrimSpace(c.Language)
 	for id, e := range c.Editions {
 		if e.Profile == "" {
 			e.Profile = c.RelevanceProfile
-			c.Editions[id] = e
 		}
+		e.Language = strings.TrimSpace(e.Language)
+		if e.Language == "" {
+			e.Language = c.Language
+		}
+		c.Editions[id] = e
 	}
 }
 

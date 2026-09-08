@@ -186,6 +186,15 @@ func runAggregate(args []string, stdout, stderr io.Writer) int {
 		if edition.Unjudged > 0 {
 			line += fmt.Sprintf(", %d never judged (the selection call failed)", edition.Unjudged)
 		}
+		if edition.TitlesFailed {
+			// Said on the run's own summary because the alternative places are
+			// the log, which nobody reads on a green run, and the digest, which
+			// the operator is not the reader of. It does not change the exit
+			// code: the digest was written and delivered, and treating a
+			// language degradation as a failed run would put it on the same
+			// footing as losing the day's digest entirely.
+			line += ", headlines kept their published language (the title call failed)"
+		}
 		if edition.Empty {
 			// Qualified rather than stated: with unjudged items in the same
 			// edition, "nothing cleared the bar" is not established. Nothing

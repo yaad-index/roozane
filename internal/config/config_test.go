@@ -1041,3 +1041,53 @@ func TestNegativeReportRetentionIsRejected(t *testing.T) {
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "retention.reports must not be negative")
 }
+
+func TestEditionLanguageFallsBackToTheTopLevel(t *testing.T) {
+	cfg, err := Load(write(t, configWith(`
+language: English
+editions:
+  inherits: {}
+  owns-one: {language: Deutsch}
+`)))
+	require.NoError(t, err)
+
+	assert.Equal(t, "English", cfg.Editions["inherits"].Language)
+	assert.Equal(t, "Deutsch", cfg.Editions["owns-one"].Language)
+}
+
+// TestNoLanguageStaysEmpty pins the default, which is the one that must not
+// drift: an unset language means no language is stated to any pass, which is
+// what this engine did before the key existed. Defaulting it to a language here
+// would silently rewrite the output of every config already in use.
+func TestNoLanguageStaysEmpty(t *testing.T) {
+	cfg, err := Load(write(t, validConfig))
+	require.NoError(t, err)
+
+	assert.Empty(t, cfg.Language)
+	assert.Empty(t, cfg.Editions[DefaultEdition].Language)
+}
+
+func TestLanguageIsTrimmed(t *testing.T) {
+	cfg, err := Load(write(t, configWith(`
+language: "  English  "
+editions:
+  inherits: {}
+  padded: {language: "  Deutsch  "}
+`)))
+	require.NoError(t, err)
+
+	assert.Equal(t, "English", cfg.Language)
+	assert.Equal(t, "English", cfg.Editions["inherits"].Language)
+	assert.Equal(t, "Deutsch", cfg.Editions["padded"].Language)
+}
+
+// TestAnUnknownLanguageKeyIsRejected is half the argument for language being
+// config rather than a sentence in the relevance profile. `digest_language` is
+// the name someone reasonably reaches for, and getting it wrong fails at load —
+// where the same mistake in a prose profile has no effect at all and reads as
+// the model ignoring an instruction.
+func TestAnUnknownLanguageKeyIsRejected(t *testing.T) {
+	_, err := Load(write(t, configWith("digest_language: English\n")))
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "digest_language")
+}

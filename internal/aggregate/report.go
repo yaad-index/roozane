@@ -20,10 +20,15 @@ import (
 // shape changed underneath a reader tells that reader nothing.
 const ReportSchema = 2
 
-// Pass names the three calls a run makes, used to attribute spend.
+// Pass names the calls a run makes, used to attribute spend.
+//
+// PassTitle runs at most once per edition and only when that edition names a
+// language, so its line is absent from most reports rather than zero — the
+// ledger records what was paid for, and a pass that never ran was not.
 const (
 	PassEnrich = "enrich"
 	PassSelect = "select"
+	PassTitle  = "title"
 	PassDigest = "digest"
 )
 

@@ -45,14 +45,15 @@ import (
 // asks — so the existing schema-mismatch path starts the day fresh rather than
 // relabelling one as the other. That costs one re-enriched day, not a converter.
 //
-// DigestSchema is 3 because the digest JSON gained the count of items its
-// edition never managed to ask about. Earlier it gained the edition it was
-// written for and the collection outcomes of the sources that edition drew on.
-// All are additive, so an existing reader keeps working — but a version whose
-// shape has changed underneath it tells a reader nothing, which is the whole
-// job of carrying one.
+// DigestSchema is 4 because each item may now carry its title in the edition's
+// language alongside the publisher's original, and the digest says when that
+// rendering could not be done. Earlier it gained the count of items its edition
+// never managed to ask about, the edition it was written for, and the collection
+// outcomes of the sources that edition drew on. All are additive, so an existing
+// reader keeps working — but a version whose shape has changed underneath it
+// tells a reader nothing, which is the whole job of carrying one.
 const (
-	DigestSchema = 3
+	DigestSchema = 4
 	stateSchema  = 2
 
 	// enrichPromptVersion is bumped whenever the enrichment prompt changes in a
@@ -114,6 +115,12 @@ type selectedItem struct {
 	Item       store.StoredItem
 	Enrichment Enrichment
 	Selection  Selection
+
+	// TitleTranslated is Item.Title in this edition's language, empty when the
+	// edition names no language, when the title was already in it, or when the
+	// title pass failed. All three mean the same thing to a reader — use the
+	// original — which is why they share one representation.
+	TitleTranslated string
 }
 
 // ItemState is one item's line in the day's bookkeeping. Keeping the enrichment
@@ -145,9 +152,22 @@ type State struct {
 
 // DigestItem is one entry in the structured digest a sink consumes.
 type DigestItem struct {
-	Source   string   `json:"source"`
-	URL      string   `json:"url,omitempty"`
-	Title    string   `json:"title,omitempty"`
+	Source string `json:"source"`
+	URL    string `json:"url,omitempty"`
+
+	// Title is the headline as its publisher wrote it, in whatever language they
+	// wrote it in. It is never overwritten by a translation: it is what the
+	// reader finds on the page at URL, and a reader who follows a link to a
+	// different headline than the one they read has been handed a worse
+	// artifact, not a better one.
+	Title string `json:"title,omitempty"`
+
+	// TitleTranslated is Title in the edition's language. It is absent when the
+	// edition names no language and when the title was already in it, so a
+	// consumer's rule is the same in every case: show TitleTranslated if it is
+	// there, otherwise Title.
+	TitleTranslated string `json:"title_translated,omitempty"`
+
 	Score    float64  `json:"score"`
 	Reason   string   `json:"reason"`
 	Points   []string `json:"points"`
@@ -184,6 +204,23 @@ type Digest struct {
 	// never ran. A reader holding only the digest cannot tell them apart
 	// without this.
 	Unjudged int `json:"unjudged,omitempty"`
+
+	// TitlesFailed carries why the title pass could not be completed, when an
+	// edition names a language and the rendering did not happen. Every item
+	// below then carries its source title, exactly as it would on a day when
+	// every publisher already wrote in the reader's language.
+	//
+	// 🚨 Those two days are the same document without this field, and they are
+	// opposite facts: one says nothing needed doing, the other says the engine
+	// tried and could not. Falling back to the original title is the right
+	// behaviour — a digest in the wrong language beats no digest — but a silent
+	// fallback deletes the only evidence that anything went wrong, which is how
+	// this class of failure stays invisible for weeks.
+	//
+	// It carries the cause rather than a flag, on ADR-0005 §8's split: error
+	// text belongs in the structured file where tooling reads it, and never in
+	// the markdown.
+	TitlesFailed string `json:"titles_failed,omitempty"`
 
 	// Sources is what collection did today for the sources this edition drew
 	// on, keyed by source id (ADR-0005 §8).
@@ -357,6 +394,12 @@ type EditionResult struct {
 	// failed, nothing was selected because nothing was asked, which is the
 	// opposite of the profile finding nothing to match.
 	Empty bool
+
+	// TitlesFailed says this edition's titles could not be put into its
+	// configured language, so the digest carries them as published. The digest
+	// itself was written and delivered: this is a degraded edition, not a failed
+	// one, and it deliberately does not count towards the run's failures.
+	TitlesFailed bool
 
 	Usage llm.Usage
 }
@@ -586,7 +629,29 @@ func (r *Runner) runEdition(ctx context.Context, day time.Time, id string, editi
 	editionResult.Empty = len(selected) == 0
 	editionReport.Empty = editionResult.Empty
 
-	usage, err := r.writeDigest(ctx, day, id, profile, selected, r.editionSources(edition, collected), editionResult.Unjudged, ledger)
+	// Titles are put into the edition's language before the digest is written,
+	// so the writing pass sees what the reader will see. A failure here costs
+	// the language, never the digest: the items keep their source titles and the
+	// edition carries on, which is the posture the select pass settled on.
+	var titlesFailed string
+	titleUsage, err := r.localiseTitles(ctx, id, edition.Language, selected, ledger)
+	addUsage(&editionResult.Usage, titleUsage)
+	if err != nil {
+		titlesFailed = err.Error()
+		editionResult.TitlesFailed = true
+		r.log.Error("titles could not be put into this edition's language; they are carried as published and the edition continues",
+			"edition", id, "language", edition.Language, "error", err)
+	}
+
+	usage, err := r.writeDigest(ctx, day, digestInput{
+		edition:      id,
+		profile:      profile,
+		language:     edition.Language,
+		selected:     selected,
+		sources:      r.editionSources(edition, collected),
+		unjudged:     editionResult.Unjudged,
+		titlesFailed: titlesFailed,
+	}, ledger)
 	addUsage(&editionResult.Usage, usage)
 	if err != nil {
 		editionReport.Failed = err.Error()
@@ -755,6 +820,24 @@ func unjudgedNote(unjudged int) string {
 		unjudged, noun)
 }
 
+// untranslatedTitlesNote tells the reader that the headlines below are in
+// whatever language they were published in, rather than in theirs.
+//
+// Without it the failure is invisible in exactly the case it matters: a reader
+// who sees a headline in another language has no way to tell "this publisher
+// writes in that language and we could not change it" from "everything is
+// working and this is simply how it was published". The two render identically.
+//
+// It carries the outcome and never the error, following unjudgedNote and
+// silentSourcesNote — the error text is on the digest's structured half, where
+// tooling reads it (ADR-0005 §8).
+func untranslatedTitlesNote(titlesFailed, language string) string {
+	if titlesFailed == "" || language == "" {
+		return ""
+	}
+	return fmt.Sprintf("\nHeadlines could not be put into %s today and are shown as they were published.\n", language)
+}
+
 // sortedEditionIDs gives editions a stable order, so two runs over the same day
 // write the same things in the same sequence and a log is comparable.
 func sortedEditionIDs(editions map[string]config.Edition) []string {
@@ -897,23 +980,124 @@ func (r *Runner) selectItem(ctx context.Context, profile string, candidate enric
 	return Selection{}, usage, lastErr
 }
 
+// digestInput is everything one edition's digest is written from. It is a struct
+// because the alternative is a ninth positional string argument, and the last
+// two additions to this call were both a language and an error message — two
+// strings whose order nothing but their names distinguishes.
+type digestInput struct {
+	edition  string
+	profile  string
+	language string
+	selected []selectedItem
+	sources  map[string]collect.SourceOutcome
+	unjudged int
+
+	// titlesFailed is why the title pass did not run to completion, empty when
+	// it succeeded or was never needed.
+	titlesFailed string
+}
+
+// titleParseAttempts mirrors selectParseAttempts, for the reasons recorded
+// there: one retry on a reply that did not parse, none on a transport error,
+// and every attempt billed.
+const titleParseAttempts = 2
+
+// localiseTitles fills in each selected item's headline in the edition's
+// language, and does nothing at all when the edition names no language.
+//
+// It is ONE call for the whole edition rather than one per headline. The unit
+// that needs translating is the day's selection, not the item: a per-item call
+// would multiply the cost of a language by the size of the digest, and it would
+// re-ask on every re-run for items whose headline never changed. It runs after
+// selection so it only ever pays for headlines that reached the reader — the
+// items an edition passed over are the majority, and none of them is worth a
+// token.
+//
+// A headline already in the reader's language costs nothing: the pass is told to
+// omit those, so they consume no output tokens and produce no entry to apply.
+//
+// 🚨 The caller must treat an error as the loss of a language and not the loss
+// of an edition. Every item keeps Item.Title, which is a correct headline in the
+// wrong language — strictly better than no digest.
+func (r *Runner) localiseTitles(ctx context.Context, edition, language string, selected []selectedItem, ledger *spendLedger) (llm.Usage, error) {
+	var usage llm.Usage
+	if language == "" || len(selected) == 0 {
+		return usage, nil
+	}
+
+	asked := map[int]bool{}
+	titles := make([]numberedTitle, 0, len(selected))
+	for i, s := range selected {
+		title := strings.TrimSpace(s.Item.Title)
+		if title == "" {
+			continue
+		}
+		titles = append(titles, numberedTitle{index: i, title: title})
+		asked[i] = true
+	}
+	if len(titles) == 0 {
+		return usage, nil
+	}
+
+	var lastErr error
+	for attempt := 1; attempt <= titleParseAttempts; attempt++ {
+		started := r.now()
+		resp, err := r.client.Complete(ctx, llm.Request{
+			Model:    r.cfg.Aggregator.Models.Item,
+			Messages: buildTitleMessages(language, titles),
+		})
+		if err == nil {
+			ledger.record(PassTitle, r.cfg.Aggregator.Models.Item,
+				resp.Usage.PromptTokens, resp.Usage.CompletionTokens, r.now().Sub(started))
+		}
+		if err != nil {
+			return usage, err
+		}
+
+		// Every attempt was billed, so every attempt is added.
+		addUsage(&usage, resp.Usage)
+
+		translated, parseErr := parseTitles(resp.Content, asked)
+		if parseErr == nil {
+			for i, title := range translated {
+				// A headline that came back identical is one that needed nothing,
+				// whatever the pass thought it was doing. Recording it would put
+				// the same string in the payload twice and make a consumer render
+				// an "original" alongside itself.
+				if title == strings.TrimSpace(selected[i].Item.Title) {
+					continue
+				}
+				selected[i].TitleTranslated = title
+			}
+			return usage, nil
+		}
+		lastErr = parseErr
+		if attempt < titleParseAttempts {
+			r.log.Warn("title reply was not usable; asking once more",
+				"edition", edition, "error", parseErr)
+		}
+	}
+
+	return usage, lastErr
+}
+
 // writeDigest renders and writes both digest files, returning the markdown.
 //
 // A day with nothing relevant skips the model entirely: there is nothing to
 // write a digest from, the correct output is the empty marker, and asking a
 // model to write about nothing is exactly how filler gets produced.
-func (r *Runner) writeDigest(ctx context.Context, day time.Time, edition, profile string, selected []selectedItem, sources map[string]collect.SourceOutcome, unjudged int, ledger *spendLedger) (llm.Usage, error) {
+func (r *Runner) writeDigest(ctx context.Context, day time.Time, in digestInput, ledger *spendLedger) (llm.Usage, error) {
 	var markdown string
 	var usage llm.Usage
 
-	if len(selected) == 0 {
+	if len(in.selected) == 0 {
 		markdown = fmt.Sprintf("# Digest — %s\n\n%s%s%s\n",
-			store.Day(day), emptyDigestMarker, unjudgedNote(unjudged), silentSourcesNote(sources))
+			store.Day(day), emptyDigestMarker, unjudgedNote(in.unjudged), silentSourcesNote(in.sources))
 	} else {
 		started := r.now()
 		resp, err := r.client.Complete(ctx, llm.Request{
 			Model:    r.cfg.Aggregator.Models.Digest,
-			Messages: buildDigestMessages(profile, selected),
+			Messages: buildDigestMessages(in.profile, in.language, in.selected),
 		})
 		if err == nil {
 			ledger.record(PassDigest, r.cfg.Aggregator.Models.Digest,
@@ -927,29 +1111,32 @@ func (r *Runner) writeDigest(ctx context.Context, day time.Time, edition, profil
 		if body == "" {
 			return usage, errors.New("digest pass returned no text")
 		}
-		markdown = fmt.Sprintf("# Digest — %s\n\n%s%s\n", store.Day(day), body, unjudgedNote(unjudged))
+		markdown = fmt.Sprintf("# Digest — %s\n\n%s%s%s\n",
+			store.Day(day), body, unjudgedNote(in.unjudged), untranslatedTitlesNote(in.titlesFailed, in.language))
 	}
 
 	digest := Digest{
-		Schema:      DigestSchema,
-		Day:         store.Day(day),
-		Edition:     edition,
-		GeneratedAt: r.now().UTC().Format(time.RFC3339),
-		Empty:       len(selected) == 0,
-		Unjudged:    unjudged,
-		Sources:     sources,
-		Items:       make([]DigestItem, 0, len(selected)),
+		Schema:       DigestSchema,
+		Day:          store.Day(day),
+		Edition:      in.edition,
+		GeneratedAt:  r.now().UTC().Format(time.RFC3339),
+		Empty:        len(in.selected) == 0,
+		Unjudged:     in.unjudged,
+		TitlesFailed: in.titlesFailed,
+		Sources:      in.sources,
+		Items:        make([]DigestItem, 0, len(in.selected)),
 	}
-	for _, s := range selected {
+	for _, s := range in.selected {
 		digest.Items = append(digest.Items, DigestItem{
-			Source:   s.Item.Source,
-			URL:      s.Item.URL,
-			Title:    s.Item.Title,
-			Score:    s.Selection.Score,
-			Reason:   s.Selection.Reason,
-			Points:   s.Enrichment.Points,
-			Tags:     s.Enrichment.Tags,
-			Category: s.Enrichment.Category,
+			Source:          s.Item.Source,
+			URL:             s.Item.URL,
+			Title:           s.Item.Title,
+			TitleTranslated: s.TitleTranslated,
+			Score:           s.Selection.Score,
+			Reason:          s.Selection.Reason,
+			Points:          s.Enrichment.Points,
+			Tags:            s.Enrichment.Tags,
+			Category:        s.Enrichment.Category,
 		})
 	}
 
@@ -958,7 +1145,7 @@ func (r *Runner) writeDigest(ctx context.Context, day time.Time, edition, profil
 		return usage, fmt.Errorf("encode digest: %w", err)
 	}
 
-	mdPath, jsonPath := r.store.DigestPaths(day, edition)
+	mdPath, jsonPath := r.store.DigestPaths(day, in.edition)
 	if err := r.store.WriteAtomic(mdPath, []byte(markdown)); err != nil {
 		return usage, fmt.Errorf("write digest markdown: %w", err)
 	}
@@ -1066,6 +1253,48 @@ func parseSelection(content string) (Selection, error) {
 		return Selection{}, fmt.Errorf("select pass did not return usable JSON: %w (got: %s)", err, snippet(text))
 	}
 	return s, nil
+}
+
+// parseTitles decodes the title pass's reply into item index → headline, given
+// the set of indexes the pass was actually asked about.
+//
+// 🚨 An index outside that set fails the whole reply rather than being skipped.
+// A reply that answers about a headline it was not given is not a reply with one
+// bad entry in it — it is a reply that is not aligned with the request, and the
+// entries that DO land on real items are then the dangerous ones: they attach
+// one item's headline to another item and look entirely correct doing it. There
+// is no way to tell a shifted mapping from a correct one entry by entry, so the
+// only safe reading of a misalignment is that none of it can be trusted.
+func parseTitles(content string, asked map[int]bool) (map[int]string, error) {
+	text := unfence(content)
+
+	var reply struct {
+		Titles []struct {
+			Index int    `json:"index"`
+			Title string `json:"title"`
+		} `json:"titles"`
+	}
+	if err := json.Unmarshal([]byte(text), &reply); err != nil {
+		return nil, fmt.Errorf("title pass did not return usable JSON: %w (got: %s)", err, snippet(text))
+	}
+
+	out := make(map[int]string, len(reply.Titles))
+	for _, t := range reply.Titles {
+		if !asked[t.Index] {
+			return nil, fmt.Errorf("title pass answered about headline %d, which it was not given: the reply is not aligned with the request", t.Index)
+		}
+		if _, seen := out[t.Index]; seen {
+			return nil, fmt.Errorf("title pass answered twice about headline %d", t.Index)
+		}
+		title := strings.TrimSpace(t.Title)
+		if title == "" {
+			// Omitting a headline and returning it empty are the same statement —
+			// nothing to change here — and neither is a failure.
+			continue
+		}
+		out[t.Index] = title
+	}
+	return out, nil
 }
 
 func snippet(s string) string {

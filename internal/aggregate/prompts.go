@@ -97,6 +97,75 @@ Rules:
 - Do not invent anything that is not in the points you were given, and do not speculate about what an item implies.
 - No preamble about what you are doing. Output the digest only.`
 
+// titleSystemPrompt drives the title pass, which runs once per edition over the
+// titles that edition selected.
+//
+// It asks for omissions rather than echoes: a title already in the reader's
+// language is left out of the reply entirely. That is what makes the common case
+// free — no output tokens are spent restating a title that needed nothing — and
+// it also means "unchanged" and "translated to something identical" arrive as
+// the same answer, which they are.
+//
+// Translating is stated as the ONLY job, because a model given a headline and no
+// constraint improves it: it expands abbreviations, adds the context the article
+// supplies, and returns something more useful than a title and no longer the
+// same one. A title that no longer matches the page it links to is the failure
+// this pass has to avoid, not the one it is fixing.
+const titleSystemPrompt = `You are the title pass of a news engine. You are given a reader's language and a numbered list of headlines as their publishers wrote them.
+
+Return each headline that is NOT already in the reader's language, rendered in the reader's language.
+
+Rules:
+- TRANSLATE ONLY. Do not improve, expand, shorten, explain or re-punctuate a headline. It has to stay the same headline.
+- Omit a headline that is already in the reader's language. Saying nothing about it is the answer.
+- Keep names, numbers, dates and organisations exactly as they appear. Names of people, places, products and companies are not translated.
+- Do not add anything a headline does not say, and do not resolve an abbreviation the headline leaves short.
+
+Respond with a single JSON object and nothing else, in this exact shape:
+{"titles": [{"index": 0, "title": "..."}]}
+
+- "index" is the number the headline was given in the list.
+- "title" is that headline in the reader's language.
+- An empty list is a correct answer: it says every headline was already in the reader's language.`
+
+// numberedTitle is one headline and the position of the item it belongs to.
+// The number is the item's own index and not a position in this list, so items
+// without a headline can be left out of the request without the remaining
+// numbers shifting under the reply.
+type numberedTitle struct {
+	index int
+	title string
+}
+
+// buildTitleMessages assembles one edition's title pass. Titles are numbered
+// rather than sent bare, because the reply has to be attached back to the items
+// it came from and a positional list gives a misaligned reply no way to announce
+// itself — an index the caller can check against what it asked does.
+func buildTitleMessages(language string, titles []numberedTitle) []llmMessages {
+	var b strings.Builder
+
+	fmt.Fprintf(&b, "# Reader's language\n\n%s\n\n# Headlines\n\n", language)
+	for _, t := range titles {
+		fmt.Fprintf(&b, "%d. %s\n", t.index, t.title)
+	}
+
+	return []llmMessages{
+		{Role: roleSystem, Content: titleSystemPrompt},
+		{Role: roleUser, Content: b.String()},
+	}
+}
+
+// digestLanguageRule is appended to the writing pass's instructions when the
+// edition names a language. It is a separate string rather than an edit to
+// digestSystemPrompt so that an edition with no language configured sends
+// byte-identical instructions to the ones sent before this pass existed.
+func digestLanguageRule(language string) string {
+	return fmt.Sprintf(`
+- WRITE IN %s. Everything you produce is for a reader of that language: headings, prose, and the entries themselves.
+- Some items below carry both a headline in %s and the publisher's original headline. Lead with the first and keep the original alongside it, because the original is what the reader sees on the page when they follow the link. Never replace the original, and never drop it.
+- An item with only one headline has one because it was already in %s. Use it as it stands.`, language, language, language)
+}
+
 // buildEnrichMessages assembles the neutral pass's call for one item. It
 // carries no profile: there is deliberately nothing here to tell the model who
 // is going to read the result.
@@ -159,7 +228,10 @@ func buildSelectMessages(profile string, candidate enrichedItem) []llmMessages {
 // buildDigestMessages assembles the writing call from the items one edition
 // selected, using that edition's own profile so the digest is written in its
 // voice rather than a shared one.
-func buildDigestMessages(profile string, selected []selectedItem) []llmMessages {
+//
+// The language rule is appended to the system prompt rather than folded into it,
+// so an edition that names no language sends exactly what it sent before.
+func buildDigestMessages(profile, language string, selected []selectedItem) []llmMessages {
 	var b strings.Builder
 
 	b.WriteString("# Reader's relevance profile\n\n")
@@ -169,6 +241,8 @@ func buildDigestMessages(profile string, selected []selectedItem) []llmMessages 
 	for _, s := range selected {
 		b.WriteString("\n## ")
 		switch {
+		case s.TitleTranslated != "":
+			b.WriteString(s.TitleTranslated)
 		case s.Item.Title != "":
 			b.WriteString(s.Item.Title)
 		case s.Item.URL != "":
@@ -177,6 +251,12 @@ func buildDigestMessages(profile string, selected []selectedItem) []llmMessages 
 			b.WriteString(s.Item.Source)
 		}
 		b.WriteString("\n")
+
+		// Only when it differs, so the writer is never handed the same headline
+		// twice and asked to treat one of them as an original.
+		if s.TitleTranslated != "" && s.Item.Title != "" {
+			fmt.Fprintf(&b, "Original headline: %s\n", s.Item.Title)
+		}
 
 		if s.Item.URL != "" {
 			fmt.Fprintf(&b, "Source: %s (%s)\n", s.Item.Source, s.Item.URL)
@@ -188,8 +268,13 @@ func buildDigestMessages(profile string, selected []selectedItem) []llmMessages 
 		}
 	}
 
+	system := digestSystemPrompt
+	if language != "" {
+		system += digestLanguageRule(language)
+	}
+
 	return []llmMessages{
-		{Role: roleSystem, Content: digestSystemPrompt},
+		{Role: roleSystem, Content: system},
 		{Role: roleUser, Content: b.String()},
 	}
 }

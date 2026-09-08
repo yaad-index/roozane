@@ -17,6 +17,27 @@ data_root: data
 # input on every run. Default: profile.md
 relevance_profile: profile.md
 
+# The language the digest is written in. Free text, named the way you would name
+# it to a person: English, Deutsch, فارسی.
+#
+# Left out — as it is here — nothing states a language anywhere, and the digest
+# comes out in whatever language the sources and the model between them produce.
+# That is the historical behaviour and stays the default, because setting one
+# here changes what every existing edition writes.
+#
+# Setting it does two things. The digest is written in that language, and a
+# headline published in another is rendered into it, with the publisher's
+# original kept alongside — the original is what the linked page shows, so it is
+# never replaced.
+#
+# ⚠️ This belongs here and not in your relevance profile. The profile is read
+# once per candidate item to decide whether that item belongs in the digest, so
+# a language written into it is read as part of what you are asking for, and an
+# item can be passed over for being in the wrong language. What the digest is
+# written in and what belongs in it are separate questions.
+#
+# language: English
+
 # Two independent windows, both counted in UTC days (ADR-0002). Each collection
 # pass enforces them before it collects. A window of N keeps the newest N days:
 # `items: 1` keeps today alone.
@@ -151,6 +172,9 @@ sources:
 #            legal source id and a magic token would collide with a real source.
 #   profile: this edition's own relevance profile. Falls back to the top-level
 #            `relevance_profile` when absent.
+#   language: this edition's digest language. Falls back to the top-level
+#            `language` when absent, and inheriting nothing is a valid outcome:
+#            with neither set, no language is stated and nothing changes.
 #
 # ⚠️ Once you define this block, the `default` edition exists only if you write
 # it. Every sink then has to say which edition it delivers, and a sink that says

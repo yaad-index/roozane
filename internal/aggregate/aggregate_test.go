@@ -8,6 +8,8 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"sort"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -41,12 +43,18 @@ func passOf(req llm.Request) string {
 	if len(req.Messages) == 0 {
 		return "unknown"
 	}
-	switch req.Messages[0].Content {
-	case enrichSystemPrompt:
+	// The digest is matched on its prefix because an edition naming a language
+	// appends a rule to the instructions. The others are matched exactly, so a
+	// pass that quietly grew a suffix would show up here as "unknown" rather
+	// than being waved through.
+	switch system := req.Messages[0].Content; {
+	case system == enrichSystemPrompt:
 		return "enrich"
-	case selectSystemPrompt:
+	case system == selectSystemPrompt:
 		return "select"
-	case digestSystemPrompt:
+	case system == titleSystemPrompt:
+		return "title"
+	case strings.HasPrefix(system, digestSystemPrompt):
 		return "digest"
 	default:
 		return "unknown"
@@ -58,6 +66,7 @@ func passOf(req llm.Request) string {
 type stubClient struct {
 	enrich func(req llm.Request) (llm.Response, error)
 	sel    func(req llm.Request) (llm.Response, error)
+	title  func(req llm.Request) (llm.Response, error)
 	digest func(req llm.Request) (llm.Response, error)
 
 	calls []llm.Request
@@ -77,6 +86,13 @@ func (s *stubClient) Complete(_ context.Context, req llm.Request) (llm.Response,
 			return s.sel(req)
 		}
 		return llm.Response{Content: selectionJSON(true, 0.9)}, nil
+	case "title":
+		if s.title != nil {
+			return s.title(req)
+		}
+		// Every headline already in the reader's language, which is the answer
+		// that changes nothing.
+		return llm.Response{Content: `{"titles": []}`}, nil
 	case "digest":
 		if s.digest != nil {
 			return s.digest(req)
@@ -972,8 +988,9 @@ func TestDigestSchemaIsCurrent(t *testing.T) {
 	require.NoError(t, err)
 
 	_, digest := readDigest(t, root, day, config.DefaultEdition)
-	assert.Equal(t, 3, digest.Schema,
-		"the digest JSON gained an unjudged count, after an edition and collection outcomes; "+
+	assert.Equal(t, 4, digest.Schema,
+		"the digest JSON gained a per-item translated title and a title-pass failure, "+
+			"after an unjudged count, an edition and collection outcomes; "+
 			"the version has to move with the shape")
 }
 
@@ -1682,4 +1699,464 @@ func TestEmptyDigestSaysWhenNothingWasAsked(t *testing.T) {
 	// The delivered markdown never carries the cause, following the rule
 	// silentSourcesNote already sets: this is what a sink hands to a reader.
 	assert.NotContains(t, markdown, "usable JSON")
+}
+
+// --- the digest's language (#60) ---
+
+// germanTitles are the shape the reported defect had: headlines copied verbatim
+// from a publisher writing in one language, under summaries generated in
+// another.
+func germanTitles() []store.Item {
+	return []store.Item{
+		{Source: "a-source", URL: "https://example.com/eins", Title: "Bahnstreik endet nach vier Tagen", Content: "body"},
+		{Source: "a-source", URL: "https://example.com/zwei", Title: "Hafen meldet Rekordumschlag", Content: "body"},
+	}
+}
+
+// titlesJSON builds a title-pass reply from item index to headline.
+func titlesJSON(t *testing.T, translated map[int]string) string {
+	t.Helper()
+	type entry struct {
+		Index int    `json:"index"`
+		Title string `json:"title"`
+	}
+	// Sorted, so a reply is the same string every run and a failure is
+	// reproducible rather than order-dependent.
+	indexes := make([]int, 0, len(translated))
+	for i := range translated {
+		indexes = append(indexes, i)
+	}
+	sort.Ints(indexes)
+
+	entries := make([]entry, 0, len(indexes))
+	for _, i := range indexes {
+		entries = append(entries, entry{Index: i, Title: translated[i]})
+	}
+	raw, err := json.Marshal(map[string][]entry{"titles": entries})
+	require.NoError(t, err)
+	return string(raw)
+}
+
+// numberedTitlesIn reads back the numbered list a title request carried, as
+// index to headline.
+//
+// Tests translate by CONTENT rather than by position because the order of an
+// edition's selected items is the store's, not the fixture's — an assumption
+// about which item is index 0 silently attaches one headline to another item
+// and then asserts about the wrong one.
+func numberedTitlesIn(t *testing.T, req llm.Request) map[int]string {
+	t.Helper()
+	out := map[int]string{}
+	for _, line := range strings.Split(req.Messages[len(req.Messages)-1].Content, "\n") {
+		number, title, ok := strings.Cut(line, ". ")
+		if !ok {
+			continue
+		}
+		index, err := strconv.Atoi(strings.TrimSpace(number))
+		if err != nil {
+			continue
+		}
+		out[index] = title
+	}
+	require.NotEmpty(t, out, "a title request always carries at least one numbered headline")
+	return out
+}
+
+// translateWith answers a title request the way the pass asks to be answered:
+// headlines present in the dictionary come back rendered, everything else is
+// omitted as already being in the reader's language.
+func translateWith(t *testing.T, dictionary map[string]string) func(llm.Request) (llm.Response, error) {
+	return func(req llm.Request) (llm.Response, error) {
+		reply := map[int]string{}
+		for index, title := range numberedTitlesIn(t, req) {
+			if rendered, ok := dictionary[title]; ok {
+				reply[index] = rendered
+			}
+		}
+		return llm.Response{Content: titlesJSON(t, reply)}, nil
+	}
+}
+
+// germanToEnglish is the fixture dictionary, so every test that translates
+// agrees about what a rendered headline looks like.
+var germanToEnglish = map[string]string{
+	"Bahnstreik endet nach vier Tagen": "Rail strike ends after four days",
+	"Hafen meldet Rekordumschlag":      "Port reports record throughput",
+}
+
+const englishEdition = `
+language: English
+`
+
+// TestNoLanguageMeansNoTitlePassAtAll pins the default. An engine upgraded to
+// this build with an untouched config must behave exactly as it did before:
+// same passes, same prompts, same spend.
+func TestNoLanguageMeansNoTitlePassAtAll(t *testing.T) {
+	day := at(t, "2026-09-04T06:00:00Z")
+	cfg, root := fixture(t, day, "profile", "", germanTitles()...)
+
+	client := &stubClient{}
+	_, err := runner(t, cfg, client, day).Run(context.Background(), day)
+	require.NoError(t, err)
+
+	assert.Empty(t, client.callsIn("title"), "no language is configured, so there is nothing to render into one")
+
+	require.Len(t, client.callsIn("digest"), 1)
+	assert.Equal(t, digestSystemPrompt, client.callsIn("digest")[0].Messages[0].Content,
+		"an edition with no language sends the writing instructions it sent before this pass existed")
+
+	_, digest := readDigest(t, root, day, config.DefaultEdition)
+	require.Len(t, digest.Items, 2)
+	for _, item := range digest.Items {
+		assert.Empty(t, item.TitleTranslated)
+	}
+}
+
+// TestATranslatedTitleIsCarriedAlongsideTheOriginal is the fix. The original is
+// what matches the linked page, so it is never replaced.
+func TestATranslatedTitleIsCarriedAlongsideTheOriginal(t *testing.T) {
+	day := at(t, "2026-09-04T06:00:00Z")
+	cfg, root := fixture(t, day, "profile", englishEdition, germanTitles()...)
+
+	client := &stubClient{title: translateWith(t, germanToEnglish)}
+	_, err := runner(t, cfg, client, day).Run(context.Background(), day)
+	require.NoError(t, err)
+
+	_, digest := readDigest(t, root, day, config.DefaultEdition)
+	require.Len(t, digest.Items, 2)
+
+	byOriginal := map[string]DigestItem{}
+	for _, item := range digest.Items {
+		byOriginal[item.Title] = item
+	}
+
+	first, ok := byOriginal["Bahnstreik endet nach vier Tagen"]
+	require.True(t, ok, "the publisher's headline is still the one under `title`")
+	assert.Equal(t, "Rail strike ends after four days", first.TitleTranslated)
+
+	second, ok := byOriginal["Hafen meldet Rekordumschlag"]
+	require.True(t, ok)
+	assert.Equal(t, "Port reports record throughput", second.TitleTranslated)
+
+	assert.Empty(t, digest.TitlesFailed)
+}
+
+// TestAHeadlineAlreadyInTheReaderLanguageCostsNoCallOfItsOwn is the common case:
+// the pass is told to omit those, so they consume no output tokens and produce
+// nothing to apply. The absent field is what a consumer falls back on.
+func TestAHeadlineAlreadyInTheReaderLanguageCostsNoCallOfItsOwn(t *testing.T) {
+	day := at(t, "2026-09-04T06:00:00Z")
+	cfg, root := fixture(t, day, "profile", englishEdition,
+		store.Item{Source: "a-source", URL: "https://example.com/a", Title: "Rail strike ends", Content: "body"},
+		store.Item{Source: "a-source", URL: "https://example.com/b", Title: "Port reports record", Content: "body"})
+
+	client := &stubClient{}
+	_, err := runner(t, cfg, client, day).Run(context.Background(), day)
+	require.NoError(t, err)
+
+	assert.Len(t, client.callsIn("title"), 1,
+		"one call for the edition, whatever it decides about the individual headlines")
+
+	_, digest := readDigest(t, root, day, config.DefaultEdition)
+	require.Len(t, digest.Items, 2)
+	for _, item := range digest.Items {
+		assert.Empty(t, item.TitleTranslated, "nothing needed rendering, so nothing is carried")
+		assert.NotEmpty(t, item.Title)
+	}
+}
+
+// TestTheTitlePassRunsOnceForTheWholeEdition pins the unit. A per-item call
+// would multiply the cost of naming a language by the size of the digest.
+func TestTheTitlePassRunsOnceForTheWholeEdition(t *testing.T) {
+	day := at(t, "2026-09-04T06:00:00Z")
+	cfg, _ := fixture(t, day, "profile", englishEdition, threeItems()...)
+
+	client := &stubClient{}
+	_, err := runner(t, cfg, client, day).Run(context.Background(), day)
+	require.NoError(t, err)
+
+	calls := client.callsIn("title")
+	require.Len(t, calls, 1, "three selected items, one call")
+
+	var sent string
+	for _, m := range calls[0].Messages {
+		sent += m.Content
+	}
+	for _, title := range []string{"Alpha", "Bravo", "Charlie"} {
+		assert.Contains(t, sent, title, "every selected headline is in the one request")
+	}
+}
+
+// TestTheTitlePassOnlyPaysForSelectedHeadlines keeps the pass downstream of
+// selection. The items an edition passed over are the majority and none of them
+// reaches a reader, so none is worth a token.
+func TestTheTitlePassOnlyPaysForSelectedHeadlines(t *testing.T) {
+	day := at(t, "2026-09-04T06:00:00Z")
+	cfg, _ := fixture(t, day, "profile", englishEdition, threeItems()...)
+
+	client := &stubClient{sel: func(req llm.Request) (llm.Response, error) {
+		var text string
+		for _, m := range req.Messages {
+			text += m.Content
+		}
+		return llm.Response{Content: selectionJSON(strings.Contains(text, "Alpha"), 0.9)}, nil
+	}}
+	_, err := runner(t, cfg, client, day).Run(context.Background(), day)
+	require.NoError(t, err)
+
+	calls := client.callsIn("title")
+	require.Len(t, calls, 1)
+
+	var sent string
+	for _, m := range calls[0].Messages {
+		sent += m.Content
+	}
+	assert.Contains(t, sent, "Alpha")
+	assert.NotContains(t, sent, "Bravo", "an item this edition passed over never reaches the reader")
+	assert.NotContains(t, sent, "Charlie")
+}
+
+// TestAFailedTitlePassCostsTheLanguageNotTheDigest is the posture the select
+// pass settled on in #64, applied to the pass added here: the digest is written,
+// every headline keeps the language it was published in, and the run says so.
+func TestAFailedTitlePassCostsTheLanguageNotTheDigest(t *testing.T) {
+	day := at(t, "2026-09-04T06:00:00Z")
+	cfg, root := fixture(t, day, "profile", englishEdition, germanTitles()...)
+
+	client := &stubClient{title: func(llm.Request) (llm.Response, error) {
+		return llm.Response{Content: `{"titles": [{"index": 0, "title": "Rail strike`}, nil
+	}}
+	result, err := runner(t, cfg, client, day).Run(context.Background(), day)
+	require.NoError(t, err, "a language is not worth a day's digest")
+
+	require.Len(t, result.Editions, 1)
+	assert.True(t, result.Editions[0].TitlesFailed)
+
+	markdown, digest := readDigest(t, root, day, config.DefaultEdition)
+	require.Len(t, digest.Items, 2, "the digest is still written and still carries both items")
+	for _, item := range digest.Items {
+		assert.Empty(t, item.TitleTranslated)
+		assert.NotEmpty(t, item.Title, "a headline in the wrong language beats no headline")
+	}
+
+	assert.NotEmpty(t, digest.TitlesFailed,
+		"a failed run and a day where every publisher already wrote in English render identically without this")
+	assert.Contains(t, markdown, "shown as they were published")
+
+	// The delivered markdown carries the outcome and never the cause, following
+	// unjudgedNote and silentSourcesNote (ADR-0005 §8).
+	assert.NotContains(t, markdown, "usable JSON")
+}
+
+// TestAMisalignedTitleReplyIsRejectedWholesale is the sharp one. A reply that
+// answers about a headline it was not given is not a good reply with one bad
+// entry: its other entries may be shifted by one, and a shifted headline is
+// wrong in the way that looks right. Applying the entries that happen to land on
+// real items is the failure this rejects.
+func TestAMisalignedTitleReplyIsRejectedWholesale(t *testing.T) {
+	day := at(t, "2026-09-04T06:00:00Z")
+	cfg, root := fixture(t, day, "profile", englishEdition, germanTitles()...)
+
+	client := &stubClient{title: func(req llm.Request) (llm.Response, error) {
+		// One real entry alongside one index that was never sent. Keeping the
+		// valid entry is the point of the test: a parser that skipped the bad
+		// entry would apply this one.
+		reply := map[int]string{99: "A headline about nothing we sent"}
+		for index, title := range numberedTitlesIn(t, req) {
+			if rendered, ok := germanToEnglish[title]; ok {
+				reply[index] = rendered
+			}
+		}
+		return llm.Response{Content: titlesJSON(t, reply)}, nil
+	}}
+	result, err := runner(t, cfg, client, day).Run(context.Background(), day)
+	require.NoError(t, err)
+
+	require.Len(t, result.Editions, 1)
+	assert.True(t, result.Editions[0].TitlesFailed)
+
+	_, digest := readDigest(t, root, day, config.DefaultEdition)
+	for _, item := range digest.Items {
+		assert.Empty(t, item.TitleTranslated,
+			"none of a misaligned reply is applied, including the entries that land on real items")
+	}
+}
+
+// TestMalformedTitleReplyIsRetriedOnce mirrors the select pass: one retry on a
+// reply that did not parse.
+func TestMalformedTitleReplyIsRetriedOnce(t *testing.T) {
+	day := at(t, "2026-09-04T06:00:00Z")
+	cfg, root := fixture(t, day, "profile", englishEdition, germanTitles()...)
+
+	var calls int
+	translate := translateWith(t, map[string]string{
+		"Bahnstreik endet nach vier Tagen": "Rail strike ends after four days",
+	})
+	client := &stubClient{title: func(req llm.Request) (llm.Response, error) {
+		calls++
+		if calls == 1 {
+			return llm.Response{Content: "not json at all"}, nil
+		}
+		return translate(req)
+	}}
+	_, err := runner(t, cfg, client, day).Run(context.Background(), day)
+	require.NoError(t, err)
+
+	assert.Equal(t, 2, calls, "asked once more, and once only")
+
+	_, digest := readDigest(t, root, day, config.DefaultEdition)
+	var translated int
+	for _, item := range digest.Items {
+		if item.TitleTranslated != "" {
+			translated++
+		}
+	}
+	assert.Equal(t, 1, translated, "the second reply is applied")
+	assert.Empty(t, digest.TitlesFailed)
+}
+
+// TestEveryTitleAttemptIsBilled keeps a retry from reading as free, which is the
+// same trap the select pass's usage accounting had.
+func TestEveryTitleAttemptIsBilled(t *testing.T) {
+	day := at(t, "2026-09-04T06:00:00Z")
+	cfg, root := fixture(t, day, "profile", englishEdition, germanTitles()...)
+
+	client := &stubClient{title: func(llm.Request) (llm.Response, error) {
+		return llm.Response{
+			Content: "not json at all",
+			Usage:   llm.Usage{PromptTokens: 10, CompletionTokens: 5},
+		}, nil
+	}}
+	_, err := runner(t, cfg, client, day).Run(context.Background(), day)
+	require.NoError(t, err)
+
+	_, report := readReport(t, root, day)
+	var title *PassSpend
+	for i := range report.Spend {
+		if report.Spend[i].Pass == PassTitle {
+			title = &report.Spend[i]
+		}
+	}
+	require.NotNil(t, title, "a pass that ran is a pass that is accounted for")
+	assert.Equal(t, 2, title.Calls)
+	assert.Equal(t, 20, title.PromptTokens, "both attempts were paid for, so both are counted")
+}
+
+// TestATitleThatCameBackUnchangedIsNotCarriedTwice guards the payload against
+// an item whose original and translated headline are the same string, which
+// would have a consumer render a headline alongside itself.
+func TestATitleThatCameBackUnchangedIsNotCarriedTwice(t *testing.T) {
+	day := at(t, "2026-09-04T06:00:00Z")
+	cfg, root := fixture(t, day, "profile", englishEdition,
+		store.Item{Source: "a-source", URL: "https://example.com/a", Title: "Rail strike ends", Content: "body"})
+
+	client := &stubClient{title: translateWith(t, map[string]string{
+		"Rail strike ends": "Rail strike ends",
+	})}
+	_, err := runner(t, cfg, client, day).Run(context.Background(), day)
+	require.NoError(t, err)
+
+	_, digest := readDigest(t, root, day, config.DefaultEdition)
+	require.Len(t, digest.Items, 1)
+	assert.Empty(t, digest.Items[0].TitleTranslated,
+		"a headline that came back identical needed nothing, whatever the pass thought it was doing")
+}
+
+// TestTheWritingPassIsToldTheLanguageAndKeepsTheOriginal pins the second half of
+// the fix: the digest's prose is written in the edition's language rather than
+// left emergent, and the writer is given both headlines.
+func TestTheWritingPassIsToldTheLanguageAndKeepsTheOriginal(t *testing.T) {
+	day := at(t, "2026-09-04T06:00:00Z")
+	cfg, _ := fixture(t, day, "profile", englishEdition, germanTitles()...)
+
+	client := &stubClient{title: translateWith(t, map[string]string{
+		"Bahnstreik endet nach vier Tagen": "Rail strike ends after four days",
+	})}
+	_, err := runner(t, cfg, client, day).Run(context.Background(), day)
+	require.NoError(t, err)
+
+	calls := client.callsIn("digest")
+	require.Len(t, calls, 1)
+
+	system := calls[0].Messages[0].Content
+	assert.Contains(t, system, "WRITE IN English")
+	assert.Contains(t, system, "Never replace the original")
+
+	user := calls[0].Messages[len(calls[0].Messages)-1].Content
+	assert.Contains(t, user, "## Rail strike ends after four days", "the entry leads with the reader's language")
+	assert.Contains(t, user, "Original headline: Bahnstreik endet nach vier Tagen")
+	assert.NotContains(t, user, "Original headline: Hafen meldet Rekordumschlag",
+		"a headline already in the reader's language has no second version to keep")
+}
+
+// TestAnEditionUsesItsOwnLanguage keeps language per edition, which is the whole
+// reason it is config and not a line in a shared profile.
+func TestAnEditionUsesItsOwnLanguage(t *testing.T) {
+	day := at(t, "2026-09-04T06:00:00Z")
+	cfg, _ := fixture(t, day, "profile", `
+language: English
+editions:
+  personal: {}
+  auswaertiges: {language: Deutsch}
+`, germanTitles()...)
+
+	client := &stubClient{}
+	_, err := runner(t, cfg, client, day).Run(context.Background(), day)
+	require.NoError(t, err)
+
+	languages := map[string]bool{}
+	for _, call := range client.callsIn("title") {
+		languages[call.Messages[len(call.Messages)-1].Content] = true
+	}
+	require.Len(t, client.callsIn("title"), 2, "one call per edition")
+
+	var sawEnglish, sawGerman bool
+	for body := range languages {
+		if strings.Contains(body, "English") {
+			sawEnglish = true
+		}
+		if strings.Contains(body, "Deutsch") {
+			sawGerman = true
+		}
+	}
+	assert.True(t, sawEnglish, "the edition inheriting the top-level language asks for it")
+	assert.True(t, sawGerman, "the edition naming its own overrides it")
+}
+
+func TestParseTitles(t *testing.T) {
+	asked := map[int]bool{0: true, 1: true}
+
+	t.Run("applies what it was asked about", func(t *testing.T) {
+		got, err := parseTitles(`{"titles": [{"index": 1, "title": "A headline"}]}`, asked)
+		require.NoError(t, err)
+		assert.Equal(t, map[int]string{1: "A headline"}, got)
+	})
+
+	t.Run("an empty list means nothing needed changing", func(t *testing.T) {
+		got, err := parseTitles(`{"titles": []}`, asked)
+		require.NoError(t, err)
+		assert.Empty(t, got)
+	})
+
+	t.Run("an empty headline is the same statement as omitting it", func(t *testing.T) {
+		got, err := parseTitles(`{"titles": [{"index": 0, "title": "  "}]}`, asked)
+		require.NoError(t, err)
+		assert.Empty(t, got)
+	})
+
+	t.Run("an index it was not given fails the whole reply", func(t *testing.T) {
+		_, err := parseTitles(`{"titles": [{"index": 0, "title": "ok"}, {"index": 7, "title": "?"}]}`, asked)
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "not aligned")
+	})
+
+	t.Run("a repeated index fails the whole reply", func(t *testing.T) {
+		_, err := parseTitles(`{"titles": [{"index": 0, "title": "one"}, {"index": 0, "title": "two"}]}`, asked)
+		require.Error(t, err)
+	})
+
+	t.Run("unusable JSON is an error", func(t *testing.T) {
+		_, err := parseTitles(`{"titles": [`, asked)
+		require.Error(t, err)
+	})
 }
