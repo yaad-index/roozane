@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.5.0](https://github.com/yaad-index/roozane/compare/v0.4.1...v0.5.0) (2026-09-08)
+
+
+### Features
+
+* the digest is written in the edition's language ([#72](https://github.com/yaad-index/roozane/issues/72)) ([5a6b250](https://github.com/yaad-index/roozane/commit/5a6b250e6077f931ef55637c1c058b1f78c86f07))
+
 ## [0.4.1](https://github.com/yaad-index/roozane/compare/v0.4.0...v0.4.1) (2026-09-08)
 
 
