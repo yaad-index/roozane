@@ -161,7 +161,7 @@ sinks:
    engine that refuses to assume a provider has no business assuming a
    denomination, and an unlabelled number means whatever the reader guesses.
 
-   **Why an item is absent has five answers, and only one is unanswerable:**
+   **Why an item is absent has six answers, and only one is unanswerable:**
 
    | Why | Recoverable? |
    |---|---|
@@ -169,6 +169,7 @@ sinks:
    | A source that covers it failed today | Yes, from §6's outcomes |
    | Collected, but enrichment failed | Yes, `StatusFailed` in `state.json` |
    | Enriched, below the generic salience floor | Yes |
+   | Enriched, admitted, but the selection call failed | Yes, with the cause |
    | Enriched, not selected by this edition | Yes, with which reason |
 
    Only the first is invisible: the item never entered the pipeline and no
@@ -178,6 +179,23 @@ sinks:
    failed covering source was unanswerable — which is exactly what §6 exists to
    fix.** Persisting outcomes is pointless if the report then files that case
    under "invisible".
+
+   🚨 **The fifth and sixth rows must not be merged, and the failure that
+   produced this row was exactly that merge happening implicitly.** "Not
+   selected by this edition" asserts the profile was applied and returned no.
+   A failed selection call means the item was never judged at all. One is
+   evidence the profile works; the other is the absence of any evidence about
+   it, and the two are indistinguishable once recorded under the same reason.
+   The distinction reaches the digest as well as the report: an edition whose
+   selections all failed selects nothing, which renders as the same empty page
+   as a profile that matched nothing, so the count of unjudged items is carried
+   on the digest rather than left to the report alone.
+
+   ⚠️ **A selection failure is one item's, never the edition's.** An edition
+   that abandoned its remaining candidates on one unusable reply would answer
+   this section with "no reason at all" for every item after the first failure
+   — the one outcome §7 exists to prevent — while writing no digest and
+   reporting a per-item failure count of zero.
 
 8. **An edition that selects nothing, or whose items all fall below the bar,
    still writes an empty digest** (ADR-0002 §4), so a quiet edition proves it
