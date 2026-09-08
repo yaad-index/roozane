@@ -83,6 +83,25 @@ type ReportAbsence struct {
 }
 
 // ReportEdition is one edition's outcome.
+//
+// ⚠️ These counts are in ARTICLES, while the digest the same run produced is
+// written in EVENTS. The writing pass merges several reports of one occurrence
+// into a single entry (see digestSystemPrompt), and nothing upstream of it
+// knows that happened: the articles are still collected, still enriched, still
+// selected, and still counted here individually.
+//
+// So a day where four articles covered one breach reports Selected as four and
+// shows the reader one entry, and the two are both correct about different
+// things. Anyone reconciling the report against the digest will hit this seam,
+// which is why it is written here rather than left to be rediscovered from a
+// report that looks wrong.
+//
+// Closing it means grouping before selection, so an event is the unit the whole
+// pipeline counts. That inserts a stage into the pipeline ADR-0005 fixes, and
+// the grouping is a property of a SET of items, which the enrichment cache
+// cannot express — it is keyed on the item filename precisely because a neutral
+// result is the same result for everybody (ADR-0005 §1). It therefore needs an
+// ADR of its own, and this comment is the evidence for writing one.
 type ReportEdition struct {
 	ID         string          `json:"id"`
 	Candidates int             `json:"candidates"`

@@ -65,6 +65,24 @@ Respond with a single JSON object and nothing else, in this exact shape:
 // digestSystemPrompt drives the second pass. Length-follows-signal has to be
 // stated as a rule with a floor of zero, because the default behaviour of a
 // summariser is to produce a consistent amount of prose regardless of input.
+//
+// One-event-one-entry is stated here, and it replaced a rule that pointed the
+// other way. The prompt used to say "a flat list is fine and usually better",
+// and four articles about one municipal data breach duly became the digest's
+// four leading rows. Scoring was working as specified — a significant event
+// scores high, and every article about it scores high for the same reason, so
+// the more important the story the more of the digest it took.
+//
+// ⚠️ Sameness is decided from the data points rather than the wording, because
+// the lexical version of this test does not work: the two top headlines in that
+// digest were one story with essentially disjoint vocabulary, and a
+// title-similarity pass over them dropped none of the four. Only the substance
+// separates a second report of one event from a report of a second event.
+//
+// The rule fails safe. A merge that does not happen leaves the previous
+// behaviour, which is a digest that repeats itself; a merge that should not have
+// happened loses a distinct story. So the instruction is asymmetric on purpose —
+// merge only the genuinely same occurrence, and when in doubt keep them apart.
 const digestSystemPrompt = `You are the writing layer of a personal news engine. You are given the reader's relevance profile and the data points extracted from the items that matched it.
 
 Write the day's digest in Markdown.
@@ -72,7 +90,9 @@ Write the day's digest in Markdown.
 Rules:
 - LENGTH FOLLOWS SIGNAL. Two small items get two lines. Do not pad to a familiar shape, do not add an introduction, a conclusion, or a "nothing else of note" line.
 - Lead with the data points. The reader wants the facts, not a description of the news.
-- Group related items under a short heading only when grouping genuinely helps. A flat list is fine and usually better.
+- ONE EVENT IS ONE ENTRY. Several of the items below often report the same underlying event. Merge those into a single entry carrying the fullest set of facts between them, and name the sources that reported it — several sources agreeing is worth showing. Never give one event several entries: to the reader that is repetition rather than emphasis, and it crowds out everything else that happened.
+- Decide sameness from what the data points describe, not from wording. Two reports of one event routinely share almost no vocabulary — a different headline, a different angle, sometimes a different language. If the facts point at the same occurrence, it is one event.
+- Merge only what is genuinely the same occurrence. Items that are merely related stay separate, and when in doubt keep them separate. A short heading may group related entries where that helps the reader, but a heading is not a merge.
 - Preserve specifics exactly: numbers, names, dates. Do not round, soften, or generalise them.
 - Do not invent anything that is not in the points you were given, and do not speculate about what an item implies.
 - No preamble about what you are doing. Output the digest only.`

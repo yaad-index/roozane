@@ -709,6 +709,28 @@ func TestSuppressionIsTheDefaultInTheSelectPrompt(t *testing.T) {
 	assert.Contains(t, enrichSystemPrompt, "YOU DO NOT KNOW WHO WILL READ THIS")
 }
 
+// TestOneEventIsOneEntryInTheDigestPrompt guards the rule against being softened
+// back into the one it replaced.
+//
+// The NotContains half is the load-bearing one. The prompt previously said "a
+// flat list is fine and usually better", and four articles about a single
+// municipal data breach became the digest's four leading rows — behaviour that
+// was instructed rather than accidental, and therefore invisible to anyone
+// reading only the output.
+func TestOneEventIsOneEntryInTheDigestPrompt(t *testing.T) {
+	assert.NotContains(t, digestSystemPrompt, "flat list is fine and usually better",
+		"the instruction that produced one entry per article must not come back")
+	assert.Contains(t, digestSystemPrompt, "ONE EVENT IS ONE ENTRY")
+
+	// Sameness has to be judged on substance: the headlines of one story
+	// routinely share almost no vocabulary, so a wording test does not work.
+	assert.Contains(t, digestSystemPrompt, "not from wording")
+
+	// And the rule has to fail toward keeping items apart, since an unwanted
+	// merge loses a story while a missed one only repeats.
+	assert.Contains(t, digestSystemPrompt, "when in doubt keep them separate")
+}
+
 // TestEnrichPromptDefinesTheSalienceScale keeps the number comparable to
 // something. A floor and a report are both stated in terms of this scale, and a
 // score on an undefined scale is not a measurement.
