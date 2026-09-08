@@ -13,7 +13,12 @@ import (
 )
 
 // ReportSchema versions reports/<day>.json.
-const ReportSchema = 1
+//
+// It is 2 because an absence gained the error that caused it, for the case
+// where an item was never judged at all. Additive, so an existing reader keeps
+// working — bumped anyway on the same grounds as DigestSchema: a version whose
+// shape changed underneath a reader tells that reader nothing.
+const ReportSchema = 2
 
 // Pass names the three calls a run makes, used to attribute spend.
 const (
@@ -33,10 +38,20 @@ const (
 // Enrichment failure is deliberately not among them. It happens before any
 // edition sees the item, so it is not a per-edition absence: ADR-0005 §7 answers
 // that case at item level, where the report records StatusFailed with the error.
+//
+// 🚨 ReasonSelectFailed is a distinct answer from ReasonNotSelected and must
+// never be folded into it. "Not selected" asserts that this edition's profile
+// was applied and returned no; a failed select means the item was never judged
+// at all. The two are opposite in what they say about the profile — one is
+// evidence the profile works, the other is the absence of any evidence — and
+// they are indistinguishable once written to the same string. Recording an
+// unjudged item as "not selected by this edition's profile" would be a false
+// statement in the one artifact whose job is to explain the day.
 const (
 	ReasonBelowFloor   = "below the generic salience floor"
 	ReasonNotInSources = "not in this edition's source list"
 	ReasonNotSelected  = "not selected by this edition's profile"
+	ReasonSelectFailed = "the selection call failed, so this item was never judged"
 )
 
 // PassSpend is one pass's spend on one model, for this run.
@@ -80,6 +95,16 @@ type ReportAbsence struct {
 	Item   string `json:"item"`
 	Source string `json:"source"`
 	Reason string `json:"reason"`
+
+	// Error carries what went wrong, for the absences caused by a failure
+	// rather than by a judgement. It is empty for the ordinary reasons, which
+	// are outcomes and not faults.
+	//
+	// It is carried because a reason alone does not survive the thing this
+	// field exists for: an operator reading "the selection call failed" still
+	// has to go to the logs for the cause, and a log is exactly where this
+	// class of failure hid in the first place.
+	Error string `json:"error,omitempty"`
 }
 
 // ReportEdition is one edition's outcome.
@@ -240,6 +265,17 @@ func plural(n int, noun string) string {
 	return fmt.Sprintf("%d %ss", n, noun)
 }
 
+// countAbsent counts the absences given for one reason.
+func countAbsent(absences []ReportAbsence, reason string) int {
+	n := 0
+	for _, a := range absences {
+		if a.Reason == reason {
+			n++
+		}
+	}
+	return n
+}
+
 // renderReport writes the operator-facing markdown.
 func renderReport(report Report) string {
 	var b strings.Builder
@@ -305,6 +341,11 @@ func renderReport(report Report) string {
 			continue
 		}
 		fmt.Fprintf(&b, "%s, %d selected", plural(edition.Candidates, "candidate"), len(edition.Selected))
+		// Counted from the absences rather than carried as its own field, so
+		// the number and the per-item reasons cannot disagree.
+		if unjudged := countAbsent(edition.Absent, ReasonSelectFailed); unjudged > 0 {
+			fmt.Fprintf(&b, ", %d never judged (the selection call failed)", unjudged)
+		}
 		if edition.Empty {
 			b.WriteString(" (empty)")
 		}
@@ -313,6 +354,10 @@ func renderReport(report Report) string {
 			fmt.Fprintf(&b, "- selected `%s`\n", name)
 		}
 		for _, absence := range edition.Absent {
+			if absence.Error != "" {
+				fmt.Fprintf(&b, "- `%s` — %s: %s\n", absence.Item, absence.Reason, absence.Error)
+				continue
+			}
 			fmt.Fprintf(&b, "- `%s` — %s\n", absence.Item, absence.Reason)
 		}
 		b.WriteString("\n")

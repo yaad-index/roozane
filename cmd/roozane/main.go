@@ -183,17 +183,42 @@ func runAggregate(args []string, stdout, stderr io.Writer) int {
 	for _, edition := range result.Editions {
 		line := fmt.Sprintf("edition %s: %d candidates, %d selected",
 			edition.ID, edition.Candidates, edition.Selected)
+		if edition.Unjudged > 0 {
+			line += fmt.Sprintf(", %d never judged (the selection call failed)", edition.Unjudged)
+		}
 		if edition.Empty {
-			line += " (empty: nothing cleared the relevance bar)"
+			// Qualified rather than stated: with unjudged items in the same
+			// edition, "nothing cleared the bar" is not established. Nothing
+			// was asked about those items, which is not the same finding.
+			if edition.Unjudged > 0 {
+				line += " (empty, but not all candidates were assessed)"
+			} else {
+				line += " (empty: nothing cleared the relevance bar)"
+			}
 		}
 		_, _ = fmt.Fprintln(stdout, line)
 	}
 	_, _ = fmt.Fprintf(stdout, "tokens: %d prompt, %d completion\n",
 		result.Usage.PromptTokens, result.Usage.CompletionTokens)
 
-	// A failed item does not invalidate the digest that was written, but the
-	// exit code still reports it so a scheduler notices.
-	if result.Failed > 0 {
+	return aggregateExitCode(result)
+}
+
+// aggregateExitCode decides the exit status for an aggregation that ran to
+// completion. A failed item does not invalidate the digest that was written,
+// but the status still reports it so a scheduler notices.
+//
+// 🚨 Unjudged is checked alongside Failed, and dropping it would undo the fix
+// it ships with. A selection failure used to abort its edition, which surfaced
+// as an error and exited non-zero. Now that one bad reply costs one item, the
+// edition succeeds and there is no error left to propagate — so without this
+// clause the change would convert a loud failure into a silent one, which is
+// the defect it was written to remove.
+//
+// It is a function so that clause can be tested. Reaching it through runAggregate
+// means building a runner, which builds a real client.
+func aggregateExitCode(result aggregate.Result) int {
+	if result.Failed > 0 || result.Unjudged() > 0 {
 		return 1
 	}
 	return 0

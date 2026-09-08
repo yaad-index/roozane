@@ -972,8 +972,9 @@ func TestDigestSchemaIsCurrent(t *testing.T) {
 	require.NoError(t, err)
 
 	_, digest := readDigest(t, root, day, config.DefaultEdition)
-	assert.Equal(t, 2, digest.Schema,
-		"the digest JSON gained an edition and collection outcomes; the version has to move with the shape")
+	assert.Equal(t, 3, digest.Schema,
+		"the digest JSON gained an unjudged count, after an edition and collection outcomes; "+
+			"the version has to move with the shape")
 }
 
 // --- the daily report (ADR-0005 §7) ---
@@ -1479,4 +1480,206 @@ func TestEveryEnrichedItemGetsAnAbsenceReason(t *testing.T) {
 		wide[absence.Source] = absence.Reason
 	}
 	assert.Equal(t, ReasonBelowFloor, wide["b-source"])
+}
+
+// --- a failed selection is one item's failure, not the edition's (#64) ---
+
+// selectFailsFor builds a select hook that returns truncated JSON for one
+// title and a clean selection for every other item. The malformed body is the
+// shape actually observed: an unterminated string in the reason field, which is
+// what a response-length ceiling produces.
+func selectFailsFor(title string) func(req llm.Request) (llm.Response, error) {
+	return func(req llm.Request) (llm.Response, error) {
+		var text string
+		for _, m := range req.Messages {
+			text += m.Content
+		}
+		if strings.Contains(text, title) {
+			return llm.Response{
+				Content: `{"selected": false, "score": 0.1, "reason": "The profile requests`,
+			}, nil
+		}
+		return llm.Response{Content: selectionJSON(true, 0.9)}, nil
+	}
+}
+
+func threeItems() []store.Item {
+	return []store.Item{
+		{Source: "a-source", URL: "https://example.com/alpha", Title: "Alpha", Content: "body"},
+		{Source: "a-source", URL: "https://example.com/bravo", Title: "Bravo", Content: "body"},
+		{Source: "a-source", URL: "https://example.com/charlie", Title: "Charlie", Content: "body"},
+	}
+}
+
+// TestOneMalformedSelectDoesNotCostTheEdition is the regression. One item's
+// unusable reply used to return from runEdition, discarding every selection
+// already made and writing no digest at all.
+func TestOneMalformedSelectDoesNotCostTheEdition(t *testing.T) {
+	day := at(t, "2026-09-04T06:00:00Z")
+	cfg, root := fixture(t, day, "profile", "", threeItems()...)
+
+	client := &stubClient{sel: selectFailsFor("Bravo")}
+	result, err := runner(t, cfg, client, day).Run(context.Background(), day)
+
+	require.NoError(t, err, "one item the model could not judge is not the edition's failure")
+	require.Len(t, result.Editions, 1)
+
+	edition := result.Editions[0]
+	assert.Equal(t, 2, edition.Selected, "the other two items are still selected")
+	assert.Equal(t, 1, edition.Unjudged)
+	assert.Equal(t, 1, result.Unjudged())
+	assert.False(t, edition.Empty)
+
+	// The digest exists and carries the survivors, which is the whole point.
+	_, digest := readDigest(t, root, day, config.DefaultEdition)
+	require.Len(t, digest.Items, 2)
+	assert.Equal(t, 1, digest.Unjudged)
+
+	titles := []string{digest.Items[0].Title, digest.Items[1].Title}
+	assert.ElementsMatch(t, []string{"Alpha", "Charlie"}, titles)
+}
+
+// TestAnUnjudgedItemIsNotReportedAsRejected keeps the two states apart. "Not
+// selected by this edition's profile" asserts the profile was applied and said
+// no; a failed select means it was never asked. Folding one into the other
+// would make the report state something untrue about the profile.
+func TestAnUnjudgedItemIsNotReportedAsRejected(t *testing.T) {
+	day := at(t, "2026-09-04T06:00:00Z")
+	cfg, root := fixture(t, day, "profile", "", threeItems()...)
+
+	client := &stubClient{sel: selectFailsFor("Bravo")}
+	_, err := runner(t, cfg, client, day).Run(context.Background(), day)
+	require.NoError(t, err)
+
+	_, report := readReport(t, root, day)
+	require.Len(t, report.Editions, 1)
+
+	// Item filenames are slugged from the source, so the title has to be
+	// resolved through the report's own item list rather than guessed.
+	var bravo string
+	for _, item := range report.Items {
+		if item.Title == "Bravo" {
+			bravo = item.Item
+		}
+	}
+	require.NotEmpty(t, bravo, "the item that failed selection was still enriched")
+
+	var found ReportAbsence
+	for _, absence := range report.Editions[0].Absent {
+		if absence.Item == bravo {
+			found = absence
+		}
+		assert.NotEqual(t, ReasonNotSelected, absence.Reason,
+			"nothing was rejected by the profile in this run")
+	}
+
+	require.NotEmpty(t, found.Item, "the unjudged item still gets an absence, per ADR-0005 §7")
+	assert.Equal(t, ReasonSelectFailed, found.Reason)
+	assert.Contains(t, found.Error, "usable JSON",
+		"the absence carries the cause, so the report answers what the log used to")
+}
+
+// TestMalformedSelectIsRetriedOnce covers the insurance half: a truncation is a
+// property of one generation, so the item gets a second chance before it is
+// recorded as unjudged.
+func TestMalformedSelectIsRetriedOnce(t *testing.T) {
+	day := at(t, "2026-09-04T06:00:00Z")
+	cfg, _ := fixture(t, day, "profile", "",
+		store.Item{Source: "a-source", URL: "https://example.com/a", Title: "Alpha", Content: "body"})
+
+	var attempts int
+	client := &stubClient{sel: func(_ llm.Request) (llm.Response, error) {
+		attempts++
+		if attempts == 1 {
+			return llm.Response{Content: `{"selected": true, "score": 0.9, "reason": "trunc`}, nil
+		}
+		return llm.Response{Content: selectionJSON(true, 0.9)}, nil
+	}}
+
+	result, err := runner(t, cfg, client, day).Run(context.Background(), day)
+	require.NoError(t, err)
+
+	assert.Equal(t, 2, attempts, "the item is asked about exactly twice")
+	require.Len(t, result.Editions, 1)
+	assert.Equal(t, 1, result.Editions[0].Selected, "the retry's answer is the one used")
+	assert.Zero(t, result.Editions[0].Unjudged)
+}
+
+// TestSelectRetryStopsAtOne bounds the insurance. The failure is
+// input-dependent, so retrying harder spends most on the items least likely to
+// come back clean.
+func TestSelectRetryStopsAtOne(t *testing.T) {
+	day := at(t, "2026-09-04T06:00:00Z")
+	cfg, _ := fixture(t, day, "profile", "",
+		store.Item{Source: "a-source", URL: "https://example.com/a", Title: "Alpha", Content: "body"})
+
+	client := &stubClient{sel: selectFailsFor("Alpha")}
+	result, err := runner(t, cfg, client, day).Run(context.Background(), day)
+	require.NoError(t, err)
+
+	assert.Len(t, client.callsIn("select"), 2, "one retry, not a loop")
+	assert.Equal(t, 1, result.Editions[0].Unjudged)
+}
+
+// TestEveryAttemptIsBilled guards the accounting. Both calls were made and
+// charged, so reporting only the successful one would make a retry look free.
+func TestEveryAttemptIsBilled(t *testing.T) {
+	day := at(t, "2026-09-04T06:00:00Z")
+	cfg, root := fixture(t, day, "profile", "",
+		store.Item{Source: "a-source", URL: "https://example.com/a", Title: "Alpha", Content: "body"})
+
+	var attempts int
+	client := &stubClient{sel: func(_ llm.Request) (llm.Response, error) {
+		attempts++
+		if attempts == 1 {
+			return llm.Response{
+				Content: `{"selected": true, "score": 0.9, "reason": "trunc`,
+				Usage:   llm.Usage{PromptTokens: 10, CompletionTokens: 5},
+			}, nil
+		}
+		return llm.Response{
+			Content: selectionJSON(true, 0.9),
+			Usage:   llm.Usage{PromptTokens: 10, CompletionTokens: 5},
+		}, nil
+	}}
+
+	_, err := runner(t, cfg, client, day).Run(context.Background(), day)
+	require.NoError(t, err)
+
+	_, report := readReport(t, root, day)
+	var selectSpend PassSpend
+	for _, spend := range report.Spend {
+		if spend.Pass == PassSelect {
+			selectSpend = spend
+		}
+	}
+	assert.Equal(t, 2, selectSpend.Calls, "the discarded attempt was still paid for")
+	assert.Equal(t, 20, selectSpend.PromptTokens)
+}
+
+// TestEmptyDigestSaysWhenNothingWasAsked is the reader-facing half. An edition
+// that judged nothing produces the same empty page as one whose profile matched
+// nothing, and the two are opposite facts about whether the engine worked.
+func TestEmptyDigestSaysWhenNothingWasAsked(t *testing.T) {
+	day := at(t, "2026-09-04T06:00:00Z")
+	cfg, root := fixture(t, day, "profile", "", threeItems()...)
+
+	// Every select fails, so nothing is selected and nothing was judged.
+	client := &stubClient{sel: func(_ llm.Request) (llm.Response, error) {
+		return llm.Response{Content: `{"selected": false, "score": 0.1, "reason": "trunc`}, nil
+	}}
+
+	result, err := runner(t, cfg, client, day).Run(context.Background(), day)
+	require.NoError(t, err)
+	require.Equal(t, 3, result.Unjudged())
+
+	markdown, digest := readDigest(t, root, day, config.DefaultEdition)
+	assert.True(t, digest.Empty)
+	assert.Equal(t, 3, digest.Unjudged)
+	assert.Contains(t, markdown, "could not be assessed",
+		"an empty digest must not imply the profile matched nothing when nothing was asked")
+
+	// The delivered markdown never carries the cause, following the rule
+	// silentSourcesNote already sets: this is what a sink hands to a reader.
+	assert.NotContains(t, markdown, "usable JSON")
 }

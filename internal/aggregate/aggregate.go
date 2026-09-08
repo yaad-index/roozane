@@ -45,13 +45,14 @@ import (
 // asks — so the existing schema-mismatch path starts the day fresh rather than
 // relabelling one as the other. That costs one re-enriched day, not a converter.
 //
-// DigestSchema is 2 because the digest JSON gained the edition it was written
-// for and the collection outcomes of the sources its edition drew on. Both are
-// additive, so an existing reader keeps working — but a version whose shape has
-// changed underneath it tells a reader nothing, which is the whole job of
-// carrying one.
+// DigestSchema is 3 because the digest JSON gained the count of items its
+// edition never managed to ask about. Earlier it gained the edition it was
+// written for and the collection outcomes of the sources that edition drew on.
+// All are additive, so an existing reader keeps working — but a version whose
+// shape has changed underneath it tells a reader nothing, which is the whole
+// job of carrying one.
 const (
-	DigestSchema = 2
+	DigestSchema = 3
 	stateSchema  = 2
 
 	// enrichPromptVersion is bumped whenever the enrichment prompt changes in a
@@ -172,6 +173,17 @@ type Digest struct {
 	// rather than implied by an absent file, so "quiet day" and "the aggregator
 	// never ran" stay distinguishable (ADR-0002 §4).
 	Empty bool `json:"empty"`
+
+	// Unjudged counts items this edition admitted and then could not ask about,
+	// because the selection call failed for them.
+	//
+	// 🚨 It is on the digest, not only in the report, because it is the one
+	// number that changes what Empty MEANS. "Nothing cleared the bar" and
+	// "nothing was asked" render identically in an empty digest and are
+	// opposite facts — the first says the profile worked, the second says it
+	// never ran. A reader holding only the digest cannot tell them apart
+	// without this.
+	Unjudged int `json:"unjudged,omitempty"`
 
 	// Sources is what collection did today for the sources this edition drew
 	// on, keyed by source id (ADR-0005 §8).
@@ -305,6 +317,23 @@ type Result struct {
 	Editions []EditionResult
 }
 
+// Unjudged totals the candidates no edition could ask about, across every
+// edition this run wrote.
+//
+// 🚨 A caller deciding an exit status must consult this as well as Failed,
+// which counts the enrichment pass alone. A selection failure no longer
+// propagates as an error now that one bad reply costs one item instead of the
+// whole edition — so a run can lose items to it while every other number on the
+// summary line reads clean. That combination is the defect this exists to stop
+// recurring, not a hypothetical.
+func (r Result) Unjudged() int {
+	n := 0
+	for _, e := range r.Editions {
+		n += e.Unjudged
+	}
+	return n
+}
+
 // EditionResult is one edition's outcome for the day.
 type EditionResult struct {
 	ID string
@@ -314,8 +343,19 @@ type EditionResult struct {
 	Candidates int
 	Selected   int
 
+	// Unjudged counts candidates whose selection call could not be completed,
+	// so they were never judged either way. They are neither selected nor
+	// passed over, and a caller that treats Candidates-Selected as "rejected"
+	// will be wrong by exactly this number.
+	Unjudged int
+
 	// Empty says this edition ran and selected nothing, which is a correct
 	// outcome rather than a failure (ADR-0002 §4).
+	//
+	// ⚠️ Empty and Unjudged are independent, and an edition can be both. Empty
+	// alone must never be read as "a quiet day": if every candidate's selection
+	// failed, nothing was selected because nothing was asked, which is the
+	// opposite of the profile finding nothing to match.
 	Empty bool
 
 	Usage llm.Usage
@@ -421,7 +461,7 @@ func (r *Runner) Run(ctx context.Context, day time.Time) (Result, error) {
 		r.log.Info("digest written",
 			"day", result.Day, "edition", id,
 			"candidates", editionResult.Candidates, "selected", editionResult.Selected,
-			"empty", editionResult.Empty)
+			"unjudged", editionResult.Unjudged, "empty", editionResult.Empty)
 	}
 
 	// The report comes last, always. It describes what the editions selected,
@@ -435,10 +475,14 @@ func (r *Runner) Run(ctx context.Context, day time.Time) (Result, error) {
 		r.log.Error("could not write the daily report", "error", err)
 	}
 
+	// unjudged is carried here because `failed` counts the enrichment pass
+	// alone. A run that lost items in selection still reports failed=0, so a
+	// summary without this number reads as a clean run on exactly the days it
+	// is least entitled to.
 	r.log.Info("aggregation complete",
 		"day", result.Day, "items", result.Items, "enriched", result.Enriched,
-		"failed", result.Failed, "reused", result.Reused, "below_floor", result.BelowFloor,
-		"editions", len(result.Editions))
+		"failed", result.Failed, "unjudged", result.Unjudged(), "reused", result.Reused,
+		"below_floor", result.BelowFloor, "editions", len(result.Editions))
 
 	return result, errors.Join(problems...)
 }
@@ -504,11 +548,27 @@ func (r *Runner) runEdition(ctx context.Context, day time.Time, id string, editi
 	var selected []selectedItem
 	for _, candidate := range candidates {
 		selection, usage, err := r.selectItem(ctx, profile, candidate, ledger)
-		if err != nil {
-			editionReport.Failed = err.Error()
-			return editionResult, editionReport, fmt.Errorf("select %s: %w", candidate.Item.Filename, err)
-		}
 		addUsage(&editionResult.Usage, usage)
+		if err != nil {
+			// One item the model could not judge is one item's failure, not the
+			// edition's. This used to return, which discarded every selection
+			// already made — a single malformed reply cost a whole day's digest
+			// while the run's own summary still read as healthy.
+			//
+			// This is enrichment's posture, and deliberately so: the two passes
+			// disagreeing about how much one bad reply costs is what made the
+			// failure so hard to see.
+			editionResult.Unjudged++
+			editionReport.Absent = append(editionReport.Absent, ReportAbsence{
+				Item:   candidate.Item.Filename,
+				Source: candidate.Item.Source,
+				Reason: ReasonSelectFailed,
+				Error:  err.Error(),
+			})
+			r.log.Error("item selection failed; the item is unjudged and the edition continues",
+				"edition", id, "item", candidate.Item.Filename, "error", err)
+			continue
+		}
 		if selection.Selected {
 			selected = append(selected, selectedItem{
 				Item:       candidate.Item,
@@ -526,7 +586,7 @@ func (r *Runner) runEdition(ctx context.Context, day time.Time, id string, editi
 	editionResult.Empty = len(selected) == 0
 	editionReport.Empty = editionResult.Empty
 
-	usage, err := r.writeDigest(ctx, day, id, profile, selected, r.editionSources(edition, collected), ledger)
+	usage, err := r.writeDigest(ctx, day, id, profile, selected, r.editionSources(edition, collected), editionResult.Unjudged, ledger)
 	addUsage(&editionResult.Usage, usage)
 	if err != nil {
 		editionReport.Failed = err.Error()
@@ -671,6 +731,30 @@ func silentSourcesNote(sources map[string]collect.SourceOutcome) string {
 		len(silent), noun, strings.Join(silent, ", "))
 }
 
+// unjudgedNote tells the reader that part of the day was never asked about.
+//
+// 🚨 It exists because of what an empty digest means without it. "Nothing
+// cleared the bar" and "nothing was asked" produce the same page and are
+// opposite facts, and the reader is the one person who cannot check which
+// happened. It is written on non-empty digests too: a digest missing a quarter
+// of its candidates is incomplete in a way its own contents cannot show.
+//
+// It carries the count and never the error, following silentSourcesNote for the
+// same reason — this markdown is what a sink delivers, and a delivered document
+// must not end in an exception.
+func unjudgedNote(unjudged int) string {
+	if unjudged <= 0 {
+		return ""
+	}
+
+	noun := "item"
+	if unjudged > 1 {
+		noun = "items"
+	}
+	return fmt.Sprintf("\n%d %s could not be assessed today and are not represented above.\n",
+		unjudged, noun)
+}
+
 // sortedEditionIDs gives editions a stable order, so two runs over the same day
 // write the same things in the same sequence and a log is comparable.
 func sortedEditionIDs(editions map[string]config.Edition) []string {
@@ -755,25 +839,62 @@ func (r *Runner) enrich(ctx context.Context, item store.StoredItem, state State,
 // selectItem asks one edition whether it wants an enriched item. It is given
 // the neutral summary and data points rather than the full item, which is what
 // makes a selection pass cheaper than the judgement it replaces.
+// A malformed reply is retried once. A truncated response is a property of that
+// one generation rather than of the item, so asking again is worth one call —
+// but only once, because the failure is input-dependent: the reply that broke
+// this pass was the model quoting a long profile back at itself, and an item
+// and profile that produce an over-long reason will tend to produce it again.
+// Retrying harder would multiply the spend on exactly the items least likely to
+// come back clean.
+//
+// Only the parse is retried. A transport error is the client's to answer for,
+// and re-sending on top of whatever it is already doing is not this pass's call
+// to make.
+//
+// 🚨 The retry earns its call only while the endpoint's sampling is
+// non-deterministic, and nothing in this repo states that it is: llm.Request
+// sends Temperature only when set, and this pass does not set it, so the
+// default belongs to the endpoint. Pinning a deterministic temperature for
+// selection is a reasonable change on its own terms, and it would silently
+// turn this retry into a byte-identical re-send — doubling spend on exactly
+// the items least able to benefit. The two decisions have to be made together.
+const selectParseAttempts = 2
+
 func (r *Runner) selectItem(ctx context.Context, profile string, candidate enrichedItem, ledger *spendLedger) (Selection, llm.Usage, error) {
-	started := r.now()
-	resp, err := r.client.Complete(ctx, llm.Request{
-		Model:    r.cfg.Aggregator.Models.Item,
-		Messages: buildSelectMessages(profile, candidate),
-	})
-	if err == nil {
-		ledger.record(PassSelect, r.cfg.Aggregator.Models.Item,
-			resp.Usage.PromptTokens, resp.Usage.CompletionTokens, r.now().Sub(started))
-	}
-	if err != nil {
-		return Selection{}, llm.Usage{}, err
+	var usage llm.Usage
+	var lastErr error
+
+	for attempt := 1; attempt <= selectParseAttempts; attempt++ {
+		started := r.now()
+		resp, err := r.client.Complete(ctx, llm.Request{
+			Model:    r.cfg.Aggregator.Models.Item,
+			Messages: buildSelectMessages(profile, candidate),
+		})
+		if err == nil {
+			ledger.record(PassSelect, r.cfg.Aggregator.Models.Item,
+				resp.Usage.PromptTokens, resp.Usage.CompletionTokens, r.now().Sub(started))
+		}
+		if err != nil {
+			return Selection{}, usage, err
+		}
+
+		// Every attempt was billed, so every attempt is added. Returning only
+		// the successful call's usage would under-report a day of retries and
+		// make the retry look free.
+		addUsage(&usage, resp.Usage)
+
+		selection, parseErr := parseSelection(resp.Content)
+		if parseErr == nil {
+			return selection, usage, nil
+		}
+		lastErr = parseErr
+		if attempt < selectParseAttempts {
+			r.log.Warn("select reply was not usable JSON; asking once more",
+				"item", candidate.Item.Filename, "error", parseErr)
+		}
 	}
 
-	selection, err := parseSelection(resp.Content)
-	if err != nil {
-		return Selection{}, resp.Usage, err
-	}
-	return selection, resp.Usage, nil
+	return Selection{}, usage, lastErr
 }
 
 // writeDigest renders and writes both digest files, returning the markdown.
@@ -781,12 +902,13 @@ func (r *Runner) selectItem(ctx context.Context, profile string, candidate enric
 // A day with nothing relevant skips the model entirely: there is nothing to
 // write a digest from, the correct output is the empty marker, and asking a
 // model to write about nothing is exactly how filler gets produced.
-func (r *Runner) writeDigest(ctx context.Context, day time.Time, edition, profile string, selected []selectedItem, sources map[string]collect.SourceOutcome, ledger *spendLedger) (llm.Usage, error) {
+func (r *Runner) writeDigest(ctx context.Context, day time.Time, edition, profile string, selected []selectedItem, sources map[string]collect.SourceOutcome, unjudged int, ledger *spendLedger) (llm.Usage, error) {
 	var markdown string
 	var usage llm.Usage
 
 	if len(selected) == 0 {
-		markdown = fmt.Sprintf("# Digest — %s\n\n%s%s\n", store.Day(day), emptyDigestMarker, silentSourcesNote(sources))
+		markdown = fmt.Sprintf("# Digest — %s\n\n%s%s%s\n",
+			store.Day(day), emptyDigestMarker, unjudgedNote(unjudged), silentSourcesNote(sources))
 	} else {
 		started := r.now()
 		resp, err := r.client.Complete(ctx, llm.Request{
@@ -805,7 +927,7 @@ func (r *Runner) writeDigest(ctx context.Context, day time.Time, edition, profil
 		if body == "" {
 			return usage, errors.New("digest pass returned no text")
 		}
-		markdown = fmt.Sprintf("# Digest — %s\n\n%s\n", store.Day(day), body)
+		markdown = fmt.Sprintf("# Digest — %s\n\n%s%s\n", store.Day(day), body, unjudgedNote(unjudged))
 	}
 
 	digest := Digest{
@@ -814,6 +936,7 @@ func (r *Runner) writeDigest(ctx context.Context, day time.Time, edition, profil
 		Edition:     edition,
 		GeneratedAt: r.now().UTC().Format(time.RFC3339),
 		Empty:       len(selected) == 0,
+		Unjudged:    unjudged,
 		Sources:     sources,
 		Items:       make([]DigestItem, 0, len(selected)),
 	}
