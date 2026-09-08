@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.4.1](https://github.com/yaad-index/roozane/compare/v0.4.0...v0.4.1) (2026-09-08)
+
+
+### Bug Fixes
+
+* a failed selection costs one item, not the whole edition ([#68](https://github.com/yaad-index/roozane/issues/68)) ([e3837f0](https://github.com/yaad-index/roozane/commit/e3837f06770167946a3a3067628bbc445bab8037))
+* one event is one digest entry, not one entry per article ([#62](https://github.com/yaad-index/roozane/issues/62)) ([669e996](https://github.com/yaad-index/roozane/commit/669e9961624f505a54911a6bf6dd2beb67a2bf21))
+
 ## [0.4.0](https://github.com/yaad-index/roozane/compare/v0.3.0...v0.4.0) (2026-09-07)
 
 
