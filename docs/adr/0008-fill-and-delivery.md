@@ -60,17 +60,19 @@ The report doctrine applies unchanged: these must never be folded into one strin
 - The script **loses** what is now the engine's: truncation and per-subject balance.
 - Its failures become the engine's to report. Today a delivery that fails is invisible to the run that produced the digest.
 
-### ⚠️ Amendment: §7's mechanism is superseded; its purpose is not
+### ⚠️ Amendment: §7 is DEFERRED, not superseded
 
-**The spoken reading stays outside the engine and reads the finished digest file. There is no exec sink.**
+**§7 stands as the target.** The spoken reading becomes an ADR-0003 plugin. It is not one yet, and until it is, an external program reads the finished digest file — **an interim measure, named as interim.**
 
-**Why the mechanism failed, recorded because the constraint is not obvious from the contract.** The engine image is distroless and **has no shell**: `docker run --entrypoint sh` on it fails with `exec: "sh": executable file not found`. So an ADR-0003 exec sink must be a **compiled static binary** — which the one existing plugin already is, and which is the shape the contract has quietly required all along. §7 was written from the plugin contract without checking what the image can execute, and packaging a working script as a sink would have meant rewriting it in Go and carrying speech synthesis and a delivery credential into the container.
+**The constraint that deferred it, recorded because it is not visible from the contract.** The engine image is distroless and **has no shell**: `docker run --entrypoint sh` on it fails with `exec: "sh": executable file not found`. So an ADR-0003 exec sink must be a **compiled static binary** — which the one existing plugin already is, and which the contract has quietly required all along. §7 was written from the plugin contract without checking what the image can execute, and the plugin therefore has to carry the speech step and a delivery credential rather than shelling out to an existing script.
 
-🔑 **This constraint belongs in the record rather than in the incident that found it.** The next person reaching for an exec sink hits the same wall, and nothing in ADR-0003 says so.
+🔑 **That constraint belongs in the record rather than in the incident that found it.** Nothing in ADR-0003 says it, so the next person reaching for an exec sink hits the same wall.
 
-**What §7 was for is unaffected, and this is not an abandonment.** The requirement was that the reader receives *what the writing pass produced* — one entry per merged event — rather than something reconstructed from `items[]`. The engine writes exactly that, as prose, beside the structured digest. A local reader of that file gets it. **The engine still owns length and subject share; the external program only speaks.** §8's envelope field remains correct and is what any future in-container sink would use.
+**What §7 is for is already satisfied by the interim, which is why deferring it is safe.** The requirement was that the reader receives *what the writing pass produced* — one entry per merged event — rather than something reconstructed from `items[]`. The engine writes exactly that, as prose, beside the structured digest, and a local reader of that file gets it. **The engine owns length and subject share either way; the external program only speaks.** §8's envelope field is already correct and is what the plugin will use.
 
-⚠️ **The residual, stated rather than glossed: failures are no longer visible to the run that produced the digest.** An exec sink's exit code would have been. This is covered in practice by the external script's own alert path — which exists precisely because a silent delivery failure is the defect this whole line of work started from — but that is a **different mechanism**, outside the engine, and the record should not read as though the property were retained. Anything that later needs delivery outcomes inside the run has to reopen the packaging question, and would then face the static-binary constraint above.
+⚠️ **The cost of the deferral is OUTSTANDING, not accepted: delivery failures are not visible to the run that produced the digest.** A plugin's exit code would make them so. In the meantime the external reader's own alert path covers it — that path exists precisely because a silent delivery failure is the defect this whole line of work started from — but it is a **different mechanism, outside the engine**, and the record must not read as though the property were held.
+
+**The deferral is tracked as an issue** rather than left in this paragraph: the voice sink as a static Go binary satisfying ADR-0003, carrying the speech step and a delivery credential, replacing the external reader. ⚠️ **An interim measure with no open item against it becomes the design by default**, which is exactly what writing this down as a deferral rather than as a decision is meant to prevent.
 
 **8. The sink envelope gains the written markdown, additively — and this is required rather than convenient.**
 
@@ -104,6 +106,6 @@ The report doctrine applies unchanged: these must never be folded into one strin
 
 - **The target number.** The script uses 8. Whether that is right is a question for the reader and for the configuration, and the mechanism is indifferent to it.
 - **Whether the report's counts move from articles to events.** Untouched, and still its own decision.
-- **Anything about the voice** — how it is rendered, what produces the audio, or what the reading sounds like. Per the amendment above, the program that does it reads the digest file rather than being a sink.
-- **Whether an in-container sink is worth its cost**, and what an ADR-0003 plugin would have to be to satisfy the distroless image. Reopening it means accepting the static-binary constraint named in the amendment.
+- **Anything about the voice** — how it is rendered, what produces the audio, or what the reading sounds like. This decision only says the program that does it is a sink rather than a bypass, and that it is handed the prose.
+- **When the deferred plugin lands**, and what it costs to build. The shape is settled by §7 and by the static-binary constraint in the amendment; the scheduling is not decided here.
 - **Whether the report's absence lists should reconcile against events rather than articles** once the prose is what a sink renders. The seam widens here and closing it is still ADR-0006's open question, not this one.
