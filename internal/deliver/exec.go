@@ -27,6 +27,26 @@ type envelope struct {
 	Sink     string          `json:"sink"`
 	Params   map[string]any  `json:"params,omitempty"`
 	Digest   json.RawMessage `json:"digest"`
+
+	// Markdown is the written digest — the prose the writing pass produced
+	// (ADR-0008 §8).
+	//
+	// 🚨 It is not a convenience beside `digest`. The two carry different things
+	// and only one of them has been through the writing pass: `digest.items[]` is
+	// one entry per ARTICLE and pre-merge, while one-event-one-entry is a property
+	// of the prose and exists nowhere else. That is why #58's recorded limitation
+	// is that the merge never reaches `items[]` or the report's counts.
+	//
+	// So a plugin that renders from `items[]` gives one event several entries. A
+	// sink built that way looks like delivery running through the delivery layer
+	// while reproducing the exact defect that moving delivery inside it was meant
+	// to fix. This field is what lets a sink render what the reader should see.
+	//
+	// Additive, and the contract stays at 1: a plugin that does not read it is
+	// unaffected, and one that needs it can check for its presence. Bumping to 2
+	// would make every existing plugin fail loudly (ADR-0003 §7) over a field none
+	// of them uses.
+	Markdown string `json:"markdown,omitempty"`
 }
 
 // waitDelay bounds how long Wait may go on reading a plugin's pipes after the
@@ -74,6 +94,7 @@ func (s *execSink) Deliver(ctx context.Context, digest Digest) error {
 		Sink:     s.id,
 		Params:   params,
 		Digest:   json.RawMessage(structured),
+		Markdown: digest.Markdown,
 	})
 	if err != nil {
 		return fmt.Errorf("encode envelope: %w", err)

@@ -58,8 +58,19 @@ be honest about the security consequences of running configured executables.
    configured command with:
 
    ```json
-   {"contract": 1, "sink": "<sink-id>", "params": { … }, "digest": { …the ADR-0002 digest JSON… }}
+   {"contract": 1, "sink": "<sink-id>", "params": { … }, "digest": { …the ADR-0002 digest JSON… }, "markdown": "…the written digest…"}
    ```
+
+   🚨 **`markdown` is the prose and `digest` is the structured record, and a sink
+   that renders the wrong one is broken in a way nothing reports.** `digest.items[]`
+   is one entry per ARTICLE and pre-merge; one-event-one-entry is a property of the
+   writing pass and exists only in the prose. A sink rendering from `items[]` gives
+   one event several entries while looking entirely healthy. Added by ADR-0008 §8.
+
+   It is **additive and the contract stays at 1**: a plugin that does not read it is
+   unaffected, and one that needs it checks for its presence. It is omitted rather
+   than sent empty when a payload has no written digest, so "no prose" and "prose
+   that said nothing" stay distinguishable.
 
    Anything the sink writes to stdout is logged verbatim; delivery success is
    the exit code.

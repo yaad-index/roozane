@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -200,4 +201,74 @@ func TestExecSinkEscapedDescendantCannotHangTheRun(t *testing.T) {
 	require.Error(t, err, "a plugin past its deadline must fail")
 	assert.Less(t, elapsed, 15*time.Second,
 		"the run waited on a descendant that escaped the process group; it must give up instead")
+}
+
+// TestExecSinkIsHandedTheProseAndNotOnlyTheItems is ADR-0008 §8, asserted as the
+// difference it exists for rather than as the presence of a field.
+//
+// 🚨 The fixture is built so the two halves DISAGREE: the prose carries one entry
+// naming two sources, the structured half carries two items. That is the ordinary
+// case, not a contrived one — one-event-one-entry is a property of the writing
+// pass, and `items[]` is one entry per article and pre-merge, which is why #58's
+// recorded limitation is that the merge never reaches it.
+//
+// A plugin rendering from `items[]` therefore gives one event several entries. A
+// sink built that way looks like delivery running through the delivery layer while
+// reproducing the exact defect that moving delivery inside it was meant to fix, so
+// "the envelope has a markdown field" is not the claim worth testing — "a plugin
+// can render what the reader should see" is.
+func TestExecSinkIsHandedTheProseAndNotOnlyTheItems(t *testing.T) {
+	out := filepath.Join(t.TempDir(), "captured.json")
+	sink := &execSink{id: "voice", command: []string{script(t, "cat > "+out+"\n")}}
+
+	const prose = "# Digest — 2026-09-04\n\n- One occurrence, reported by two outlets.\n"
+	const items = `{"schema":1,"items":[{"source":"a-source"},{"source":"b-source"}]}`
+
+	require.NoError(t, sink.Deliver(context.Background(), Digest{
+		Day:        "2026-09-04",
+		Edition:    "default",
+		Markdown:   prose,
+		Structured: []byte(items),
+	}))
+
+	raw, err := os.ReadFile(out) //nolint:gosec // test-controlled path
+	require.NoError(t, err)
+
+	var envelope struct {
+		Contract int    `json:"contract"`
+		Markdown string `json:"markdown"`
+		Digest   struct {
+			Items []struct {
+				Source string `json:"source"`
+			} `json:"items"`
+		} `json:"digest"`
+	}
+	require.NoError(t, json.Unmarshal(raw, &envelope))
+
+	assert.Equal(t, prose, envelope.Markdown, "the plugin receives the written digest verbatim")
+	assert.Equal(t, contractVersion, envelope.Contract,
+		"the field is additive, so a plugin that ignores it is unaffected and the contract does not move")
+
+	// The property, stated as the disagreement: one entry in the prose, two items
+	// beside it. A sink rendering the second would repeat the event.
+	assert.Equal(t, 1, strings.Count(envelope.Markdown, "\n- "), "the prose merged the event")
+	assert.Len(t, envelope.Digest.Items, 2, "while the structured half still carries both articles")
+}
+
+// TestExecSinkOmitsTheProseWhenThereIsNone keeps the field honest for a payload
+// that genuinely has no written digest, rather than sending an empty string a
+// plugin would have to distinguish from a digest that said nothing.
+func TestExecSinkOmitsTheProseWhenThereIsNone(t *testing.T) {
+	out := filepath.Join(t.TempDir(), "captured.json")
+	sink := &execSink{id: "voice", command: []string{script(t, "cat > "+out+"\n")}}
+
+	require.NoError(t, sink.Deliver(context.Background(), Digest{Day: "2026-09-04", Edition: "default"}))
+
+	raw, err := os.ReadFile(out) //nolint:gosec // test-controlled path
+	require.NoError(t, err)
+
+	var fields map[string]json.RawMessage
+	require.NoError(t, json.Unmarshal(raw, &fields))
+	assert.NotContains(t, fields, "markdown")
+	assert.Contains(t, fields, "digest", "the structured half is always present, even as null")
 }
