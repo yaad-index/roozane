@@ -1,11 +1,17 @@
 package aggregate
 
 import (
+	"context"
+	"strconv"
+	"strings"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/yaad-index/roozane/internal/config"
+	"github.com/yaad-index/roozane/internal/llm"
 	"github.com/yaad-index/roozane/internal/store"
 )
 
@@ -406,4 +412,323 @@ func TestMergeSameSubjectKeepsFirstAppearanceOrderAndDoesNotAliasInput(t *testin
 	assert.Equal(t, []int{0}, groups[0].Members)
 	assert.Equal(t, -1, backing[1],
 		"the merge must not write past the caller's slice into its backing array")
+}
+
+// --- the grouping reply ---
+
+// itemsAskedAbout counts the items a grouping request was given, by the numbered
+// headings buildGroupMessages writes. It lets a stub answer a request it did not
+// author, which is what keeps the default answer valid for any set size.
+func itemsAskedAbout(req llm.Request) int {
+	if len(req.Messages) < 2 {
+		return 0
+	}
+	return strings.Count(req.Messages[1].Content, "\n## ")
+}
+
+// oneSubjectJSON is a valid partition putting every item in one subject.
+func oneSubjectJSON(n int) string {
+	items := make([]string, 0, n)
+	for i := 0; i < n; i++ {
+		items = append(items, strconv.Itoa(i))
+	}
+	return `{"subjects": [{"subject": "everything", "items": [` + strings.Join(items, ", ") + `]}]}`
+}
+
+// splitSubjectsJSON puts the first n-tail items in one subject and the rest in
+// another, which is the shape that makes a ceiling bind.
+func splitSubjectsJSON(n, tail int) string {
+	var head, rest []string
+	for i := 0; i < n-tail; i++ {
+		head = append(head, strconv.Itoa(i))
+	}
+	for i := n - tail; i < n; i++ {
+		rest = append(rest, strconv.Itoa(i))
+	}
+	return `{"subjects": [
+		{"subject": "the busy one", "items": [` + strings.Join(head, ", ") + `]},
+		{"subject": "the other", "items": [` + strings.Join(rest, ", ") + `]}
+	]}`
+}
+
+func TestParseGroupingReadsAPartition(t *testing.T) {
+	t.Run("plain json", func(t *testing.T) {
+		groups, err := parseGrouping(`{"subjects": [{"subject": "a", "items": [0, 2]}, {"subject": "b", "items": [1]}]}`, 3)
+		require.NoError(t, err)
+		require.Len(t, groups, 2)
+		assert.Equal(t, "a", groups[0].Subject)
+		assert.Equal(t, []int{0, 2}, groups[0].Members)
+	})
+
+	t.Run("fenced json", func(t *testing.T) {
+		groups, err := parseGrouping("```json\n"+`{"subjects": [{"subject": "a", "items": [0]}]}`+"\n```", 1)
+		require.NoError(t, err)
+		require.Len(t, groups, 1)
+	})
+
+	t.Run("unnamed subjects get DISTINCT placeholders, so they are not merged together", func(t *testing.T) {
+		// 🚨 Not cosmetic. mergeSameSubject folds entries sharing a label, so one
+		// shared placeholder would merge clusters the grouping never said were
+		// related — and merging two subjects into one drops items, where leaving
+		// them apart only leaves the digest less balanced.
+		groups, err := parseGrouping(`{"subjects": [{"subject": "  ", "items": [0]}, {"subject": "", "items": [1]}]}`, 2)
+		require.NoError(t, err)
+		require.Len(t, groups, 2)
+		assert.Equal(t, "unnamed 1", groups[0].Subject)
+		assert.Equal(t, "unnamed 2", groups[1].Subject)
+		assert.NotEqual(t, groups[0].Subject, groups[1].Subject)
+
+		// And the property that actually matters, asserted through the ceiling
+		// rather than through the labels: two unlabelled clusters keep their own
+		// allowances.
+		selected := []selectedItem{item("a.md", 0.9, 0.5), item("b.md", 0.8, 0.5)}
+		kept, dropped := applyShareCeiling(selected, groups, 0.25)
+		assert.Equal(t, []string{"a.md", "b.md"}, names(kept))
+		assert.Empty(t, dropped)
+	})
+
+	t.Run("not json at all", func(t *testing.T) {
+		_, err := parseGrouping("I grouped them by subject for you!", 2)
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "did not return usable JSON")
+	})
+
+	t.Run("a reply that is not a partition is an ERROR, never a partial grouping", func(t *testing.T) {
+		// 🚨 The whole safety property. Item 1 is missing, and the tempting
+		// reading — "group what came back" — would drop it from the digest with
+		// no absence recorded.
+		_, err := parseGrouping(`{"subjects": [{"subject": "a", "items": [0, 2]}]}`, 3)
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "did not partition the 3 selected items")
+		assert.Contains(t, err.Error(), "item 1 was left out")
+	})
+
+	t.Run("an empty selected set can never be partitioned", func(t *testing.T) {
+		// Which is why the caller skips the pass entirely on a quiet day rather
+		// than calling it and reading the failure as a fault.
+		_, err := parseGrouping(`{"subjects": []}`, 0)
+		require.Error(t, err)
+	})
+
+	t.Run("a duplicate names which subjects disagree", func(t *testing.T) {
+		_, err := parseGrouping(`{"subjects": [{"subject": "a", "items": [0, 1]}, {"subject": "b", "items": [1]}]}`, 2)
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), `"a" and "b"`)
+	})
+
+	t.Run("a duplicate inside one subject says so", func(t *testing.T) {
+		_, err := parseGrouping(`{"subjects": [{"subject": "a", "items": [0, 0, 1]}]}`, 2)
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), `appears twice in subject "a"`)
+	})
+}
+
+// --- the balance pass, end to end ---
+
+// balanceFixture builds a day of n items across two sources, for an edition
+// configured with a subject share.
+func balanceFixture(t *testing.T, day time.Time, n int, extraEditionYAML string) (*config.Config, string) {
+	t.Helper()
+	items := make([]store.Item, 0, n)
+	for i := 0; i < n; i++ {
+		source := "a-source"
+		if i%2 == 1 {
+			source = "b-source"
+		}
+		items = append(items, store.Item{
+			Source:  source,
+			URL:     "https://example.com/" + strconv.Itoa(i),
+			Title:   "Item " + strconv.Itoa(i),
+			Content: "body " + strconv.Itoa(i),
+		})
+	}
+	return fixture(t, day, "profile", "editions:\n  "+config.DefaultEdition+":\n    "+extraEditionYAML+"\n", items...)
+}
+
+// TestTheCeilingTrimsTheDigestAndNamesEveryItemItRemoved is the pass's whole
+// contract in one run: fewer items in the digest, and every missing one
+// accounted for in the report under its own reason.
+func TestTheCeilingTrimsTheDigestAndNamesEveryItemItRemoved(t *testing.T) {
+	day := at(t, "2026-09-04T06:00:00Z")
+	cfg, root := balanceFixture(t, day, 5, "subject_share: 0.25")
+
+	client := &stubClient{
+		group: func(req llm.Request) (llm.Response, error) {
+			// Four items on one subject, one on another. The allowance is
+			// max(1, floor(0.25*5)) = 1, so the crowded subject keeps one.
+			return llm.Response{Content: splitSubjectsJSON(itemsAskedAbout(req), 1)}, nil
+		},
+	}
+	result, err := runner(t, cfg, client, day).Run(context.Background(), day)
+	require.NoError(t, err)
+
+	require.Len(t, result.Editions, 1)
+	edition := result.Editions[0]
+	assert.Equal(t, 2, edition.Selected, "one item per subject survives")
+	assert.Equal(t, 3, edition.Dropped)
+	assert.False(t, edition.Empty)
+	assert.False(t, edition.BalanceFailed)
+
+	_, digest := readDigest(t, root, day, config.DefaultEdition)
+	assert.Len(t, digest.Items, 2, "the digest carries what survived, not what was selected")
+	assert.Empty(t, digest.BalanceFailed)
+
+	_, report := readReport(t, root, day)
+	require.Len(t, report.Editions, 1)
+	assert.Len(t, report.Editions[0].Selected, 2)
+	assert.Equal(t, 3, countAbsent(report.Editions[0].Absent, ReasonSubjectShare))
+
+	// 🚨 The property the reason exists for: every item is accounted for exactly
+	// once. An item both listed as selected and recorded as absent would make
+	// the report's two lists disagree about the same day.
+	inDigest := map[string]bool{}
+	for _, name := range report.Editions[0].Selected {
+		inDigest[name] = true
+	}
+	for _, absence := range report.Editions[0].Absent {
+		assert.False(t, inDigest[absence.Item],
+			"an item recorded as absent must not also be listed as selected")
+	}
+	assert.Equal(t, 5, len(report.Editions[0].Selected)+len(report.Editions[0].Absent))
+}
+
+// TestAnEditionWithNoShareRunsNoGroupingCall keeps the setting's absence free:
+// an edition that has never heard of it behaves as it did before it existed,
+// and pays for nothing.
+func TestAnEditionWithNoShareRunsNoGroupingCall(t *testing.T) {
+	day := at(t, "2026-09-04T06:00:00Z")
+	cfg, root := fixture(t, day, "profile", "",
+		store.Item{Source: "a-source", URL: "https://example.com/a", Title: "A", Content: "body"},
+		store.Item{Source: "b-source", URL: "https://example.com/b", Title: "B", Content: "body"})
+
+	client := &stubClient{}
+	result, err := runner(t, cfg, client, day).Run(context.Background(), day)
+	require.NoError(t, err)
+
+	assert.Empty(t, client.callsIn("group"), "no share configured means no call is made")
+	assert.Equal(t, 2, result.Editions[0].Selected)
+	assert.Zero(t, result.Editions[0].Dropped)
+
+	_, digest := readDigest(t, root, day, config.DefaultEdition)
+	assert.Len(t, digest.Items, 2)
+	assert.Empty(t, digest.BalanceFailed, "a pass that never ran is not a pass that failed")
+}
+
+// TestAQuietDayIsNotAGroupingFailure guards the one input the grouping pass
+// cannot answer. An empty selected set has no valid partition — every reply
+// fails validation — so calling the pass anyway would label a legitimately
+// quiet day as a failure, in an engine whose stated position is that an empty
+// digest is a correct outcome.
+func TestAQuietDayIsNotAGroupingFailure(t *testing.T) {
+	day := at(t, "2026-09-04T06:00:00Z")
+	cfg, root := balanceFixture(t, day, 2, "subject_share: 0.25")
+
+	client := &stubClient{
+		sel: func(llm.Request) (llm.Response, error) {
+			return llm.Response{Content: selectionJSON(false, 0.1)}, nil
+		},
+	}
+	result, err := runner(t, cfg, client, day).Run(context.Background(), day)
+	require.NoError(t, err)
+
+	assert.Empty(t, client.callsIn("group"), "nothing was selected, so there is nothing to balance")
+	assert.True(t, result.Editions[0].Empty)
+	assert.False(t, result.Editions[0].BalanceFailed)
+
+	markdown, digest := readDigest(t, root, day, config.DefaultEdition)
+	assert.Contains(t, markdown, emptyDigestMarker)
+	assert.Empty(t, digest.BalanceFailed)
+	assert.NotContains(t, markdown, "could not be sorted by subject")
+}
+
+// TestAFailedGroupingWritesTheDigestUnbalancedAndSaysSo is ADR-0007 §8.
+//
+// ⚠️ The assertion that matters most is the last one. A full digest is exactly
+// what a WORKING ceiling produces on a balanced day, so without the recorded
+// cause the two days are the same document — and the one where the reader's own
+// instruction went unenforced is the one they would want to know about.
+func TestAFailedGroupingWritesTheDigestUnbalancedAndSaysSo(t *testing.T) {
+	day := at(t, "2026-09-04T06:00:00Z")
+	cfg, root := balanceFixture(t, day, 4, "subject_share: 0.25")
+
+	client := &stubClient{
+		group: func(llm.Request) (llm.Response, error) {
+			return llm.Response{Content: "sorry, I could not do that"}, nil
+		},
+	}
+	result, err := runner(t, cfg, client, day).Run(context.Background(), day)
+	require.NoError(t, err, "a failed ceiling costs the balance, never the digest")
+
+	edition := result.Editions[0]
+	assert.True(t, edition.BalanceFailed)
+	assert.Equal(t, 4, edition.Selected, "every selected item is carried")
+	assert.Zero(t, edition.Dropped)
+	assert.False(t, edition.Empty)
+
+	markdown, digest := readDigest(t, root, day, config.DefaultEdition)
+	assert.Len(t, digest.Items, 4)
+	assert.Contains(t, digest.BalanceFailed, "did not return usable JSON",
+		"the cause is on the structured half, where tooling reads it")
+	assert.Contains(t, markdown, "no subject was held to its usual share",
+		"and the outcome is in the markdown, where the reader is")
+	assert.NotContains(t, markdown, "usable JSON", "the error text never reaches the reader")
+
+	_, report := readReport(t, root, day)
+	assert.Zero(t, countAbsent(report.Editions[0].Absent, ReasonSubjectShare),
+		"a ceiling that never ran removed nothing, so it recorded no absences")
+}
+
+// TestAnUnusableGroupingIsAskedAgainOnce mirrors the title and select passes:
+// one retry on a reply that did not parse, because the likeliest failure of a
+// hard-checked reply is a near-miss the same request would not repeat.
+func TestAnUnusableGroupingIsAskedAgainOnce(t *testing.T) {
+	day := at(t, "2026-09-04T06:00:00Z")
+	cfg, root := balanceFixture(t, day, 4, "subject_share: 0.25")
+
+	attempts := 0
+	client := &stubClient{
+		group: func(req llm.Request) (llm.Response, error) {
+			attempts++
+			if attempts == 1 {
+				// A partition missing one index: the near-miss the retry is for.
+				return llm.Response{Content: `{"subjects": [{"subject": "a", "items": [0, 1, 2]}]}`}, nil
+			}
+			return llm.Response{Content: splitSubjectsJSON(itemsAskedAbout(req), 1)}, nil
+		},
+	}
+	result, err := runner(t, cfg, client, day).Run(context.Background(), day)
+	require.NoError(t, err)
+
+	assert.Equal(t, 2, attempts)
+	assert.False(t, result.Editions[0].BalanceFailed)
+	assert.Equal(t, 2, result.Editions[0].Selected)
+
+	_, digest := readDigest(t, root, day, config.DefaultEdition)
+	assert.Empty(t, digest.BalanceFailed)
+}
+
+// TestTitlesAreOnlyPaidForWhatSurvives pins the pass's position in the sequence.
+// Running it after the title pass would translate headlines for items about to
+// be dropped — correct output, paid for twice over.
+func TestTitlesAreOnlyPaidForWhatSurvives(t *testing.T) {
+	day := at(t, "2026-09-04T06:00:00Z")
+	cfg, root := balanceFixture(t, day, 5, "subject_share: 0.25\n    language: Persian")
+
+	client := &stubClient{
+		group: func(req llm.Request) (llm.Response, error) {
+			return llm.Response{Content: splitSubjectsJSON(itemsAskedAbout(req), 1)}, nil
+		},
+	}
+	_, err := runner(t, cfg, client, day).Run(context.Background(), day)
+	require.NoError(t, err)
+
+	titleCalls := client.callsIn("title")
+	require.Len(t, titleCalls, 1)
+	headlines := titleCalls[0].Messages[1].Content
+	assert.Equal(t, 2, strings.Count(headlines, "\n0. ")+strings.Count(headlines, "\n1. ")+
+		strings.Count(headlines, "\n2. ")+strings.Count(headlines, "\n3. ")+strings.Count(headlines, "\n4. "),
+		"the title pass is given the survivors, not everything that was selected")
+
+	_, digest := readDigest(t, root, day, config.DefaultEdition)
+	assert.Len(t, digest.Items, 2)
 }

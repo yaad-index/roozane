@@ -25,9 +25,15 @@ const ReportSchema = 2
 // PassTitle runs at most once per edition and only when that edition names a
 // language, so its line is absent from most reports rather than zero — the
 // ledger records what was paid for, and a pass that never ran was not.
+//
+// PassGroup is the same shape: once per edition, and only when that edition
+// configures a subject share (ADR-0007). Its absence from a report says the
+// balance pass did not run, which for an unconfigured edition is the correct
+// and expected outcome.
 const (
 	PassEnrich = "enrich"
 	PassSelect = "select"
+	PassGroup  = "group"
 	PassTitle  = "title"
 	PassDigest = "digest"
 )
@@ -52,11 +58,20 @@ const (
 // they are indistinguishable once written to the same string. Recording an
 // unjudged item as "not selected by this edition's profile" would be a false
 // statement in the one artifact whose job is to explain the day.
+// 🚨 ReasonSubjectShare is likewise distinct from ReasonNotSelected, and the
+// distinction carries a diagnosis nothing else in the report offers. "Not
+// selected" says the profile was applied and said no. This one says the profile
+// said YES and the item lost its place to others on the same subject — so a
+// rising count of it says this reader's source list is lopsided, which is a
+// statement about the configuration rather than about the day. Folded into
+// "not selected", that signal is destroyed and the report reads as though the
+// profile rejected items it in fact chose.
 const (
 	ReasonBelowFloor   = "below the generic salience floor"
 	ReasonNotInSources = "not in this edition's source list"
 	ReasonNotSelected  = "not selected by this edition's profile"
 	ReasonSelectFailed = "the selection call failed, so this item was never judged"
+	ReasonSubjectShare = "selected, then crowded out by its own subject's share of the digest"
 )
 
 // PassSpend is one pass's spend on one model, for this run.

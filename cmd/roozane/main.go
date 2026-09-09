@@ -195,6 +195,20 @@ func runAggregate(args []string, stdout, stderr io.Writer) int {
 			// footing as losing the day's digest entirely.
 			line += ", headlines kept their published language (the title call failed)"
 		}
+		if edition.Dropped > 0 {
+			// Reported because Selected otherwise falls with nothing to account
+			// for it: an operator comparing two days sees a smaller digest and
+			// no reason. The per-item reasons are in the report; this is the
+			// count that sends them there.
+			line += fmt.Sprintf(", %d dropped to keep one subject from crowding out the rest", edition.Dropped)
+		}
+		if edition.BalanceFailed {
+			// Same footing as a title failure: the digest was written and
+			// delivered, so this does not change the exit code. It is said here
+			// because a full digest is exactly what a working ceiling also
+			// produces on a balanced day, and the two must not read alike.
+			line += ", no subject was held to its share (the grouping call failed)"
+		}
 		if edition.Empty {
 			// Qualified rather than stated: with unjudged items in the same
 			// edition, "nothing cleared the bar" is not established. Nothing

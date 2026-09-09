@@ -97,6 +97,90 @@ Rules:
 - Do not invent anything that is not in the points you were given, and do not speculate about what an item implies.
 - No preamble about what you are doing. Output the digest only.`
 
+// groupSystemPrompt drives the grouping pass, which runs once per edition over
+// the items that edition selected (ADR-0007 §2).
+//
+// It is asked to describe and never to decide. The ceiling is arithmetic over
+// what comes back, so a pass that also dropped items would make its own answer
+// unauditable: a subject it merged and an item it left out arrive as the same
+// thing, a shorter list, and nothing downstream — or in a test — could tell
+// them apart.
+//
+// ⚠️ Every item must come back exactly once, and the reply is checked for that
+// rather than trusted. An omitted index would delete an item from the digest
+// with nothing recorded, which is precisely the failure this pass exists to
+// prevent; parseGrouping rejects the reply instead, and a rejected grouping
+// leaves the digest unbalanced and says so.
+//
+// The instruction to group by substance rather than by publisher or by kind is
+// the one the whole decision turns on. Enrichment already carries a category
+// and tags, and neither is a subject: the category names the KIND of item, and
+// tags are free-form and multi-valued. A ceiling counted over either would be
+// permanently satisfied and never binding.
+//
+// Granularity is stated in terms of a reader's standing interests, because the
+// two obvious readings are both wrong in the same direction. One subject per
+// story makes every item its own subject and the ceiling never binds; one
+// subject per broad domain collapses unrelated things and it binds far too
+// hard. What the reader perceives is the level in between.
+const groupSystemPrompt = `You are the grouping layer of a news engine. You are given the items one reader's digest has selected today, numbered.
+
+Sort them into subjects: what each item is ABOUT.
+
+Rules:
+- EVERY item appears in exactly one subject. Never leave an item out, and never put one in two subjects. If an item shares its subject with nothing else, it is a subject of one — that is a correct answer, not a failure to place it.
+- Group by substance, not by publisher and not by the kind of item. Two publishers covering one field are one subject. An announcement and an analysis about the same field are one subject.
+- A subject is the size of a standing interest someone would name — the field, the pursuit, the area — not the size of a single story and not the size of a whole domain. Several developments in one field are one subject; two unrelated fields are never one subject because both happen to be technical.
+- DESCRIBE, do not judge. Do not rank the items, do not say which matter, and do not leave anything out for being minor. Something else decides what the digest keeps.
+
+Respond with a single JSON object and nothing else, in this exact shape:
+{"subjects": [{"subject": "...", "items": [0, 2, 5]}]}
+
+- "subject" is a short lower-case label for what those items are about.
+- "items" are the numbers of the items belonging to it, taken from the list you were given.`
+
+// buildGroupMessages assembles one edition's grouping call.
+//
+// It sends the data points rather than the titles alone, and it carries no
+// profile. Both follow the pass's job: the subject of an item is a property of
+// the item and not of the reader, and one story's headlines routinely share
+// almost no vocabulary — the writing pass learned that when a lexical
+// similarity test over four articles about one event dropped none of them.
+//
+// The numbers are positions in the selected slice, so the reply can be checked
+// against what was asked. A reply naming filenames would have to be matched by
+// string, where a near-miss reads as an item the grouping simply omitted.
+func buildGroupMessages(selected []selectedItem) []llmMessages {
+	var b strings.Builder
+
+	b.WriteString("# Items in today's digest\n")
+
+	for i, s := range selected {
+		fmt.Fprintf(&b, "\n## %d. ", i)
+		switch {
+		case s.Item.Title != "":
+			b.WriteString(s.Item.Title)
+		case s.Item.URL != "":
+			b.WriteString(s.Item.URL)
+		default:
+			b.WriteString(s.Item.Source)
+		}
+		b.WriteString("\n")
+
+		if summary := strings.TrimSpace(s.Enrichment.Summary); summary != "" {
+			fmt.Fprintf(&b, "%s\n", summary)
+		}
+		for _, point := range s.Enrichment.Points {
+			fmt.Fprintf(&b, "- %s\n", point)
+		}
+	}
+
+	return []llmMessages{
+		{Role: roleSystem, Content: groupSystemPrompt},
+		{Role: roleUser, Content: b.String()},
+	}
+}
+
 // titleSystemPrompt drives the title pass, which runs once per edition over the
 // titles that edition selected.
 //

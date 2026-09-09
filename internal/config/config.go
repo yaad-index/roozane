@@ -213,6 +213,31 @@ type Edition struct {
 	// stating no language at all is a supported configuration and the default
 	// one (see Config.Language).
 	Language string `yaml:"language"`
+
+	// Share is the largest slice of a digest one subject may take, as a
+	// fraction (ADR-0007). Absent means no balance pass runs for this edition
+	// and no grouping call is paid for, which is why it is a pointer: an
+	// edition that has never heard of the setting behaves exactly as it did
+	// before it existed.
+	//
+	// There is deliberately no default. ADR-0007 leaves the number to the
+	// configuration and settles only the mechanism, and a shipped default would
+	// quietly change what every existing edition produces.
+	Share *float64 `yaml:"subject_share"`
+}
+
+// SubjectShare is this edition's configured share and whether it has one.
+//
+// Callers must consult the second return rather than reading a zero as "no
+// ceiling": zero is not a legal configured value (validateEditions rejects it),
+// but a caller that ignored the flag would read an absent setting as the
+// tightest possible ceiling rather than as none at all — the opposite outcome,
+// silently.
+func (e Edition) SubjectShare() (float64, bool) {
+	if e.Share == nil {
+		return 0, false
+	}
+	return *e.Share, true
 }
 
 // SelectsAll reports whether this edition draws on the whole pool, which is
@@ -740,6 +765,16 @@ func (c *Config) validateEditions() []error {
 					"edition %q: sources[%d] names unknown source %q; configured sources are %s",
 					id, i, src, strings.Join(sortedKeys(c.Sources), ", ")))
 			}
+		}
+
+		// A share outside (0, 1] is rejected at load rather than clamped. A
+		// clamped 25 would run as a ceiling of 1.0 — no ceiling at all — and
+		// the digest it produced would be indistinguishable from a correctly
+		// configured one, which is the failure the whole decision is about.
+		if share, ok := c.Editions[id].SubjectShare(); ok && (share <= 0 || share > 1) {
+			problems = append(problems, fmt.Errorf(
+				"edition %q: subject_share is %v; it is a fraction of the digest and must be greater than 0 and at most 1 (0.25 is a quarter)",
+				id, share))
 		}
 	}
 

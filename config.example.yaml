@@ -184,9 +184,24 @@ sources:
 # editions:
 #   personal:
 #     profile: profile.md
+#     subject_share: 0.25
 #   boardgames:
 #     sources: [example-feed]
 #     profile: boardgames.md
+#
+# `subject_share` is the largest slice of a digest any one subject may take, as
+# a fraction — 0.25 is a quarter. It is optional and has no default: an edition
+# that omits it is written exactly as it was before the setting existed, and
+# pays for nothing extra.
+#
+# It only ever SHORTENS a digest. Nothing is added to fill a share, so on a day
+# when three subjects have news, three subjects' worth is the whole digest. A
+# day whose news is all one subject is carried whole: with nothing else present
+# there is nothing being crowded out, and trimming would only cost you facts.
+#
+# Items it removes are not lost quietly — each one is named in the day's report
+# with the reason it went, so a digest that keeps getting trimmed tells you your
+# source list has tilted towards one subject.
 #
 # sinks:
 #   local-file:     {type: file, edition: personal, params: {path: ...}}

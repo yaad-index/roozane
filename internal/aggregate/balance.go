@@ -1,10 +1,59 @@
 package aggregate
 
 import (
+	"encoding/json"
 	"fmt"
 	"math"
 	"sort"
+	"strings"
 )
+
+// parseGrouping reads the grouping pass's reply and returns it only if it is a
+// genuine partition of the n items the pass was given.
+//
+// 🚨 The validation is not defensive tidiness. A reply that left an item out
+// would remove it from the digest with no absence recorded, which is the exact
+// failure ADR-0007 exists to prevent, arriving inside the mechanism built to
+// prevent it. Rejecting the whole reply is the safe direction: an unbalanced
+// digest is what the reader gets today, while a silently shortened one is worse
+// than either.
+func parseGrouping(content string, n int) ([]subjectGroup, error) {
+	text := unfence(content)
+
+	var reply struct {
+		Subjects []struct {
+			Subject string `json:"subject"`
+			Items   []int  `json:"items"`
+		} `json:"subjects"`
+	}
+	if err := json.Unmarshal([]byte(text), &reply); err != nil {
+		return nil, fmt.Errorf("grouping pass did not return usable JSON: %w (got: %s)", err, snippet(text))
+	}
+
+	groups := make([]subjectGroup, 0, len(reply.Subjects))
+	for i, s := range reply.Subjects {
+		subject := strings.TrimSpace(s.Subject)
+		if subject == "" {
+			// A cluster with no name is still a cluster, and refusing the whole
+			// reply over a missing label would cost a correct partition for a
+			// cosmetic reason.
+			//
+			// 🚨 The placeholder is NUMBERED, and that is load-bearing rather
+			// than cosmetic. mergeSameSubject folds entries sharing a label, so
+			// giving every unlabelled cluster the same placeholder would merge
+			// clusters the pass never said were related — and merging subjects
+			// that are not one subject DROPS items, which is the expensive
+			// direction. Distinct placeholders keep them distinct.
+			subject = fmt.Sprintf("unnamed %d", i+1)
+		}
+		groups = append(groups, subjectGroup{Subject: subject, Members: s.Items})
+	}
+
+	if err := validateGrouping(groups, n); err != nil {
+		return nil, fmt.Errorf("grouping pass did not partition the %d selected items: %w", n, err)
+	}
+	return groups, nil
+}
 
 // subjectGroup is one subject and the selected items that belong to it, named
 // by their positions in the edition's selected slice.
@@ -52,6 +101,7 @@ func validateGrouping(groups []subjectGroup, n int) error {
 	}
 
 	seen := make([]bool, n)
+	dup := make([]string, n)
 	counted := 0
 	for _, group := range groups {
 		if len(group.Members) == 0 {
@@ -62,8 +112,17 @@ func validateGrouping(groups []subjectGroup, n int) error {
 				return fmt.Errorf("subject %q names item %d, which is outside the %d selected", group.Subject, index, n)
 			}
 			if seen[index] {
-				return fmt.Errorf("item %d appears in more than one subject", index)
+				// Named separately because the two say different things about
+				// the reply: twice inside one subject is a careless list, twice
+				// across subjects is a genuine contradiction about where the
+				// item belongs. Both are rejected; only one of them is a
+				// disagreement.
+				if dup[index] == group.Subject {
+					return fmt.Errorf("item %d appears twice in subject %q", index, group.Subject)
+				}
+				return fmt.Errorf("item %d appears in more than one subject: %q and %q", index, dup[index], group.Subject)
 			}
+			dup[index] = group.Subject
 			seen[index] = true
 			counted++
 		}

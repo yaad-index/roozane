@@ -52,6 +52,8 @@ func passOf(req llm.Request) string {
 		return "enrich"
 	case system == selectSystemPrompt:
 		return "select"
+	case system == groupSystemPrompt:
+		return "group"
 	case system == titleSystemPrompt:
 		return "title"
 	case strings.HasPrefix(system, digestSystemPrompt):
@@ -66,6 +68,7 @@ func passOf(req llm.Request) string {
 type stubClient struct {
 	enrich func(req llm.Request) (llm.Response, error)
 	sel    func(req llm.Request) (llm.Response, error)
+	group  func(req llm.Request) (llm.Response, error)
 	title  func(req llm.Request) (llm.Response, error)
 	digest func(req llm.Request) (llm.Response, error)
 
@@ -86,6 +89,14 @@ func (s *stubClient) Complete(_ context.Context, req llm.Request) (llm.Response,
 			return s.sel(req)
 		}
 		return llm.Response{Content: selectionJSON(true, 0.9)}, nil
+	case "group":
+		if s.group != nil {
+			return s.group(req)
+		}
+		// One subject holding everything: a valid partition that the ceiling
+		// deliberately does not act on, so a test enabling a share without
+		// caring about grouping keeps the digest it would otherwise have had.
+		return llm.Response{Content: oneSubjectJSON(itemsAskedAbout(req))}, nil
 	case "title":
 		if s.title != nil {
 			return s.title(req)
@@ -988,10 +999,10 @@ func TestDigestSchemaIsCurrent(t *testing.T) {
 	require.NoError(t, err)
 
 	_, digest := readDigest(t, root, day, config.DefaultEdition)
-	assert.Equal(t, 4, digest.Schema,
-		"the digest JSON gained a per-item translated title and a title-pass failure, "+
-			"after an unjudged count, an edition and collection outcomes; "+
-			"the version has to move with the shape")
+	assert.Equal(t, 5, digest.Schema,
+		"the digest JSON gained the reason its subject-share ceiling could not be applied, "+
+			"after a per-item translated title and a title-pass failure, an unjudged count, "+
+			"an edition and collection outcomes; the version has to move with the shape")
 }
 
 // --- the daily report (ADR-0005 §7) ---

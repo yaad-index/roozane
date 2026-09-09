@@ -45,15 +45,16 @@ import (
 // asks — so the existing schema-mismatch path starts the day fresh rather than
 // relabelling one as the other. That costs one re-enriched day, not a converter.
 //
-// DigestSchema is 4 because each item may now carry its title in the edition's
-// language alongside the publisher's original, and the digest says when that
-// rendering could not be done. Earlier it gained the count of items its edition
+// DigestSchema is 5 because the digest now says when its subject-share ceiling
+// could not be applied. Earlier it gained each item's title in the edition's
+// language alongside the publisher's original, and said when that rendering
+// could not be done. Earlier it gained the count of items its edition
 // never managed to ask about, the edition it was written for, and the collection
 // outcomes of the sources that edition drew on. All are additive, so an existing
 // reader keeps working — but a version whose shape has changed underneath it
 // tells a reader nothing, which is the whole job of carrying one.
 const (
-	DigestSchema = 4
+	DigestSchema = 5
 	stateSchema  = 2
 
 	// enrichPromptVersion is bumped whenever the enrichment prompt changes in a
@@ -221,6 +222,28 @@ type Digest struct {
 	// text belongs in the structured file where tooling reads it, and never in
 	// the markdown.
 	TitlesFailed string `json:"titles_failed,omitempty"`
+
+	// BalanceFailed carries why the subject-share ceiling could not be applied,
+	// when the edition configures one and the grouping pass did not produce a
+	// usable partition. Every item this edition selected is then below, exactly
+	// as on a day when no subject was over its share.
+	//
+	// 🚨 Those two days are the same document without this field, and they are
+	// opposite facts: one says the ceiling looked and found nothing to trim, the
+	// other says it never ran. Carrying the digest unbalanced is the right
+	// behaviour — an unbalanced digest beats no digest, and it is what the
+	// reader received before the ceiling existed — but a silent fallback deletes
+	// the only evidence that the reader's own instruction went unenforced today.
+	//
+	// ⚠️ It is the mirror of the field this pass exists to make unnecessary. A
+	// dropped item's absence is recorded per item in the report; a ceiling that
+	// never ran drops nothing, so there is no per-item record to carry it and
+	// the fact has nowhere else to live.
+	//
+	// Like TitlesFailed it carries the cause rather than a flag, on ADR-0005
+	// §8's split: error text belongs in the structured file where tooling reads
+	// it, never in the markdown.
+	BalanceFailed string `json:"balance_failed,omitempty"`
 
 	// Sources is what collection did today for the sources this edition drew
 	// on, keyed by source id (ADR-0005 §8).
@@ -400,6 +423,19 @@ type EditionResult struct {
 	// itself was written and delivered: this is a degraded edition, not a failed
 	// one, and it deliberately does not count towards the run's failures.
 	TitlesFailed bool
+
+	// BalanceFailed says this edition configures a subject share and the ceiling
+	// could not be applied, so the digest carries every selected item. Degraded
+	// in the same way and for the same reason as TitlesFailed: the reader gets
+	// the digest they used to get, and the run says the instruction went
+	// unenforced rather than letting a full digest imply a balanced one.
+	BalanceFailed bool
+
+	// Dropped counts items this edition selected and then removed to keep one
+	// subject from crowding out the others (ADR-0007). Each one is a named
+	// absence in the report; this is the total, for a run summary that would
+	// otherwise show Selected falling with no reason attached.
+	Dropped int
 
 	Usage llm.Usage
 }
@@ -626,6 +662,41 @@ func (r *Runner) runEdition(ctx context.Context, day time.Time, id string, editi
 		})
 	}
 	editionResult.Selected = len(selected)
+
+	// The balance pass runs here: after selection, which is the first point
+	// anything holds the whole selected set, and before the title pass, so a
+	// headline is never translated for an item that is about to be dropped
+	// (ADR-0007 §1).
+	var balanceFailed string
+	if share, ok := edition.SubjectShare(); ok && len(selected) > 0 {
+		kept, dropped, usage, err := r.balance(ctx, id, selected, share, ledger)
+		addUsage(&editionResult.Usage, usage)
+		switch {
+		case err != nil:
+			// The cheapest correct failure is the previous behaviour. An
+			// unbalanced digest is what this reader received before the ceiling
+			// existed; an absent one is a regression. ADR-0007 §8.
+			balanceFailed = err.Error()
+			editionResult.BalanceFailed = true
+			r.log.Error("the subject-share ceiling could not be applied; the digest carries every selected item and says so",
+				"edition", id, "error", err)
+		default:
+			for _, d := range dropped {
+				editionReport.Absent = append(editionReport.Absent, ReportAbsence{
+					Item: d.Item.Item.Filename, Source: d.Item.Item.Source, Reason: ReasonSubjectShare,
+				})
+			}
+			// ⚠️ The dropped items leave the report's selected list as well as
+			// the digest. Left in, the report would name an item as selected
+			// AND as absent, and the two lists exist precisely so a reader can
+			// account for every item exactly once.
+			editionReport.Selected = filenames(kept)
+			editionResult.Dropped = len(dropped)
+			selected = kept
+			editionResult.Selected = len(selected)
+		}
+	}
+
 	editionResult.Empty = len(selected) == 0
 	editionReport.Empty = editionResult.Empty
 
@@ -644,13 +715,14 @@ func (r *Runner) runEdition(ctx context.Context, day time.Time, id string, editi
 	}
 
 	usage, err := r.writeDigest(ctx, day, digestInput{
-		edition:      id,
-		profile:      profile,
-		language:     edition.Language,
-		selected:     selected,
-		sources:      r.editionSources(edition, collected),
-		unjudged:     editionResult.Unjudged,
-		titlesFailed: titlesFailed,
+		edition:       id,
+		profile:       profile,
+		language:      edition.Language,
+		selected:      selected,
+		sources:       r.editionSources(edition, collected),
+		unjudged:      editionResult.Unjudged,
+		titlesFailed:  titlesFailed,
+		balanceFailed: balanceFailed,
 	}, ledger)
 	addUsage(&editionResult.Usage, usage)
 	if err != nil {
@@ -838,6 +910,24 @@ func untranslatedTitlesNote(titlesFailed, language string) string {
 	return fmt.Sprintf("\nHeadlines could not be put into %s today and are shown as they were published.\n", language)
 }
 
+// unbalancedNote tells the reader that no subject was held to its share today.
+//
+// Without it the failure is invisible in exactly the case it matters: a digest
+// dominated by one subject reads the same whether the ceiling looked and found
+// nothing to trim or never ran at all. The second is the reader's own
+// instruction going unenforced, and it is the one they would want to know
+// about.
+//
+// It carries the outcome and never the error, following unjudgedNote,
+// silentSourcesNote and untranslatedTitlesNote — the error text is on the
+// digest's structured half, where tooling reads it (ADR-0005 §8).
+func unbalancedNote(balanceFailed string) string {
+	if balanceFailed == "" {
+		return ""
+	}
+	return "\nToday's items could not be sorted by subject, so no subject was held to its usual share of this digest.\n"
+}
+
 // sortedEditionIDs gives editions a stable order, so two runs over the same day
 // write the same things in the same sequence and a log is comparable.
 func sortedEditionIDs(editions map[string]config.Edition) []string {
@@ -995,6 +1085,82 @@ type digestInput struct {
 	// titlesFailed is why the title pass did not run to completion, empty when
 	// it succeeded or was never needed.
 	titlesFailed string
+
+	// balanceFailed is why the subject-share ceiling could not be applied, empty
+	// when it ran or when the edition configures no share.
+	balanceFailed string
+}
+
+// groupParseAttempts mirrors titleParseAttempts and selectParseAttempts: one
+// retry on a reply that did not parse, none on a transport error, and every
+// attempt billed.
+//
+// A retry is worth having here because the reply is checked hard — a partition
+// missing one index of thirty is rejected outright — so the most likely failure
+// is a near-miss the same request would not repeat, rather than a request the
+// model cannot answer.
+const groupParseAttempts = 2
+
+// balance groups an edition's selected items by subject and trims each subject
+// to its share, returning what survives and what it removed.
+//
+// The split between the two halves is ADR-0007 §2: the grouping is a judgement
+// and needs a model, the ceiling is arithmetic and must not. Everything after
+// the reply is parsed is deterministic and testable without a model.
+func (r *Runner) balance(ctx context.Context, edition string, selected []selectedItem, share float64, ledger *spendLedger) ([]selectedItem, []droppedItem, llm.Usage, error) {
+	groups, usage, err := r.groupBySubject(ctx, edition, selected, ledger)
+	if err != nil {
+		return nil, nil, usage, err
+	}
+	kept, dropped := applyShareCeiling(selected, groups, share)
+	return kept, dropped, usage, nil
+}
+
+// groupBySubject asks for one partition of the selected set.
+//
+// It uses the item model rather than the digest model, following the title
+// pass: both are whole-set auxiliary calls that classify rather than write, and
+// the writing model is reserved for the pass that produces prose.
+func (r *Runner) groupBySubject(ctx context.Context, edition string, selected []selectedItem, ledger *spendLedger) ([]subjectGroup, llm.Usage, error) {
+	var usage llm.Usage
+	var lastErr error
+
+	for attempt := 1; attempt <= groupParseAttempts; attempt++ {
+		started := r.now()
+		resp, err := r.client.Complete(ctx, llm.Request{
+			Model:    r.cfg.Aggregator.Models.Item,
+			Messages: buildGroupMessages(selected),
+		})
+		if err != nil {
+			return nil, usage, err
+		}
+		ledger.record(PassGroup, r.cfg.Aggregator.Models.Item,
+			resp.Usage.PromptTokens, resp.Usage.CompletionTokens, r.now().Sub(started))
+
+		// Every attempt was billed, so every attempt is added.
+		addUsage(&usage, resp.Usage)
+
+		groups, parseErr := parseGrouping(resp.Content, len(selected))
+		if parseErr == nil {
+			return groups, usage, nil
+		}
+		lastErr = parseErr
+		if attempt < groupParseAttempts {
+			r.log.Warn("the subject grouping was not usable; asking once more",
+				"edition", edition, "error", parseErr)
+		}
+	}
+
+	return nil, usage, lastErr
+}
+
+// filenames names a set of selected items, for the report's selected list.
+func filenames(selected []selectedItem) []string {
+	out := make([]string, 0, len(selected))
+	for _, s := range selected {
+		out = append(out, s.Item.Filename)
+	}
+	return out
 }
 
 // titleParseAttempts mirrors selectParseAttempts, for the reasons recorded
@@ -1111,20 +1277,22 @@ func (r *Runner) writeDigest(ctx context.Context, day time.Time, in digestInput,
 		if body == "" {
 			return usage, errors.New("digest pass returned no text")
 		}
-		markdown = fmt.Sprintf("# Digest — %s\n\n%s%s%s\n",
-			store.Day(day), body, unjudgedNote(in.unjudged), untranslatedTitlesNote(in.titlesFailed, in.language))
+		markdown = fmt.Sprintf("# Digest — %s\n\n%s%s%s%s\n",
+			store.Day(day), body, unjudgedNote(in.unjudged),
+			untranslatedTitlesNote(in.titlesFailed, in.language), unbalancedNote(in.balanceFailed))
 	}
 
 	digest := Digest{
-		Schema:       DigestSchema,
-		Day:          store.Day(day),
-		Edition:      in.edition,
-		GeneratedAt:  r.now().UTC().Format(time.RFC3339),
-		Empty:        len(in.selected) == 0,
-		Unjudged:     in.unjudged,
-		TitlesFailed: in.titlesFailed,
-		Sources:      in.sources,
-		Items:        make([]DigestItem, 0, len(in.selected)),
+		Schema:        DigestSchema,
+		Day:           store.Day(day),
+		Edition:       in.edition,
+		GeneratedAt:   r.now().UTC().Format(time.RFC3339),
+		Empty:         len(in.selected) == 0,
+		Unjudged:      in.unjudged,
+		TitlesFailed:  in.titlesFailed,
+		BalanceFailed: in.balanceFailed,
+		Sources:       in.sources,
+		Items:         make([]DigestItem, 0, len(in.selected)),
 	}
 	for _, s := range in.selected {
 		digest.Items = append(digest.Items, DigestItem{

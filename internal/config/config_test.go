@@ -1091,3 +1091,52 @@ func TestAnUnknownLanguageKeyIsRejected(t *testing.T) {
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "digest_language")
 }
+
+func TestEditionSubjectShareOmittedVersusSet(t *testing.T) {
+	cfg, err := Load(write(t, configWith(`
+editions:
+  unbalanced: {}
+  balanced: {subject_share: 0.25}
+`)))
+	require.NoError(t, err)
+
+	// 🚨 Absent and zero must not be the same answer. A caller reading a bare
+	// float would take an edition that never configured a ceiling for one
+	// configured with the tightest possible ceiling — the opposite outcome, and
+	// silent.
+	_, ok := cfg.Editions["unbalanced"].SubjectShare()
+	assert.False(t, ok, "an omitted share runs no balance pass at all")
+
+	share, ok := cfg.Editions["balanced"].SubjectShare()
+	require.True(t, ok)
+	assert.InDelta(t, 0.25, share, 0.0001)
+}
+
+// TestEditionRejectsAShareOutsideAFraction keeps a wrong number a load error
+// rather than a silent no-op.
+//
+// ⚠️ Clamping is the tempting alternative and it is the dangerous one: a
+// clamped 25 runs as a ceiling of 1.0, which is no ceiling, and the digest it
+// produces is indistinguishable from a correctly configured edition's. The
+// misconfiguration would then be invisible in exactly the artifact someone
+// would check.
+func TestEditionRejectsAShareOutsideAFraction(t *testing.T) {
+	for name, body := range map[string]string{
+		"a percentage rather than a fraction": "\neditions:\n  personal: {subject_share: 25}\n",
+		"above one":                           "\neditions:\n  personal: {subject_share: 1.5}\n",
+		"zero":                                "\neditions:\n  personal: {subject_share: 0}\n",
+		"negative":                            "\neditions:\n  personal: {subject_share: -0.25}\n",
+	} {
+		t.Run(name, func(t *testing.T) {
+			_, err := Load(write(t, configWith(body)))
+			require.Error(t, err)
+			assert.Contains(t, err.Error(), `edition "personal": subject_share is`)
+			assert.Contains(t, err.Error(), "must be greater than 0 and at most 1")
+		})
+	}
+
+	t.Run("a whole share is legal and means no subject is ever trimmed", func(t *testing.T) {
+		_, err := Load(write(t, configWith("\neditions:\n  personal: {subject_share: 1}\n")))
+		require.NoError(t, err)
+	})
+}
