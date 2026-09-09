@@ -222,6 +222,38 @@ sources:
 #   chat:           {type: telegram, edition: personal, params: {...}}
 #   newsletter:     {command: [/usr/local/bin/mailer], edition: boardgames}
 #   telemetry:      {type: file, report: true, params: {path: exports/report-{day}.md}}
+#
+# An external sink is just a command. It is handed a JSON envelope on stdin and
+# its exit code is the whole success signal — several sinks may carry the same
+# edition, so an extra one is additive rather than a replacement:
+#
+#   sinks:
+#     chat:
+#       type: telegram
+#       edition: personal
+#       params: {chat_id: "...", token_env: TELEGRAM_BOT_TOKEN}
+#     spoken:
+#       command: [/usr/local/bin/read-aloud]
+#       edition: personal
+#       params: {voice: calm}
+#
+# The envelope it receives:
+#
+#   {"contract": 1,
+#    "sink": "spoken",
+#    "params": {"voice": "calm"},
+#    "digest": {"schema": 5, "day": "2026-09-04", "edition": "personal", "items": []},
+#    "markdown": "# Digest — 2026-09-04\n\n- One occurrence, reported by two outlets.\n"}
+#
+# 🚨 RENDER `markdown`. It is the digest as written, and the only place where
+# several reports of one event have been merged into a single entry. `digest.items[]`
+# is one entry per ARTICLE, before that merge and before the length and subject
+# share were applied — it is there for tooling that wants the data.
+#
+# A sink that renders items[] repeats itself: four articles about one occurrence
+# become four lines the reader reads as four events, and nothing errors. If your
+# plugin also trims the list, it is imposing a second limit on top of the one you
+# configured above.
 
 # Where the digest goes. Optional: with no sinks each edition's digest is still
 # written under <data_root>/digests/<edition-id>/, which is a complete pipeline

@@ -283,3 +283,90 @@ func TestExecSinkOmitsTheProseWhenThereIsNone(t *testing.T) {
 	assert.NotContains(t, fields, "markdown")
 	assert.Contains(t, fields, "digest", "the structured half is always present, even as null")
 }
+
+// TestTheDocumentedEnvelopeMatchesTheOneSent compares the shipped example's
+// envelope against the one actually marshalled, in BOTH directions.
+//
+// ⚠️ One direction is not enough, and the missing half causes the same harm as the
+// one it catches. "Every field sent appears in the example" catches a rename, since
+// the new name will be missing. It says nothing about a field the example documents
+// and the engine no longer sends — and an author coding against a key that never
+// arrives gets the failure in their program, not in this repository's tests.
+//
+// A commented-out example is parsed by nothing, so it drifts silently in either
+// direction. Extracting and unmarshalling it here also checks it is well-formed
+// JSON, which no other test does.
+func TestTheDocumentedEnvelopeMatchesTheOneSent(t *testing.T) {
+	payload, err := json.Marshal(envelope{
+		Contract: contractVersion,
+		Sink:     "spoken",
+		Params:   map[string]any{"voice": "calm"},
+		Digest:   json.RawMessage(`{"schema":1}`),
+		Markdown: "# Digest\n",
+	})
+	require.NoError(t, err)
+
+	var sent map[string]json.RawMessage
+	require.NoError(t, json.Unmarshal(payload, &sent))
+
+	raw, err := os.ReadFile(filepath.Join("..", "..", "config.example.yaml"))
+	require.NoError(t, err)
+	documented := documentedEnvelope(t, string(raw))
+
+	for field := range sent {
+		assert.Contains(t, documented, field,
+			"the shipped example documents every field a plugin receives")
+	}
+	for field := range documented {
+		assert.Contains(t, sent, field,
+			"the example documents no field the engine has stopped sending")
+	}
+
+	// And the one that decides whether a reader gets a digest or a list is named
+	// as such rather than merely listed.
+	assert.Contains(t, string(raw), "RENDER `markdown`")
+}
+
+// documentedEnvelope lifts the SINK envelope out of the commented block in
+// config.example.yaml and parses it, so the comparison above is against what the
+// file actually says rather than against a substring search.
+//
+// ⚠️ It looks for the block carrying a "sink" key rather than the first block that
+// starts with "contract". The example documents a collector envelope too, and that
+// one starts identically — the first attempt at this test picked it up and failed
+// on its placeholders, which is a decent illustration of why a doc nothing parses
+// drifts: two payloads with the same opening, and only one of them is this one.
+func documentedEnvelope(t *testing.T, example string) map[string]json.RawMessage {
+	t.Helper()
+
+	lines := strings.Split(example, "\n")
+	uncomment := func(line string) string {
+		return strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(line), "#"))
+	}
+
+	for i, line := range lines {
+		if !strings.HasPrefix(uncomment(line), `{"contract"`) {
+			continue
+		}
+		var block []string
+		for _, rest := range lines[i:] {
+			text := uncomment(rest)
+			block = append(block, text)
+			if strings.HasSuffix(text, "}") && len(block) > 1 {
+				break
+			}
+		}
+
+		var documented map[string]json.RawMessage
+		if err := json.Unmarshal([]byte(strings.Join(block, "\n")), &documented); err != nil {
+			continue
+		}
+		if _, isSink := documented["sink"]; isSink {
+			return documented
+		}
+	}
+
+	require.FailNow(t, "config.example.yaml shows no parseable sink envelope",
+		"an example a plugin author would copy has to be valid JSON, or it is a doc nothing can check")
+	return nil
+}

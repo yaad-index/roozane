@@ -56,6 +56,27 @@ Collectors and sinks are **exec-pluggable** ([ADR-0003](docs/adr/0003-plugin-con
 external program in any language can extend the edges over stdin/stdout, while the engine alone
 owns the on-disk layout and its invariants ([ADR-0002](docs/adr/0002-on-disk-layout.md)).
 
+### Writing a sink: render `markdown`, not `items[]`
+
+A sink plugin receives a JSON envelope on stdin carrying two views of the same day, and **which one
+it renders decides whether the reader gets a digest or a list**:
+
+- **`markdown` is the digest the reader should see.** It is what the writing pass produced, and the
+  only place where several reports of one event have been merged into a single entry.
+- **`digest.items[]` is the structured record**: one entry per *article*, before that merge, with
+  scores, tags and reasons attached. It is there for tooling that wants the data — filtering,
+  archiving, counting.
+
+🚨 **A sink that renders `items[]` will repeat itself.** Four articles about one occurrence are four
+items and one entry, so a reader gets the same event four times and the digest's own merge never
+reaches them. Nothing errors and nothing looks wrong from the engine's side, which is why it is
+written here rather than left to be discovered: this exact mistake is what
+[ADR-0008](docs/adr/0008-fill-and-delivery.md) exists to prevent.
+
+The same holds for length. `items[]` carries every item the edition selected; `markdown` carries
+what survived the digest's configured length and subject share. A sink that trims `items[]` itself
+is imposing a second, different limit on top of the one the reader configured.
+
 ## Status
 
 Early. The design ADRs are in [`docs/adr/`](docs/adr/); the layers are being built. See the issue
