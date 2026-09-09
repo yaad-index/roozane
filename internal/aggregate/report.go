@@ -58,6 +58,15 @@ const (
 // they are indistinguishable once written to the same string. Recording an
 // unjudged item as "not selected by this edition's profile" would be a false
 // statement in the one artifact whose job is to explain the day.
+// 🚨 ReasonDigestFull and ReasonSubjectShare are likewise distinct from each other
+// (ADR-0008 §6), and this is the pair most likely to be folded by someone tidying:
+// both mean "selected but not carried", and to a reader of the digest they look
+// identical. They answer different questions. A rising share count says this
+// reader's source list has tilted towards one subject, which is about the
+// configuration; a rising full count says there was more news than the configured
+// length admits, which is about the length. The same string for both answers
+// neither, and a short digest becomes unexplainable rather than explained.
+//
 // 🚨 ReasonSubjectShare is likewise distinct from ReasonNotSelected, and the
 // distinction carries a diagnosis nothing else in the report offers. "Not
 // selected" says the profile was applied and said no. This one says the profile
@@ -72,6 +81,7 @@ const (
 	ReasonNotSelected  = "not selected by this edition's profile"
 	ReasonSelectFailed = "the selection call failed, so this item was never judged"
 	ReasonSubjectShare = "selected, then crowded out by its own subject's share of the digest"
+	ReasonDigestFull   = "selected, then left out because the digest reached its length"
 )
 
 // PassSpend is one pass's spend on one model, for this run.

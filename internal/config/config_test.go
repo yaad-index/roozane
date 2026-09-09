@@ -1140,3 +1140,33 @@ func TestEditionRejectsAShareOutsideAFraction(t *testing.T) {
 		require.NoError(t, err)
 	})
 }
+
+func TestEditionDigestLengthOmittedVersusSet(t *testing.T) {
+	cfg, err := Load(write(t, configWith(`
+editions:
+  unbounded: {}
+  bounded: {max_entries: 8}
+`)))
+	require.NoError(t, err)
+
+	_, ok := cfg.Editions["unbounded"].DigestLength()
+	assert.False(t, ok, "an omitted length leaves the digest as long as the day's news")
+
+	n, ok := cfg.Editions["bounded"].DigestLength()
+	require.True(t, ok)
+	assert.Equal(t, 8, n)
+}
+
+func TestEditionRejectsALengthBelowOne(t *testing.T) {
+	for name, body := range map[string]string{
+		"zero":     "\neditions:\n  personal: {max_entries: 0}\n",
+		"negative": "\neditions:\n  personal: {max_entries: -3}\n",
+	} {
+		t.Run(name, func(t *testing.T) {
+			_, err := Load(write(t, configWith(body)))
+			require.Error(t, err)
+			assert.Contains(t, err.Error(), `edition "personal": max_entries is`)
+			assert.Contains(t, err.Error(), "must be at least 1")
+		})
+	}
+}

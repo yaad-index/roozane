@@ -35,9 +35,10 @@ collectors ─► days/<utc-day>/items/*.md ─► enrich ─► select ─► d
    recording a neutral summary, tags and a generic "is this substantive at all" score. Then it
    **selects per edition**: each audience narrows the shared pool by its own source list and its own
    relevance profile, and gets its own digest in its own voice. Suppression is the default. An
-   edition may also cap how much of its digest any one subject takes
-   ([ADR-0007](docs/adr/0007-subject-share.md)); the cap only ever shortens a digest, and every item
-   it removes is named in the report with the reason it went.
+   edition may also cap how much of its digest any one subject takes and how many entries it carries
+   ([ADR-0007](docs/adr/0007-subject-share.md), [ADR-0008](docs/adr/0008-fill-and-delivery.md)).
+   Entries are filled one subject at a time rather than filtered in sequence, the digest only ever
+   gets shorter, and every item left out is named in the report with which limit took it.
 3. **Editions** are how one deployment serves several audiences from one pool of items — a public
    newsletter alongside a private brief. The same item may legitimately appear in both, and with no
    audience in the per-item record there is no private reasoning that could leak into a public

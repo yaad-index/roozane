@@ -40,6 +40,7 @@ func TestExecSinkSendsTheContractEnvelope(t *testing.T) {
 		Contract int            `json:"contract"`
 		Sink     string         `json:"sink"`
 		Params   map[string]any `json:"params"`
+		Markdown string         `json:"markdown"`
 		Digest   struct {
 			Schema int  `json:"schema"`
 			Empty  bool `json:"empty"`
@@ -60,6 +61,16 @@ func TestExecSinkSendsTheContractEnvelope(t *testing.T) {
 	assert.False(t, envelope.Digest.Empty)
 	require.Len(t, envelope.Digest.Items, 1)
 	assert.Equal(t, "a-source", envelope.Digest.Items[0].Source)
+
+	// ⚠️ Asserted on the full path rather than only on a hand-built Digest. A test
+	// that constructs the struct proves the envelope forwards what it is handed,
+	// not that anything hands it a value — a field that ships empty in production
+	// while every test passes is the written-file-is-not-a-delivery shape. This
+	// runs the real path: the prose is read off disk by the runner and arrives at
+	// the plugin.
+	assert.Contains(t, envelope.Markdown, "A point worth reading.",
+		"the prose reaches the plugin from the file on disk, not only from a constructed struct")
+	assert.Contains(t, envelope.Markdown, "# Digest — ")
 }
 
 func TestExecSinkExitCodeIsTheSuccessSignal(t *testing.T) {

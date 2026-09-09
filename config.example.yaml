@@ -185,6 +185,7 @@ sources:
 #   personal:
 #     profile: profile.md
 #     subject_share: 0.25
+#     max_entries: 8
 #   boardgames:
 #     sources: [example-feed]
 #     profile: boardgames.md
@@ -199,9 +200,22 @@ sources:
 # day whose news is all one subject is carried whole: with nothing else present
 # there is nothing being crowded out, and trimming would only cost you facts.
 #
-# Items it removes are not lost quietly — each one is named in the day's report
-# with the reason it went, so a digest that keeps getting trimmed tells you your
-# source list has tilted towards one subject.
+# `max_entries` is the most entries a digest may carry. Also optional with no
+# default. When both are set the share is measured against THIS number rather than
+# against everything selected — a quarter is meant to be a quarter of what you
+# read, not of an intermediate set you never see.
+#
+# ⚠️ The digest can come SHORT of max_entries and that is correct. Entries are
+# filled one subject at a time, so no subject takes a slot while another is still
+# waiting for one, and when every subject has reached its share the digest simply
+# ends. Concretely: at a quarter and eight entries each subject may hold two, so a
+# day carrying three subjects gives you six. Nothing is added to make up a length.
+#
+# Items removed by either setting are not lost quietly — each one is named in the
+# day's report, and the two reasons are kept apart on purpose. "Crowded out by its
+# own subject" says your source list has tilted; "the digest reached its length"
+# says there was more news than you asked to receive. A short digest is otherwise
+# indistinguishable from a quiet day.
 #
 # sinks:
 #   local-file:     {type: file, edition: personal, params: {path: ...}}

@@ -2,6 +2,7 @@ package aggregate
 
 import (
 	"context"
+	"fmt"
 	"strconv"
 	"strings"
 	"testing"
@@ -14,6 +15,13 @@ import (
 	"github.com/yaad-index/roozane/internal/llm"
 	"github.com/yaad-index/roozane/internal/store"
 )
+
+// share is a pointer helper: the fill distinguishes an absent share from a
+// configured one, and a bare literal cannot express the difference.
+func share(v float64) *float64 { return &v }
+
+// entries is the same for the digest length.
+func entries(n int) *int { return &n }
 
 // item builds one selected item with the three fields the ceiling orders by.
 func item(filename string, score, salience float64) selectedItem {
@@ -79,7 +87,7 @@ func TestCeilingDoesNotRecomputeItsOwnAllowance(t *testing.T) {
 		{Subject: "another", Members: []int{6, 7}},
 	}
 
-	kept, dropped := applyShareCeiling(selected, groups, 0.25)
+	kept, dropped := fillDigest(selected, groups, share(0.25), nil)
 
 	assert.Equal(t, []string{"a1.md", "a2.md", "b1.md", "b2.md"}, names(kept))
 	assert.Equal(t, []string{"a3.md", "a4.md", "a5.md", "a6.md"}, droppedNames(dropped))
@@ -105,7 +113,7 @@ func TestSingleSubjectDayDropsNothing(t *testing.T) {
 	}
 	groups := []subjectGroup{{Subject: "one field", Members: []int{0, 1, 2, 3, 4, 5}}}
 
-	kept, dropped := applyShareCeiling(selected, groups, 0.25)
+	kept, dropped := fillDigest(selected, groups, share(0.25), nil)
 
 	assert.Equal(t, names(selected), names(kept), "a single-subject day is carried whole")
 	assert.Empty(t, dropped)
@@ -123,7 +131,7 @@ func TestSubjectIsNeverErased(t *testing.T) {
 		{Subject: "c", Members: []int{2}},
 	}
 
-	kept, dropped := applyShareCeiling(selected, groups, 0.25)
+	kept, dropped := fillDigest(selected, groups, share(0.25), nil)
 
 	assert.Equal(t, []string{"a1.md", "b1.md", "c1.md"}, names(kept),
 		"floor(0.25*3) is zero; without the floor every subject would lose its only item")
@@ -144,7 +152,7 @@ func TestSurvivorsAreTheStrongestMatches(t *testing.T) {
 			{Subject: "b", Members: []int{2, 3}},
 		}
 
-		kept, dropped := applyShareCeiling(selected, groups, 0.25)
+		kept, dropped := fillDigest(selected, groups, share(0.25), nil)
 
 		// Allowance is one: the higher score survives even though the loser
 		// carries the more substantive item.
@@ -167,7 +175,7 @@ func TestSurvivorsAreTheStrongestMatches(t *testing.T) {
 			{Subject: "b", Members: []int{2, 3}},
 		}
 
-		kept, _ := applyShareCeiling(selected, groups, 0.25)
+		kept, _ := fillDigest(selected, groups, share(0.25), nil)
 		assert.Contains(t, names(kept), "zzz-dense.md")
 		assert.NotContains(t, names(kept), "aaa-thin.md")
 	})
@@ -182,7 +190,7 @@ func TestSurvivorsAreTheStrongestMatches(t *testing.T) {
 			{Subject: "b", Members: []int{2, 3}},
 		}
 
-		kept, _ := applyShareCeiling(selected, groups, 0.25)
+		kept, _ := fillDigest(selected, groups, share(0.25), nil)
 		assert.Contains(t, names(kept), "aaa.md")
 		assert.NotContains(t, names(kept), "zzz.md")
 	})
@@ -206,8 +214,8 @@ func TestCeilingIsIndifferentToMemberOrder(t *testing.T) {
 		{Subject: "a", Members: []int{2, 1, 0}},
 	}
 
-	first, _ := applyShareCeiling(selected, forward, 0.25)
-	second, _ := applyShareCeiling(selected, reversed, 0.25)
+	first, _ := fillDigest(selected, forward, share(0.25), nil)
+	second, _ := fillDigest(selected, reversed, share(0.25), nil)
 
 	assert.Equal(t, names(first), names(second))
 	// Every field the ordering reads is equal here, so only the filename
@@ -227,7 +235,7 @@ func TestKeptItemsHoldTheirOriginalOrder(t *testing.T) {
 		{Subject: "b", Members: []int{0, 2}},
 	}
 
-	kept, _ := applyShareCeiling(selected, groups, 0.25)
+	kept, _ := fillDigest(selected, groups, share(0.25), nil)
 
 	// One from each subject, and they come back interleaved as they arrived
 	// rather than gathered by subject.
@@ -246,7 +254,7 @@ func TestDroppedItemsCarryTheirSubject(t *testing.T) {
 		{Subject: "civic data", Members: []int{3}},
 	}
 
-	_, dropped := applyShareCeiling(selected, groups, 0.25)
+	_, dropped := fillDigest(selected, groups, share(0.25), nil)
 
 	require.Len(t, dropped, 2)
 	for _, d := range dropped {
@@ -335,8 +343,8 @@ func TestEntriesSharingALabelDrawOneAllowance(t *testing.T) {
 		{Subject: "a third", Members: []int{6, 7}},
 	}
 
-	fromSplit, droppedFromSplit := applyShareCeiling(selected, split, 0.25)
-	fromWhole, _ := applyShareCeiling(selected, whole, 0.25)
+	fromSplit, droppedFromSplit := fillDigest(selected, split, share(0.25), nil)
+	fromWhole, _ := fillDigest(selected, whole, share(0.25), nil)
 
 	assert.Equal(t, names(fromWhole), names(fromSplit),
 		"a subject returned as two entries is the same subject and gets one allowance")
@@ -357,7 +365,7 @@ func TestMergingCanLeaveASingleSubject(t *testing.T) {
 		{Subject: "one field", Members: []int{2, 3}},
 	}
 
-	kept, dropped := applyShareCeiling(selected, groups, 0.25)
+	kept, dropped := fillDigest(selected, groups, share(0.25), nil)
 
 	assert.Equal(t, names(selected), names(kept))
 	assert.Empty(t, dropped, "everything is one subject once the entries are folded")
@@ -377,7 +385,7 @@ func TestUnlabelledEntriesNeverMerge(t *testing.T) {
 		{Subject: "", Members: []int{2, 3}},
 	}
 
-	kept, dropped := applyShareCeiling(selected, groups, 0.25)
+	kept, dropped := fillDigest(selected, groups, share(0.25), nil)
 
 	assert.Equal(t, []string{"a1.md", "b1.md"}, names(kept),
 		"two unlabelled clusters stay two subjects, each with its own allowance")
@@ -482,7 +490,7 @@ func TestParseGroupingReadsAPartition(t *testing.T) {
 		// rather than through the labels: two unlabelled clusters keep their own
 		// allowances.
 		selected := []selectedItem{item("a.md", 0.9, 0.5), item("b.md", 0.8, 0.5)}
-		kept, dropped := applyShareCeiling(selected, groups, 0.25)
+		kept, dropped := fillDigest(selected, groups, share(0.25), nil)
 		assert.Equal(t, []string{"a.md", "b.md"}, names(kept))
 		assert.Empty(t, dropped)
 	})
@@ -731,4 +739,214 @@ func TestTitlesAreOnlyPaidForWhatSurvives(t *testing.T) {
 
 	_, digest := readDigest(t, root, day, config.DefaultEdition)
 	assert.Len(t, digest.Items, 2)
+}
+
+// --- the digest length, and its interaction with the share (ADR-0008) ---
+
+// TestTheShareIsMeasuredAgainstTheTargetNotTheSelectedSet is the property the
+// whole decision turns on, and the fixture is built so the two rules give
+// DIFFERENT answers rather than agreeing by luck.
+//
+// Twenty selected items across two subjects, a quarter, a target of eight:
+//
+//   - against the target (correct): allowance = floor(0.25 × 8) = 2, so each
+//     subject keeps two and the digest is FOUR.
+//   - against the selected set (the weaker rule): allowance = floor(0.25 × 20) = 5,
+//     the fill runs to the target, and the digest is EIGHT.
+//
+// ⚠️ "No subject over about a quarter" was always a statement about the digest in
+// front of the reader, not about an intermediate set he never sees. Measured
+// against the selected set it is a far weaker rule than the one he asked for, and
+// it was invisible for as long as the length lived in a different program.
+func TestTheShareIsMeasuredAgainstTheTargetNotTheSelectedSet(t *testing.T) {
+	var selected []selectedItem
+	var a, b []int
+	for i := 0; i < 20; i++ {
+		selected = append(selected, item(fmt.Sprintf("i%02d.md", i), 1.0-float64(i)/100, 0.5))
+		if i%2 == 0 {
+			a = append(a, i)
+		} else {
+			b = append(b, i)
+		}
+	}
+	groups := []subjectGroup{{Subject: "a", Members: a}, {Subject: "b", Members: b}}
+
+	kept, dropped := fillDigest(selected, groups, share(0.25), entries(8))
+
+	assert.Len(t, kept, 4, "two subjects at an allowance of two, not eight items at an allowance of five")
+	assert.Equal(t, 2, shareAllowance(8, 0.25), "the allowance comes from the target")
+	assert.Equal(t, 5, shareAllowance(len(selected), 0.25), "and would be this against the selected set")
+	assert.Len(t, dropped, 16)
+}
+
+// TestATargetAloneShortensWithoutBalancing covers a length with no share: nothing
+// bounds a subject except the length itself.
+func TestATargetAloneShortensWithoutBalancing(t *testing.T) {
+	selected := []selectedItem{
+		item("a1.md", 0.9, 0.5), item("a2.md", 0.8, 0.5), item("a3.md", 0.7, 0.5),
+		item("a4.md", 0.6, 0.5), item("a5.md", 0.5, 0.5),
+	}
+	groups := []subjectGroup{{Subject: "one field", Members: []int{0, 1, 2, 3, 4}}}
+
+	kept, dropped := fillDigest(selected, groups, nil, entries(3))
+
+	assert.Equal(t, []string{"a1.md", "a2.md", "a3.md"}, names(kept),
+		"a one-subject day is carried, shortened to the target")
+	require.Len(t, dropped, 2)
+	for _, d := range dropped {
+		assert.False(t, d.LostToSubject, "nothing here lost its place to a subject's share")
+	}
+}
+
+// TestTheFillNeverLetsOneSubjectTakeASlotAnotherIsWaitingFor is the round-robin
+// property, and it is what removes the ordering trap.
+//
+// ⚠️ Sequencing would fail here in either direction. Take the strongest four first
+// and they are all one subject; apply a share afterwards and the digest collapses.
+// Balance first and then take the strongest four, and the length undoes the balance.
+func TestTheFillNeverLetsOneSubjectTakeASlotAnotherIsWaitingFor(t *testing.T) {
+	selected := []selectedItem{
+		item("strong1.md", 0.99, 0.5), item("strong2.md", 0.98, 0.5),
+		item("strong3.md", 0.97, 0.5), item("strong4.md", 0.96, 0.5),
+		item("weak1.md", 0.10, 0.5), item("weak2.md", 0.09, 0.5),
+	}
+	groups := []subjectGroup{
+		{Subject: "the loud one", Members: []int{0, 1, 2, 3}},
+		{Subject: "the quiet one", Members: []int{4, 5}},
+	}
+
+	kept, _ := fillDigest(selected, groups, nil, entries(4))
+
+	// Two apiece, even though every item of the first subject outscores both of
+	// the second's. Taking the strongest four would have given a single-subject
+	// digest of exactly the kind the reader complained about.
+	assert.Equal(t, []string{"strong1.md", "strong2.md", "weak1.md", "weak2.md"}, names(kept))
+}
+
+// TestTheFillComesUpShortRatherThanPadding is ADR-0008 §4, and the arithmetic
+// yaad's review asked to have visible: the reachable length is
+// min(target, subjects × allowance), so a day with few subjects cannot fill the
+// target however much news it carries.
+func TestTheFillComesUpShortRatherThanPadding(t *testing.T) {
+	var selected []selectedItem
+	var a, b, c []int
+	for i := 0; i < 12; i++ {
+		selected = append(selected, item(fmt.Sprintf("i%02d.md", i), 1.0-float64(i)/100, 0.5))
+		switch i % 3 {
+		case 0:
+			a = append(a, i)
+		case 1:
+			b = append(b, i)
+		default:
+			c = append(c, i)
+		}
+	}
+	groups := []subjectGroup{
+		{Subject: "a", Members: a}, {Subject: "b", Members: b}, {Subject: "c", Members: c},
+	}
+
+	kept, _ := fillDigest(selected, groups, share(0.25), entries(8))
+
+	// Three subjects × an allowance of two = six, short of the target of eight,
+	// with four items still available. Nothing is taken to make up the difference.
+	assert.Len(t, kept, 6)
+	assert.Equal(t, 2, shareAllowance(8, 0.25))
+}
+
+// TestADroppedItemSaysWHICHLimitTookIt is ADR-0008 §6. The two reasons look
+// identical to a reader of the digest and answer different questions: one is about
+// the source list, the other about the configured length.
+//
+// Two subjects of three, a target of three, a share giving an allowance of two.
+// The fill takes a1, b1, then a2 and stops on the length. So a3 was crowded out by
+// its OWN subject reaching two, while b2 and b3 lost their place to the length with
+// their subject still one short of its allowance.
+func TestADroppedItemSaysWHICHLimitTookIt(t *testing.T) {
+	selected := []selectedItem{
+		item("a1.md", 0.9, 0.5), item("a2.md", 0.8, 0.5), item("a3.md", 0.7, 0.5),
+		item("b1.md", 0.6, 0.5), item("b2.md", 0.5, 0.5), item("b3.md", 0.4, 0.5),
+	}
+	groups := []subjectGroup{
+		{Subject: "a", Members: []int{0, 1, 2}},
+		{Subject: "b", Members: []int{3, 4, 5}},
+	}
+
+	kept, dropped := fillDigest(selected, groups, share(0.7), entries(3))
+	require.Equal(t, []string{"a1.md", "a2.md", "b1.md"}, names(kept))
+	assert.Equal(t, 2, shareAllowance(3, 0.7))
+
+	byName := map[string]droppedItem{}
+	for _, d := range dropped {
+		byName[d.Item.Item.Filename] = d
+	}
+	require.Contains(t, byName, "a3.md")
+	assert.True(t, byName["a3.md"].LostToSubject, "a3 lost its place to its own subject's share")
+	require.Contains(t, byName, "b2.md")
+	assert.False(t, byName["b2.md"].LostToSubject,
+		"b's subject never reached its allowance — the digest simply filled up, which is a different fact")
+}
+
+// TestTheFillWithNoTargetIsExactlyTheOldCeiling states the compatibility property
+// as an assertion rather than leaving it to be inferred: an edition that configures
+// a share and no length behaves exactly as it did under ADR-0007.
+func TestTheFillWithNoTargetIsExactlyTheOldCeiling(t *testing.T) {
+	selected := []selectedItem{
+		item("a1.md", 0.9, 0.5), item("a2.md", 0.8, 0.5), item("a3.md", 0.7, 0.5),
+		item("a4.md", 0.6, 0.5), item("a5.md", 0.5, 0.5), item("a6.md", 0.4, 0.5),
+		item("b1.md", 0.3, 0.5), item("b2.md", 0.2, 0.5),
+	}
+	groups := []subjectGroup{
+		{Subject: "one field", Members: []int{0, 1, 2, 3, 4, 5}},
+		{Subject: "another", Members: []int{6, 7}},
+	}
+
+	kept, dropped := fillDigest(selected, groups, share(0.25), nil)
+
+	assert.Equal(t, []string{"a1.md", "a2.md", "b1.md", "b2.md"}, names(kept))
+	assert.Len(t, dropped, 4)
+}
+
+// TestSubjectsAreFilledStrongestFirst pins the order the round robin visits
+// subjects in, which decides who gets the last slot when the length runs out.
+func TestSubjectsAreFilledStrongestFirst(t *testing.T) {
+	selected := []selectedItem{
+		item("weak.md", 0.10, 0.5),
+		item("strong.md", 0.90, 0.5),
+		item("middling.md", 0.50, 0.5),
+	}
+	groups := []subjectGroup{
+		{Subject: "third", Members: []int{0}},
+		{Subject: "first", Members: []int{1}},
+		{Subject: "second", Members: []int{2}},
+	}
+
+	kept, _ := fillDigest(selected, groups, nil, entries(2))
+	assert.Equal(t, []string{"strong.md", "middling.md"}, names(kept),
+		"the two strongest subjects get the slots, in that order")
+}
+
+// TestSubjectOrderFallsBackToTheLabel reaches the comparison that decides between
+// two subjects whose strongest items are indistinguishable.
+//
+// ⚠️ It needs two items sharing a filename, which the pipeline never produces —
+// item identity is unique within a day. That is the point: strongerMatch ends in a
+// filename comparison, so through the real pipeline this branch is UNREACHABLE and
+// the ordering is correct because of a property of a different function. This test
+// exists so the branch is exercised by something, and so that weakening
+// strongerMatch does not silently activate untested code.
+func TestSubjectOrderFallsBackToTheLabel(t *testing.T) {
+	selected := []selectedItem{
+		item("same.md", 0.5, 0.5), item("same.md", 0.5, 0.5), item("same.md", 0.5, 0.5),
+	}
+	groups := []subjectGroup{
+		{Subject: "charlie", Members: []int{0}},
+		{Subject: "alpha", Members: []int{1}},
+		{Subject: "bravo", Members: []int{2}},
+	}
+
+	kept, dropped := fillDigest(selected, groups, nil, entries(2))
+	require.Len(t, kept, 2)
+	require.Len(t, dropped, 1)
+	assert.Equal(t, "charlie", dropped[0].Subject,
+		"with nothing to choose between the items, the labels order the subjects")
 }

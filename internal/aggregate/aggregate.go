@@ -668,8 +668,8 @@ func (r *Runner) runEdition(ctx context.Context, day time.Time, id string, editi
 	// headline is never translated for an item that is about to be dropped
 	// (ADR-0007 §1).
 	var balanceFailed string
-	if share, ok := edition.SubjectShare(); ok && len(selected) > 0 {
-		kept, dropped, usage, err := r.balance(ctx, id, selected, share, ledger)
+	if share, target := edition.Share, edition.MaxEntries; (share != nil || target != nil) && len(selected) > 0 {
+		kept, dropped, usage, err := r.balance(ctx, id, selected, share, target, ledger)
 		addUsage(&editionResult.Usage, usage)
 		switch {
 		case err != nil:
@@ -682,8 +682,16 @@ func (r *Runner) runEdition(ctx context.Context, day time.Time, id string, editi
 				"edition", id, "error", err)
 		default:
 			for _, d := range dropped {
+				// Two reasons, never one. See the doctrine on ReasonDigestFull:
+				// "its subject was full" and "the digest was full" look identical
+				// to a reader of the digest and answer different questions about
+				// the configuration.
+				reason := ReasonDigestFull
+				if d.LostToSubject {
+					reason = ReasonSubjectShare
+				}
 				editionReport.Absent = append(editionReport.Absent, ReportAbsence{
-					Item: d.Item.Item.Filename, Source: d.Item.Item.Source, Reason: ReasonSubjectShare,
+					Item: d.Item.Item.Filename, Source: d.Item.Item.Source, Reason: reason,
 				})
 			}
 			// ⚠️ The dropped items leave the report's selected list as well as
@@ -1107,12 +1115,12 @@ const groupParseAttempts = 2
 // The split between the two halves is ADR-0007 §2: the grouping is a judgement
 // and needs a model, the ceiling is arithmetic and must not. Everything after
 // the reply is parsed is deterministic and testable without a model.
-func (r *Runner) balance(ctx context.Context, edition string, selected []selectedItem, share float64, ledger *spendLedger) ([]selectedItem, []droppedItem, llm.Usage, error) {
+func (r *Runner) balance(ctx context.Context, edition string, selected []selectedItem, share *float64, target *int, ledger *spendLedger) ([]selectedItem, []droppedItem, llm.Usage, error) {
 	groups, usage, err := r.groupBySubject(ctx, edition, selected, ledger)
 	if err != nil {
 		return nil, nil, usage, err
 	}
-	kept, dropped := applyShareCeiling(selected, groups, share)
+	kept, dropped := fillDigest(selected, groups, share, target)
 	return kept, dropped, usage, nil
 }
 

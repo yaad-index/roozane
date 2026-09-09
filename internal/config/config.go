@@ -224,6 +224,18 @@ type Edition struct {
 	// configuration and settles only the mechanism, and a shipped default would
 	// quietly change what every existing edition produces.
 	Share *float64 `yaml:"subject_share"`
+
+	// MaxEntries is the most entries this edition's digest may carry (ADR-0008
+	// §1). Optional, no default, and a pointer for the same reason Share is: an
+	// edition that omits it is written exactly as it was before the setting
+	// existed.
+	//
+	// ⚠️ It is a ceiling the fill can come SHORT of, and doing so is correct. When
+	// every subject has reached its allowance the digest is shorter than this
+	// number however much news there was — see Edition.SubjectShare and ADR-0008
+	// §4. The ADR calls it the target length; the config names it for what it
+	// guarantees rather than for what it aims at.
+	MaxEntries *int `yaml:"max_entries"`
 }
 
 // SubjectShare is this edition's configured share and whether it has one.
@@ -238,6 +250,16 @@ func (e Edition) SubjectShare() (float64, bool) {
 		return 0, false
 	}
 	return *e.Share, true
+}
+
+// DigestLength is this edition's entry ceiling and whether it has one. Absent and
+// zero are distinct for the same reason they are on the share: a caller reading a
+// bare int would take an unconfigured edition for one asking for an empty digest.
+func (e Edition) DigestLength() (int, bool) {
+	if e.MaxEntries == nil {
+		return 0, false
+	}
+	return *e.MaxEntries, true
 }
 
 // SelectsAll reports whether this edition draws on the whole pool, which is
@@ -771,6 +793,12 @@ func (c *Config) validateEditions() []error {
 		// clamped 25 would run as a ceiling of 1.0 — no ceiling at all — and
 		// the digest it produced would be indistinguishable from a correctly
 		// configured one, which is the failure the whole decision is about.
+		if n, ok := c.Editions[id].DigestLength(); ok && n < 1 {
+			problems = append(problems, fmt.Errorf(
+				"edition %q: max_entries is %d; it is the most entries a digest may carry and must be at least 1 (omit it for no limit)",
+				id, n))
+		}
+
 		if share, ok := c.Editions[id].SubjectShare(); ok && (share <= 0 || share > 1) {
 			problems = append(problems, fmt.Errorf(
 				"edition %q: subject_share is %v; it is a fraction of the digest and must be greater than 0 and at most 1 (0.25 is a quarter)",

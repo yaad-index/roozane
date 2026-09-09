@@ -79,6 +79,16 @@ type subjectGroup struct {
 type droppedItem struct {
 	Item    selectedItem
 	Subject string
+
+	// LostToSubject says this item was crowded out by its OWN subject reaching its
+	// allowance, rather than by the digest reaching its length.
+	//
+	// 🚨 The two must not be reported as one thing. A rising count of the first
+	// says this reader's source list has tilted towards one subject — a statement
+	// about the configuration. A rising count of the second says there was more
+	// news than the configured length admits — a statement about the length. The
+	// same reason for both answers neither question (ADR-0008 §6).
+	LostToSubject bool
 }
 
 // validateGrouping checks that a grouping is a PARTITION of n selected items:
@@ -206,47 +216,147 @@ func shareAllowance(n int, share float64) int {
 	return allowance
 }
 
-// applyShareCeiling trims each subject to its allowance and returns what
-// survives, in the order it was given, together with what it removed.
+// fillDigest selects the entries a digest carries: at most `target` of them, with
+// no subject taking more than its allowance, returning what survives in the order
+// it was given together with what it left out.
+//
+// 🔑 A length and a share are ONE selection problem, not two filters (ADR-0008 §3).
+// This fills subject by subject — strongest first within each subject, subjects in
+// a stable order, one item at a time — so a subject never takes a slot while
+// another is still waiting for one. Applying them in sequence is what creates the
+// degenerate cases, and both orders have one:
+//
+//   - cap then ceiling: if the strongest N are all one subject, the ceiling cuts
+//     them to the allowance and the digest is two entries.
+//   - ceiling then cap: the cap can take N items from a single subject, undoing the
+//     balance the previous step just imposed.
+//
+// Neither is visible from either rule alone, which is why the fill is a decision
+// rather than an implementation detail.
+//
+// ⚠️ It fails towards SHORT. When every subject is at its allowance and the target
+// is not met, the digest is shorter than the target and that is correct (ADR-0008
+// §4) — the failure mode is the one the engine already treats as valid rather than
+// the one the reader complained about.
 //
 // The input order is preserved because it is the order the writing pass would
-// otherwise have seen; reordering the digest as a side effect of balancing it
-// would be a second, unasked-for change hidden inside this one.
+// otherwise have seen; reordering the digest as a side effect of balancing it would
+// be a second, unasked-for change hidden inside this one.
 //
-// The caller is responsible for validating the grouping first. Passing an
-// invalid one is a programming error rather than a runtime outcome, so this
-// panics rather than silently doing something reasonable — see validateGrouping
-// for why a partial grouping must never reach the arithmetic.
-func applyShareCeiling(selected []selectedItem, groups []subjectGroup, share float64) (kept []selectedItem, dropped []droppedItem) {
+// target and share are both optional. With no target the digest is as long as the
+// selected set, which reduces exactly to ADR-0007's ceiling; with no share a
+// subject is bounded only by the target.
+//
+// The caller must validate the grouping first — see validateGrouping for why a
+// partial grouping must never reach the arithmetic.
+func fillDigest(selected []selectedItem, groups []subjectGroup, share *float64, target *int) (kept []selectedItem, dropped []droppedItem) {
 	if err := validateGrouping(groups, len(selected)); err != nil {
-		panic("applyShareCeiling: " + err.Error())
+		panic("fillDigest: " + err.Error())
 	}
 
 	groups = mergeSameSubject(groups)
 
-	// ⚠️ One subject means the ceiling cannot bind, and this is not an
-	// optimisation guarding the loop below — it is a decision (ADR-0007 §4).
-	// With a single subject the share is 1.0 however many items are kept, so
-	// dropping changes no proportion and only costs the reader facts. The
-	// ceiling exists to stop one subject crowding the others out; here there
-	// are no others.
-	if len(groups) == 1 {
-		return selected, nil
+	limit := len(selected)
+	if target != nil && *target < limit {
+		limit = *target
 	}
 
-	allowance := shareAllowance(len(selected), share)
+	// ⚠️ One subject means the SHARE cannot bind, and this is a decision rather
+	// than an optimisation (ADR-0007 §4): with a single subject the share is 1.0
+	// however many items are kept, so applying it changes no proportion and only
+	// costs the reader facts. A TARGET still applies — a one-subject day is
+	// carried, shortened to the target — which is why this sets the allowance
+	// rather than returning early.
+	//
+	// shareBinds is tracked rather than inferred from `allowance == limit`. Without
+	// a share the allowance IS the limit, so a subject that fills the whole digest
+	// would look like one that hit a share ceiling — and every item it crowded out
+	// would be reported under the wrong reason, which is the one thing §6 exists to
+	// prevent.
+	allowance := limit
+	shareBinds := share != nil && len(groups) > 1
+	if shareBinds {
+		allowance = shareAllowance(limit, *share)
+	}
 
-	survives := make([]bool, len(selected))
-	subjectOf := make([]string, len(selected))
+	// Subjects in a stable order, each with its members strongest-first. Both are
+	// total orders, so re-running a day produces the same digest; a fill that
+	// reshuffled between runs would make every comparison between two runs
+	// meaningless (ADR-0008 §5).
+	// ⚠️ The subject travels WITH its members. An earlier version sorted a slice
+	// of member lists and reached back into `groups` by index for the label — but
+	// the two only correspond until the sort's first swap, after which it compared
+	// the names of unrelated subjects.
+	//
+	// 🔑 It never misbehaved, and that is the part worth recording: strongerMatch
+	// ends in a filename comparison and filenames are unique, so one of the two
+	// calls below always answers true and the label branch is unreachable. The
+	// code was correct because of a property of a DIFFERENT function, and weakening
+	// that one — dropping the filename fallback, or ordering on something that can
+	// genuinely tie — would have activated the bug silently, since the output stays
+	// deterministic and merely stops being the order intended.
+	ordered := make([]subjectGroup, 0, len(groups))
 	for _, group := range groups {
 		members := append([]int(nil), group.Members...)
 		sort.SliceStable(members, func(a, b int) bool {
 			return strongerMatch(selected[members[a]], selected[members[b]])
 		})
-		for rank, index := range members {
-			subjectOf[index] = group.Subject
-			survives[index] = rank < allowance
+		ordered = append(ordered, subjectGroup{Subject: group.Subject, Members: members})
+	}
+	sort.SliceStable(ordered, func(a, b int) bool {
+		first, second := ordered[a].Members[0], ordered[b].Members[0]
+		if strongerMatch(selected[first], selected[second]) {
+			return true
 		}
+		if strongerMatch(selected[second], selected[first]) {
+			return false
+		}
+		return ordered[a].Subject < ordered[b].Subject
+	})
+
+	survives := make([]bool, len(selected))
+	subjectOf := make([]string, len(selected))
+	atAllowance := make([]bool, len(selected))
+	taken := 0
+
+	for _, group := range groups {
+		for _, index := range group.Members {
+			subjectOf[index] = group.Subject
+		}
+	}
+
+	// Round robin: one item per subject per pass, so a subject cannot take a
+	// second slot while another subject is still waiting for its first.
+	for round := 0; taken < limit; round++ {
+		progressed := false
+		for _, group := range ordered {
+			if taken >= limit {
+				break
+			}
+			if round >= allowance || round >= len(group.Members) {
+				continue
+			}
+			survives[group.Members[round]] = true
+			taken++
+			progressed = true
+		}
+		if !progressed {
+			break
+		}
+	}
+
+	// An item left out for its subject's share and one left out because the digest
+	// was full are different facts, and the report must be able to tell them apart
+	// (ADR-0008 §6). A subject that reached its allowance crowded out its own
+	// remainder; anything else lost its place to the length.
+	countBySubject := map[string]int{}
+	for i := range selected {
+		if survives[i] {
+			countBySubject[subjectOf[i]]++
+		}
+	}
+	for i := range selected {
+		atAllowance[i] = shareBinds && countBySubject[subjectOf[i]] >= allowance
 	}
 
 	for i, item := range selected {
@@ -254,7 +364,11 @@ func applyShareCeiling(selected []selectedItem, groups []subjectGroup, share flo
 			kept = append(kept, item)
 			continue
 		}
-		dropped = append(dropped, droppedItem{Item: item, Subject: subjectOf[i]})
+		dropped = append(dropped, droppedItem{
+			Item:          item,
+			Subject:       subjectOf[i],
+			LostToSubject: atAllowance[i],
+		})
 	}
 	return kept, dropped
 }
