@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.7.0](https://github.com/yaad-index/roozane/compare/v0.6.0...v0.7.0) (2026-09-09)
+
+
+### Features
+
+* **deliver:** hand exec sinks the written prose, not only the structured digest ([#84](https://github.com/yaad-index/roozane/issues/84)) ([00efc20](https://github.com/yaad-index/roozane/commit/00efc206a470cc556f01f6899164a5e379b747c3))
+* fill a digest to a length subject by subject, not a cap then a ceiling ([#86](https://github.com/yaad-index/roozane/issues/86)) ([eb08ede](https://github.com/yaad-index/roozane/commit/eb08ede652753ff28046125a8b20a8803fea7b9d))
+
 ## [0.6.0](https://github.com/yaad-index/roozane/compare/v0.5.0...v0.6.0) (2026-09-09)
 
 
