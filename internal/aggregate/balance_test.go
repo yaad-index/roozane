@@ -474,25 +474,69 @@ func TestParseGroupingReadsAPartition(t *testing.T) {
 		require.Len(t, groups, 1)
 	})
 
-	t.Run("unnamed subjects get DISTINCT placeholders, so they are not merged together", func(t *testing.T) {
-		// 🚨 Not cosmetic. mergeSameSubject folds entries sharing a label, so one
-		// shared placeholder would merge clusters the grouping never said were
-		// related — and merging two subjects into one drops items, where leaving
-		// them apart only leaves the digest less balanced.
+	t.Run("unnamed subjects stay EMPTY — no placeholder in the label namespace", func(t *testing.T) {
+		// 🚨 A placeholder would be a value in the same namespace as real
+		// labels, so a grouping that genuinely returned "unnamed 2" would fold
+		// with the second unlabelled cluster — and merging two subjects into one
+		// drops items, where leaving them apart only leaves the digest less
+		// balanced. An empty string is the absence of a label, not a value in it.
 		groups, err := parseGrouping(`{"subjects": [{"subject": "  ", "items": [0]}, {"subject": "", "items": [1]}]}`, 2)
 		require.NoError(t, err)
 		require.Len(t, groups, 2)
-		assert.Equal(t, "unnamed 1", groups[0].Subject)
-		assert.Equal(t, "unnamed 2", groups[1].Subject)
-		assert.NotEqual(t, groups[0].Subject, groups[1].Subject)
+		assert.Empty(t, groups[0].Subject)
+		assert.Empty(t, groups[1].Subject)
 
-		// And the property that actually matters, asserted through the ceiling
-		// rather than through the labels: two unlabelled clusters keep their own
-		// allowances.
-		selected := []selectedItem{item("a.md", 0.9, 0.5), item("b.md", 0.8, 0.5)}
+		// The property that matters, asserted through the ceiling rather than
+		// through the labels, and travelling the real path: parseGrouping ->
+		// fillDigest -> mergeSameSubject.
+		//
+		// ⚠️ THREE groups, not two, and that is load-bearing. `shareBinds` is
+		// `share != nil && len(groups) > 1`, so with only two unlabelled clusters
+		// a wrong merge collapses them to ONE group, the share stops binding
+		// altogether and everything is kept — the damage is invisible. A third,
+		// labelled subject keeps the share binding after the bad merge, which is
+		// what lets the dropped item show. Learned by watching the mutation pass.
+		groups, err = parseGrouping(
+			`{"subjects": [{"subject": "", "items": [0]}, {"subject": "", "items": [1]}, {"subject": "x", "items": [2, 3]}]}`, 4)
+		require.NoError(t, err)
+
+		selected := []selectedItem{
+			item("a.md", 0.9, 0.5), item("b.md", 0.8, 0.5),
+			item("c.md", 0.7, 0.5), item("d.md", 0.6, 0.5),
+		}
 		kept, dropped := fillDigest(selected, groups, share(0.25), nil)
-		assert.Equal(t, []string{"a.md", "b.md"}, names(kept))
-		assert.Empty(t, dropped)
+
+		// One item per subject: the two unlabelled clusters hold their own
+		// allowances instead of sharing one. Remove `&& group.Subject != ""`
+		// from mergeSameSubject and b.md is dropped instead of d.md.
+		assert.Equal(t, []string{"a.md", "b.md", "c.md"}, names(kept))
+		require.Len(t, dropped, 1)
+		assert.Equal(t, "d.md", dropped[0].Item.Item.Filename)
+	})
+
+	t.Run("a real subject called \"unnamed 2\" is nobody's placeholder", func(t *testing.T) {
+		// The collision the placeholder made possible, asserted through the
+		// ceiling. The unlabelled cluster is SECOND, which is what the old code
+		// would have named "unnamed 2" — the same string the grouping genuinely
+		// returned for a different cluster. Restore the placeholder and the two
+		// fuse, which drops an item.
+		groups, err := parseGrouping(
+			`{"subjects": [{"subject": "x", "items": [0]}, {"subject": "", "items": [1]}, {"subject": "unnamed 2", "items": [2, 3]}]}`, 4)
+		require.NoError(t, err)
+		require.Len(t, groups, 3)
+		assert.Empty(t, groups[1].Subject, "the unlabelled cluster carries no label at all")
+		assert.Equal(t, "unnamed 2", groups[2].Subject, "a real label that happens to look like a placeholder")
+
+		selected := []selectedItem{
+			item("a.md", 0.9, 0.5), item("b.md", 0.8, 0.5),
+			item("c.md", 0.7, 0.5), item("d.md", 0.6, 0.5),
+		}
+		kept, dropped := fillDigest(selected, groups, share(0.25), nil)
+
+		assert.Equal(t, []string{"a.md", "b.md", "c.md"}, names(kept),
+			"three distinct subjects each keep one item")
+		require.Len(t, dropped, 1)
+		assert.Equal(t, "d.md", dropped[0].Item.Item.Filename)
 	})
 
 	t.Run("not json at all", func(t *testing.T) {

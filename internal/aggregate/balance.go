@@ -31,22 +31,24 @@ func parseGrouping(content string, n int) ([]subjectGroup, error) {
 	}
 
 	groups := make([]subjectGroup, 0, len(reply.Subjects))
-	for i, s := range reply.Subjects {
-		subject := strings.TrimSpace(s.Subject)
-		if subject == "" {
-			// A cluster with no name is still a cluster, and refusing the whole
-			// reply over a missing label would cost a correct partition for a
-			// cosmetic reason.
-			//
-			// 🚨 The placeholder is NUMBERED, and that is load-bearing rather
-			// than cosmetic. mergeSameSubject folds entries sharing a label, so
-			// giving every unlabelled cluster the same placeholder would merge
-			// clusters the pass never said were related — and merging subjects
-			// that are not one subject DROPS items, which is the expensive
-			// direction. Distinct placeholders keep them distinct.
-			subject = fmt.Sprintf("unnamed %d", i+1)
-		}
-		groups = append(groups, subjectGroup{Subject: subject, Members: s.Items})
+	for _, s := range reply.Subjects {
+		// A cluster with no name is still a cluster, and refusing the whole reply
+		// over a missing label would cost a correct partition for a cosmetic
+		// reason. So it is kept, and kept UNLABELLED.
+		//
+		// 🚨 There is deliberately no placeholder. An earlier version wrote
+		// "unnamed <n>" here, which put a sentinel into the same namespace as
+		// real labels: a grouping that genuinely returned a subject called
+		// "unnamed 2" would fold together with the second unlabelled cluster,
+		// and merging subjects that are not one subject DROPS items. Numbering
+		// fixed the collision between placeholders and left the one with real
+		// values, which is the same bug an order of magnitude quieter.
+		//
+		// An empty string is not a sentinel in that namespace, it is the absence
+		// of a label — and mergeSameSubject never folds on it. If the label is
+		// ever wanted for display, it wants a separate field, so the distinction
+		// stops being carried by the string's contents.
+		groups = append(groups, subjectGroup{Subject: strings.TrimSpace(s.Subject), Members: s.Items})
 	}
 
 	if err := validateGrouping(groups, n); err != nil {
@@ -64,10 +66,15 @@ func parseGrouping(content string, n int) ([]subjectGroup, error) {
 // string, where a near-miss reads as an item the grouping simply omitted —
 // which is the one failure this pass must not turn into a silent drop.
 type subjectGroup struct {
-	// Subject is what the grouping pass called this cluster. It is carried for
-	// the report and the logs and is never matched on: nothing downstream
-	// compares two subjects for equality, because two runs are free to name the
-	// same cluster differently and that is not an error.
+	// Subject is what the grouping pass called this cluster, and it is EMPTY
+	// when the pass named no subject.
+	//
+	// ⚠️ It IS matched on, within a single grouping: mergeSameSubject folds
+	// entries carrying the same label. That is why the empty case must stay
+	// empty rather than being filled with a placeholder — a placeholder is a
+	// value in this namespace and can equal a real label. Across runs nothing
+	// compares subjects, since two runs are free to name the same cluster
+	// differently and that is not an error.
 	Subject string
 
 	// Members are indices into the selected slice, in no required order.
@@ -174,6 +181,10 @@ func validateGrouping(groups []subjectGroup, n int) error {
 // keeping them. Between the two directions, under-binding costs balance and
 // over-binding costs the reader facts, so the uncertain case fails towards
 // keeping.
+//
+// 🔑 That guard is the LIVE path for every unlabelled cluster, not a contract
+// for a hypothetical caller: parseGrouping leaves an unnamed subject empty and
+// writes no placeholder, so this is what keeps two of them apart.
 func mergeSameSubject(groups []subjectGroup) []subjectGroup {
 	merged := make([]subjectGroup, 0, len(groups))
 	at := make(map[string]int, len(groups))
