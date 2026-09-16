@@ -220,9 +220,13 @@ func (r *Runner) Run(ctx context.Context, day time.Time) (Result, error) {
 
 // readReport loads both of the day's report files.
 //
-// An absent report is reported the same way an absent digest is: the aggregator
-// has not run. Delivering nothing in its place would tell the operator their
-// telemetry is empty when in fact it was never written.
+// An absent report means the aggregator has not run. Delivering nothing in its
+// place would tell the operator their telemetry is empty when in fact it was
+// never written.
+//
+// Unlike a digest, that sentence needs no qualifying: reports/ was introduced
+// after ADR-0005 nested the digests, so a report has only ever had one path and
+// there is no older location a file could be hiding at.
 func (r *Runner) readReport(day time.Time) (Digest, error) {
 	mdPath, jsonPath := r.store.ReportPaths(day)
 
@@ -255,9 +259,9 @@ func (r *Runner) readDigest(day time.Time, edition string) (Digest, error) {
 	if err != nil {
 		if os.IsNotExist(err) {
 			// Absent is not empty: ADR-0002 makes a quiet edition write files
-			// with an explicit marker, so nothing here means the aggregator has
-			// not run. Delivering an invented empty digest would erase that.
-			return Digest{}, fmt.Errorf("no digest for edition %s on %s: the aggregator has not run for that day", edition, store.Day(day))
+			// with an explicit marker, so nothing here means no digest was
+			// written. Delivering an invented empty digest would erase that.
+			return Digest{}, r.absentDigestError(day, edition, mdPath)
 		}
 		return Digest{}, fmt.Errorf("read digest: %w", err)
 	}
@@ -279,6 +283,79 @@ func (r *Runner) readDigest(day time.Time, edition string) (Digest, error) {
 		Structured: structured,
 		Empty:      empty,
 	}, nil
+}
+
+// absentDigestError explains an absent digest as the thing it actually is.
+//
+// Two different situations leave nothing at the expected path, and they have
+// different remedies. The aggregator may genuinely not have produced a digest
+// for that day — a scheduling or crash question. Or it produced one before
+// ADR-0005 moved digests under an edition directory, and the file is sitting at
+// the flat path that ADR deliberately left populated.
+//
+// 🚨 Reporting the second as the first is worse than unhelpful: it asserts
+// something false about a component that is healthy, and it does so to a reader
+// who is already hunting. They go and read the aggregator's schedule and its
+// logs, find nothing wrong, and are no closer, while the digest they are looking
+// for is on disk the whole time.
+//
+// expected is the path already looked at, named so the reader can see which
+// layout this engine believes in without having to reconstruct it.
+func (r *Runner) absentDigestError(day time.Time, edition, expected string) error {
+	legacyMarkdown, legacyStructured := r.store.LegacyDigestPaths(day)
+
+	switch {
+	case isFile(legacyMarkdown) && isFile(legacyStructured):
+		// The pair is what licenses the sentence "it ran", and the reason is
+		// about evidence rather than about any particular misconfiguration: a
+		// lone file is an artifact several components could have produced, so
+		// it is not evidence about any of them. Only the aggregator writes
+		// both, so only both is evidence about the aggregator.
+		//
+		// The digest is not described as this edition's. It predates editions
+		// existing, so it belongs to none of them, and naming one here would
+		// trade a false claim about the aggregator for a false claim about the
+		// file.
+		return fmt.Errorf(
+			"no digest for edition %s on %s at %s: the aggregator did run for that day and wrote %s, "+
+				"the flat path digests used before they moved under digests/<edition>/ — the layout is stale, not the aggregator",
+			edition, store.Day(day), expected, legacyMarkdown)
+
+	case isFile(legacyMarkdown) || isFile(legacyStructured):
+		// One file alone is not that evidence, and it has more than one
+		// reachable cause. A file sink resolves its path as given, so a sink
+		// pointed at digests/{day}.md writes exactly this shape — which is why
+		// ADR-0005 moves the example config off that tree. But the aggregator
+		// writes the pair as two separate atomic writes, markdown then json:
+		// each file is atomic, the pair is not, so a run that stopped between
+		// them leaves the same lone file behind.
+		//
+		// 🚨 So this branch says what is on disk and names neither cause. The
+		// reachable alternatives are what make both "it ran" and "it did not
+		// run" unsayable here — and asserting either would be the same defect
+		// this function exists to remove, only quieter.
+		found := legacyMarkdown
+		if !isFile(found) {
+			found = legacyStructured
+		}
+		return fmt.Errorf(
+			"no digest for edition %s on %s: nothing at %s, and %s exists without its pair — "+
+				"a digest is written as a .md and a .json in two separate writes, so one alone is "+
+				"either something else writing into digests/ or a run that stopped between them",
+			edition, store.Day(day), expected, found)
+
+	default:
+		return fmt.Errorf("no digest for edition %s on %s: the aggregator has not run for that day", edition, store.Day(day))
+	}
+}
+
+// isFile says whether a path is present as a regular file. Anything else —
+// absent, a directory, an unreadable parent — is not the digest being looked
+// for, and this runs only on a path that already failed to open, so a stat
+// error has nothing left to report.
+func isFile(path string) bool {
+	info, err := os.Stat(path)
+	return err == nil && info.Mode().IsRegular()
 }
 
 // defaultBuild resolves a configured sink to a built-in or an external command.
