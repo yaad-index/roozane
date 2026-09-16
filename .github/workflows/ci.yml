@@ -1,7 +1,21 @@
+# Build, vet, test and lint (#4).
+#
+# This runs on the pull request AND on the push that lands it. Those are not the
+# same commit: a squash onto a base that has moved produces a combination no run
+# has ever covered, because the PR's checks validated the branch against an older
+# base. docker-publish builds and pushes from exactly that commit, so without a
+# run here the only thing standing between an untested merge and a published
+# image is whether it compiles — a behavioural regression publishes silently.
+#
+# This reports after the fact rather than preventing it, which is the limit of a
+# trigger. Preventing it means requiring the branch to be current before merging,
+# and that is branch protection rather than anything a workflow can do.
 name: CI
 
 on:
   pull_request:
+    branches: [main]
+  push:
     branches: [main]
 
 permissions:
@@ -49,9 +63,13 @@ jobs:
         # detector is on before there is anything for it to catch.
         run: go test -race ./...
 
-  # The publish workflow only runs on a tag, so without this job the Dockerfile
-  # would go untested until someone is trying to cut a release — the worst
-  # moment to discover it. This builds it on the pull request that changes it.
+  # This builds the Dockerfile on the pull request that changes it, rather than
+  # leaving it to be discovered when someone is trying to cut a release.
+  #
+  # It is not a duplicate of docker-publish on a main push. That workflow's
+  # stamp and smoke assertions are all release-only, so the image it builds and
+  # pushes from a main commit is otherwise never run at all — this job is the
+  # only thing that executes one.
   docker:
     runs-on: ubuntu-latest
     steps:
