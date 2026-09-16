@@ -659,6 +659,26 @@ func TestDigestPathsAreNestedUnderTheEdition(t *testing.T) {
 	assert.Equal(t, "/srv/roozane/digests/default/2026-09-04.md", md)
 }
 
+// The flat layout is still a real location on disk, because ADR-0005 left files
+// already written where they were. Keeping it named is what lets a reader of an
+// absent digest tell a day that was never aggregated from one whose files
+// predate the move.
+func TestLegacyDigestPathsAreTheFlatPreEditionLayout(t *testing.T) {
+	s := New("/srv/roozane")
+	day := mustTime(t, "2026-09-04T00:00:00Z")
+
+	md, structured := s.LegacyDigestPaths(day)
+	assert.Equal(t, "/srv/roozane/digests/2026-09-04.md", md)
+	assert.Equal(t, "/srv/roozane/digests/2026-09-04.json", structured)
+
+	// It is genuinely the other layout, not a second spelling of the current
+	// one — an assertion that would fail if the legacy path were ever quietly
+	// redefined to point back under an edition.
+	current, _ := s.DigestPaths(day, "default")
+	assert.NotEqual(t, current, md)
+	assert.Equal(t, s.DigestsDir(), filepath.Dir(md))
+}
+
 // TestPruneDigestsDescendsIntoEveryEdition is the case that silently stopped
 // working when digests moved: the pruner skipped directory entries outright, so
 // a configured window became keep-forever with no error and no log line — a

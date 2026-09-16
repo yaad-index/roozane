@@ -392,6 +392,19 @@ func (s *Store) DigestPaths(t time.Time, edition string) (markdown, structured s
 	return filepath.Join(dir, day+".md"), filepath.Join(dir, day+".json")
 }
 
+// LegacyDigestPaths are the two files one day's digest was written to before
+// ADR-0005 nested digests under an edition directory.
+//
+// Nothing writes them any more. The layout is kept here because ADR-0005 left
+// files already written where they were, so a data root that ran before the
+// move still has its digests at the flat path — and a reader that only knows
+// the current layout reports those days as never aggregated.
+func (s *Store) LegacyDigestPaths(t time.Time) (markdown, structured string) {
+	day := Day(t)
+	dir := s.DigestsDir()
+	return filepath.Join(dir, day+".md"), filepath.Join(dir, day+".json")
+}
+
 // StatePath is the aggregator's per-day bookkeeping file.
 func (s *Store) StatePath(t time.Time) string {
 	return filepath.Join(s.DayDir(t), "state.json")

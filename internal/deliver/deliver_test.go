@@ -175,6 +175,106 @@ func TestMissingDigestIsNotTreatedAsEmpty(t *testing.T) {
 	assert.True(t, result.Failed())
 }
 
+// --- a not-found must not be reported as a did-not-run (#6) ---
+
+// deliverMissing asks for a day with no digest at the current path and returns
+// the message the operator would see for the single configured sink.
+func deliverMissing(t *testing.T, plant func(s *store.Store, d time.Time)) (message string, s *store.Store, missing time.Time) {
+	t.Helper()
+
+	written := day(t, "2026-09-04")
+	missing = day(t, "2026-09-05")
+	cfg, dir := fixture(t, written, false, "sinks:\n  one: {type: file}\n")
+	s = store.New(filepath.Join(dir, "data"))
+	plant(s, missing)
+
+	result, err := NewRunner(cfg,
+		WithLogger(quietLogger()),
+		WithSinkBuilder(func(string, config.Sink) (Sink, error) { return &recordingSink{}, nil }),
+	).Run(context.Background(), missing)
+	require.NoError(t, err)
+	require.Len(t, result.Sinks, 1)
+	require.Error(t, result.Sinks[0].Err)
+	return result.Sinks[0].Err.Error(), s, missing
+}
+
+// writeLegacyDigest plants a digest in the flat pre-ADR-0005 layout, which is
+// what a data root that ran before editions existed still has on disk.
+func writeLegacyDigest(t *testing.T, s *store.Store, d time.Time, both bool) (markdown string) {
+	t.Helper()
+
+	md, structured := s.LegacyDigestPaths(d)
+	require.NoError(t, s.WriteAtomic(md, []byte("# Digest — "+store.Day(d)+"\n")))
+	if both {
+		require.NoError(t, s.WriteAtomic(structured, []byte(`{"schema":1,"items":[]}`)))
+	}
+	return md
+}
+
+// The bug: the digest exists, the aggregator is healthy, and the message sends
+// the reader to check its schedule and its logs.
+func TestALegacyPathDigestIsNotReportedAsTheAggregatorNotRunning(t *testing.T) {
+	var legacy string
+	msg, s, missing := deliverMissing(t, func(s *store.Store, d time.Time) {
+		legacy = writeLegacyDigest(t, s, d, true)
+	})
+
+	// The false claim about a different component is the defect itself, so its
+	// absence is the assertion — not merely that some extra detail was added.
+	assert.NotContains(t, msg, "has not run")
+	assert.Contains(t, msg, "did run for that day")
+
+	// Naming the path is what turns the message into something actionable:
+	// the reader can look, and see the file.
+	assert.Contains(t, msg, legacy)
+	assert.Contains(t, msg, "the layout is stale, not the aggregator")
+
+	// The path actually looked at is named too, so the reader can see which
+	// layout this engine believes in without reconstructing it.
+	current, _ := s.DigestPaths(missing, "default")
+	assert.Contains(t, msg, current)
+}
+
+// The other half of the distinction, and the reason this cannot be a blanket
+// rewording: with nothing on disk at either path, the original message is the
+// correct one and must survive.
+func TestNoDigestAtEitherPathStillReportsTheAggregator(t *testing.T) {
+	msg, _, _ := deliverMissing(t, func(*store.Store, time.Time) {})
+
+	assert.Contains(t, msg, "the aggregator has not run for that day")
+	assert.NotContains(t, msg, "pre-edition")
+	assert.NotContains(t, msg, "did run for that day")
+}
+
+// A lone file has two reachable causes and the code cannot tell them apart. A
+// file sink resolves its path as given, so one pointed at digests/{day}.md
+// writes exactly this shape — and the aggregator writes the pair as two
+// separate atomic writes, so a run that stopped between them leaves it too.
+//
+// The message therefore asserts neither. Saying "it ran" and saying "it has not
+// run" are both unsayable here, and either would be the same defect this PR
+// removes, only quieter.
+func TestALoneFlatFileAssertsNeitherCause(t *testing.T) {
+	var planted string
+	msg, _, _ := deliverMissing(t, func(s *store.Store, d time.Time) {
+		planted = writeLegacyDigest(t, s, d, false)
+	})
+
+	// Neither claim about the aggregator survives.
+	assert.NotContains(t, msg, "has not run")
+	assert.NotContains(t, msg, "did run for that day")
+
+	// What is on disk is stated, and the file is named rather than passed over
+	// in silence — it is the one thing the reader can go and look at.
+	assert.Contains(t, msg, planted)
+	assert.Contains(t, msg, "without its pair")
+
+	// Both causes are offered, so the reader is pointed at a choice rather than
+	// at a conclusion the code has not earned.
+	assert.Contains(t, msg, "something else writing into digests/")
+	assert.Contains(t, msg, "a run that stopped between them")
+}
+
 func TestNoSinksIsNotAFailure(t *testing.T) {
 	d := day(t, "2026-09-04")
 	cfg, _ := fixture(t, d, false, "")
