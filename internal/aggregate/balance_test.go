@@ -507,8 +507,18 @@ func TestParseGroupingReadsAPartition(t *testing.T) {
 		kept, dropped := fillDigest(selected, groups, share(0.25), nil)
 
 		// One item per subject: the two unlabelled clusters hold their own
-		// allowances instead of sharing one. Remove `&& group.Subject != ""`
-		// from mergeSameSubject and b.md is dropped instead of d.md.
+		// allowances instead of sharing one.
+		//
+		// ⚠️ The empty-label invariant is held by TWO redundant clauses in
+		// mergeSameSubject — the merge condition and the map registration — and
+		// EITHER ALONE IS SUFFICIENT: with the registration guarded, `at[""]` is
+		// never populated, so the merge condition never sees it, and vice versa.
+		// Removing one changes nothing and every test stays green. Remove BOTH
+		// and b.md is dropped instead of d.md, which is what this asserts.
+		//
+		// 🚨 Worth knowing before editing that function: each clause looks like
+		// dead code when tested on its own, so a tidy-up removing "the redundant
+		// one" passes CI and leaves the invariant resting on a single point.
 		assert.Equal(t, []string{"a.md", "b.md", "c.md"}, names(kept))
 		require.Len(t, dropped, 1)
 		assert.Equal(t, "d.md", dropped[0].Item.Item.Filename)
