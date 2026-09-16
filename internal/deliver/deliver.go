@@ -306,10 +306,11 @@ func (r *Runner) absentDigestError(day time.Time, edition, expected string) erro
 
 	switch {
 	case isFile(legacyMarkdown) && isFile(legacyStructured):
-		// The pair is what licenses the sentence "it ran". A digest was always
-		// written as both files, so finding both is evidence about the
-		// aggregator rather than about whatever happens to sit in that
-		// directory.
+		// The pair is what licenses the sentence "it ran", and the reason is
+		// about evidence rather than about any particular misconfiguration: a
+		// lone file is an artifact several components could have produced, so
+		// it is not evidence about any of them. Only the aggregator writes
+		// both, so only both is evidence about the aggregator.
 		//
 		// The digest is not described as this edition's. It predates editions
 		// existing, so it belongs to none of them, and naming one here would
@@ -321,19 +322,27 @@ func (r *Runner) absentDigestError(day time.Time, edition, expected string) erro
 			edition, store.Day(day), expected, legacyMarkdown)
 
 	case isFile(legacyMarkdown) || isFile(legacyStructured):
-		// One file alone is not that evidence. A file sink resolves its path as
-		// given, so a sink pointed at digests/{day}.md writes exactly this
-		// shape — which is why ADR-0005 moves the example config off that tree
-		// and warns against it. Name the file and leave the reader to look
-		// rather than attributing it to the aggregator.
+		// One file alone is not that evidence, and it has more than one
+		// reachable cause. A file sink resolves its path as given, so a sink
+		// pointed at digests/{day}.md writes exactly this shape — which is why
+		// ADR-0005 moves the example config off that tree. But the aggregator
+		// writes the pair as two separate atomic writes, markdown then json:
+		// each file is atomic, the pair is not, so a run that stopped between
+		// them leaves the same lone file behind.
+		//
+		// 🚨 So this branch says what is on disk and names neither cause. The
+		// reachable alternatives are what make both "it ran" and "it did not
+		// run" unsayable here — and asserting either would be the same defect
+		// this function exists to remove, only quieter.
 		found := legacyMarkdown
 		if !isFile(found) {
 			found = legacyStructured
 		}
 		return fmt.Errorf(
-			"no digest for edition %s on %s: the aggregator has not run for that day "+
-				"(%s exists, but a digest is a .md/.json pair, so that file on its own is not one)",
-			edition, store.Day(day), found)
+			"no digest for edition %s on %s: nothing at %s, and %s exists without its pair — "+
+				"a digest is written as a .md and a .json in two separate writes, so one alone is "+
+				"either something else writing into digests/ or a run that stopped between them",
+			edition, store.Day(day), expected, found)
 
 	default:
 		return fmt.Errorf("no digest for edition %s on %s: the aggregator has not run for that day", edition, store.Day(day))

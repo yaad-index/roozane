@@ -246,23 +246,33 @@ func TestNoDigestAtEitherPathStillReportsTheAggregator(t *testing.T) {
 	assert.NotContains(t, msg, "did run for that day")
 }
 
-// A file sink resolves its path as given, so one pointed at digests/{day}.md
-// writes a single flat file that is not a digest — the shape ADR-0005 moves the
-// example config away from. One file is not evidence the aggregator ran, and
-// claiming it did would trade this bug for its mirror image.
-func TestALoneFlatFileIsNotTakenForALegacyDigest(t *testing.T) {
+// A lone file has two reachable causes and the code cannot tell them apart. A
+// file sink resolves its path as given, so one pointed at digests/{day}.md
+// writes exactly this shape — and the aggregator writes the pair as two
+// separate atomic writes, so a run that stopped between them leaves it too.
+//
+// The message therefore asserts neither. Saying "it ran" and saying "it has not
+// run" are both unsayable here, and either would be the same defect this PR
+// removes, only quieter.
+func TestALoneFlatFileAssertsNeitherCause(t *testing.T) {
 	var planted string
 	msg, _, _ := deliverMissing(t, func(s *store.Store, d time.Time) {
 		planted = writeLegacyDigest(t, s, d, false)
 	})
 
-	assert.Contains(t, msg, "the aggregator has not run for that day")
+	// Neither claim about the aggregator survives.
+	assert.NotContains(t, msg, "has not run")
 	assert.NotContains(t, msg, "did run for that day")
 
-	// It is still named rather than passed over in silence: the reader who put
-	// it there is the one person the parenthetical helps.
+	// What is on disk is stated, and the file is named rather than passed over
+	// in silence — it is the one thing the reader can go and look at.
 	assert.Contains(t, msg, planted)
-	assert.Contains(t, msg, ".md/.json pair")
+	assert.Contains(t, msg, "without its pair")
+
+	// Both causes are offered, so the reader is pointed at a choice rather than
+	// at a conclusion the code has not earned.
+	assert.Contains(t, msg, "something else writing into digests/")
+	assert.Contains(t, msg, "a run that stopped between them")
 }
 
 func TestNoSinksIsNotAFailure(t *testing.T) {
