@@ -1022,6 +1022,37 @@ func readReport(t *testing.T, root string, day time.Time) (string, Report) {
 	return string(markdown), report
 }
 
+// TestReportSchemaIsCurrent pins the literal, as the digest's equivalent does.
+//
+// The report's schema is not an internal detail: a sink says either
+// `edition: <id>` or `report: true`, and `report: true` composes with `command`,
+// so the report's structured JSON is handed to an arbitrary external program on
+// stdin under the ADR-0003 contract — schema field included. A silent shape
+// change there breaks a reader outside this repo for the same reason the
+// digest's would, and it does so while its operator is reading the report to
+// diagnose a bad run.
+//
+// Asserting against the constant cannot serve this purpose: both sides move on
+// a bump. Only a literal fails, which is the whole point of writing one.
+//
+// What a pin guarantees is narrower than it can look. It does not prevent a
+// bump, and it does not check that one was correct — a commit moving the
+// constant and this literal together passes, and is meant to. It forces the
+// bump to appear in the diff as a deliberate edit, and that is the whole of it.
+func TestReportSchemaIsCurrent(t *testing.T) {
+	day := at(t, "2026-09-04T06:00:00Z")
+	cfg, root := fixture(t, day, "profile", "")
+
+	_, err := runner(t, cfg, &stubClient{}, day).Run(context.Background(), day)
+	require.NoError(t, err)
+
+	_, report := readReport(t, root, day)
+	assert.Equal(t, 2, report.Schema,
+		"the report JSON gained the error behind an absence, for the case where an item "+
+			"was never judged at all; the version has to move with the shape, and a reader "+
+			"outside this repo is told by this number what to expect")
+}
+
 func TestReportRecordsSourcesItemsAndEditions(t *testing.T) {
 	day := at(t, "2026-09-04T06:00:00Z")
 	cfg, root := fixture(t, day, "profile", "\neditions:\n  narrow: {sources: [a-source]}\n",
@@ -1037,6 +1068,10 @@ func TestReportRecordsSourcesItemsAndEditions(t *testing.T) {
 	require.NoError(t, err)
 
 	markdown, report := readReport(t, root, day)
+	// Against the constant, so this says the field is populated and survives the
+	// round trip to JSON and back — it is NOT a currency check and cannot fail
+	// on a bump, because both sides move together. TestReportSchemaIsCurrent
+	// pins the literal and is the test that notices.
 	assert.Equal(t, ReportSchema, report.Schema)
 	assert.Equal(t, store.Day(day), report.Day)
 
