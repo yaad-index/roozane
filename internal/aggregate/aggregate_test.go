@@ -1034,6 +1034,11 @@ func readReport(t *testing.T, root string, day time.Time) (string, Report) {
 //
 // Asserting against the constant cannot serve this purpose: both sides move on
 // a bump. Only a literal fails, which is the whole point of writing one.
+//
+// What a pin guarantees is narrower than it can look. It does not prevent a
+// bump, and it does not check that one was correct — a commit moving the
+// constant and this literal together passes, and is meant to. It forces the
+// bump to appear in the diff as a deliberate edit, and that is the whole of it.
 func TestReportSchemaIsCurrent(t *testing.T) {
 	day := at(t, "2026-09-04T06:00:00Z")
 	cfg, root := fixture(t, day, "profile", "")
