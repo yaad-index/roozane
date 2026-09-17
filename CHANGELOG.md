@@ -1,5 +1,18 @@
 # Changelog
 
+## [0.8.0](https://github.com/yaad-index/roozane/compare/v0.7.0...v0.8.0) (2026-09-17)
+
+
+### Features
+
+* record what the title pass did, not only that it ran ([#25](https://github.com/yaad-index/roozane/issues/25)) ([79b15c5](https://github.com/yaad-index/roozane/commit/79b15c5ad7355fee126758a0de8783bce8d1f4d8))
+
+
+### Bug Fixes
+
+* don't report a legacy-path digest as the aggregator not running ([#18](https://github.com/yaad-index/roozane/issues/18)) ([6332705](https://github.com/yaad-index/roozane/commit/6332705930bf56a059315edfef049a09dca1f0a7))
+* stop drawing the unlabelled-cluster placeholder from the label namespace ([#23](https://github.com/yaad-index/roozane/issues/23)) ([7636825](https://github.com/yaad-index/roozane/commit/76368250ee814066746d07bb58137e7baeaf0f9c))
+
 ## [0.7.0](https://github.com/yaad-index/roozane/compare/v0.6.0...v0.7.0) (2026-09-09)
 
 
