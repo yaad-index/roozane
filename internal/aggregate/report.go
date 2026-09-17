@@ -187,7 +187,7 @@ type ReportEdition struct {
 // TitleCounts records what the title pass DID to an edition's headlines, rather
 // than only that it ran.
 //
-// 🚨 The three states it separates are otherwise one observation, and the spend
+// 🚨 The states it separates are otherwise one observation, and the spend
 // row cannot separate them either: ten completion tokens is what a decline and a
 // correct no-op both cost.
 //
@@ -200,13 +200,14 @@ type ReportEdition struct {
 //   - present, Returned 0, alongside ReportEdition.TitlesFailed: the pass was
 //     attempted and could not be completed.
 //
-// ⚠️ The counts do not separate the last state from the second on their own —
-// both are offered N, returned 0, changed 0 — which is why the cause is carried
-// beside them rather than left to the digest.
+// ⚠️ A pass that failed and a reply that named nothing do not separate on the
+// counts alone — both are offered N, returned 0, changed 0 — which is why the
+// cause is carried beside them rather than left to the digest.
 //
-// A bare "the pass ran" flag renders the middle two as the same record, and a
-// bare changed-count renders all of them as the same zero. The second is the
-// failure this exists to catch, because the third produces an identical zero
+// A bare "the pass ran" flag renders every attempted case as one record, and a
+// bare changed-count does no better, since each attempted case reports zero
+// changed. The case worth catching is the reply that named nothing, because a
+// reply that named them all and changed none produces an identical zero
 // legitimately (ADR-0005 §7's rule that an absence must not read as a quiet
 // correct outcome).
 //
