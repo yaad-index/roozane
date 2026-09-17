@@ -713,8 +713,9 @@ func (r *Runner) runEdition(ctx context.Context, day time.Time, id string, editi
 	// the language, never the digest: the items keep their source titles and the
 	// edition carries on, which is the posture the select pass settled on.
 	var titlesFailed string
-	titleUsage, err := r.localiseTitles(ctx, id, edition.Language, selected, ledger)
+	titleUsage, titleCounts, err := r.localiseTitles(ctx, id, edition.Language, selected, ledger)
 	addUsage(&editionResult.Usage, titleUsage)
+	editionReport.Titles = titleCounts
 	if err != nil {
 		titlesFailed = err.Error()
 		editionResult.TitlesFailed = true
@@ -1193,10 +1194,16 @@ const titleParseAttempts = 2
 // 🚨 The caller must treat an error as the loss of a language and not the loss
 // of an edition. Every item keeps Item.Title, which is a correct headline in the
 // wrong language — strictly better than no digest.
-func (r *Runner) localiseTitles(ctx context.Context, edition, language string, selected []selectedItem, ledger *spendLedger) (llm.Usage, error) {
+//
+// The returned counts are nil exactly when the pass was not attempted, and are
+// carried into the report so a pass that changed nothing can be told apart from
+// one that did nothing. They are returned even when the pass fails: it was
+// attempted, and the report says what it was asked to do alongside why it could
+// not (TitleCounts).
+func (r *Runner) localiseTitles(ctx context.Context, edition, language string, selected []selectedItem, ledger *spendLedger) (llm.Usage, *TitleCounts, error) {
 	var usage llm.Usage
 	if language == "" || len(selected) == 0 {
-		return usage, nil
+		return usage, nil, nil
 	}
 
 	asked := map[int]bool{}
@@ -1210,8 +1217,9 @@ func (r *Runner) localiseTitles(ctx context.Context, edition, language string, s
 		asked[i] = true
 	}
 	if len(titles) == 0 {
-		return usage, nil
+		return usage, nil, nil
 	}
+	counts := &TitleCounts{Offered: len(titles)}
 
 	var lastErr error
 	for attempt := 1; attempt <= titleParseAttempts; attempt++ {
@@ -1225,7 +1233,7 @@ func (r *Runner) localiseTitles(ctx context.Context, edition, language string, s
 				resp.Usage.PromptTokens, resp.Usage.CompletionTokens, r.now().Sub(started))
 		}
 		if err != nil {
-			return usage, err
+			return usage, counts, err
 		}
 
 		// Every attempt was billed, so every attempt is added.
@@ -1233,6 +1241,7 @@ func (r *Runner) localiseTitles(ctx context.Context, edition, language string, s
 
 		translated, parseErr := parseTitles(resp.Content, asked)
 		if parseErr == nil {
+			counts.Returned = len(translated)
 			for i, title := range translated {
 				// A headline that came back identical is one that needed nothing,
 				// whatever the pass thought it was doing. Recording it would put
@@ -1242,8 +1251,12 @@ func (r *Runner) localiseTitles(ctx context.Context, edition, language string, s
 					continue
 				}
 				selected[i].TitleTranslated = title
+				counts.Changed++
 			}
-			return usage, nil
+			r.log.Info("title pass finished",
+				"edition", edition, "language", language,
+				"offered", counts.Offered, "returned", counts.Returned, "changed", counts.Changed)
+			return usage, counts, nil
 		}
 		lastErr = parseErr
 		if attempt < titleParseAttempts {
@@ -1252,7 +1265,7 @@ func (r *Runner) localiseTitles(ctx context.Context, edition, language string, s
 		}
 	}
 
-	return usage, lastErr
+	return usage, counts, lastErr
 }
 
 // writeDigest renders and writes both digest files, returning the markdown.
