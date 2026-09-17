@@ -718,6 +718,7 @@ func (r *Runner) runEdition(ctx context.Context, day time.Time, id string, editi
 	editionReport.Titles = titleCounts
 	if err != nil {
 		titlesFailed = err.Error()
+		editionReport.TitlesFailed = titlesFailed
 		editionResult.TitlesFailed = true
 		r.log.Error("titles could not be put into this edition's language; they are carried as published and the edition continues",
 			"edition", id, "language", edition.Language, "error", err)
@@ -1197,9 +1198,9 @@ const titleParseAttempts = 2
 //
 // The returned counts are nil exactly when the pass was not attempted, and are
 // carried into the report so a pass that changed nothing can be told apart from
-// one that did nothing. They are returned even when the pass fails: it was
-// attempted, and the report says what it was asked to do alongside why it could
-// not (TitleCounts).
+// one that did nothing. They are returned even when the pass fails, because it
+// was attempted — the counts say what it was asked to do, and the caller records
+// the cause beside them (TitleCounts).
 func (r *Runner) localiseTitles(ctx context.Context, edition, language string, selected []selectedItem, ledger *spendLedger) (llm.Usage, *TitleCounts, error) {
 	var usage llm.Usage
 	if language == "" || len(selected) == 0 {

@@ -2110,7 +2110,7 @@ func TestATitleThatCameBackUnchangedIsNotCarriedTwice(t *testing.T) {
 
 // titleCountsFrom runs one day with the given title behaviour and returns what
 // the report recorded about the pass.
-func titleCountsFrom(t *testing.T, editionYAML string, title func(llm.Request) (llm.Response, error)) (*TitleCounts, EditionResult) {
+func titleCountsFrom(t *testing.T, editionYAML string, title func(llm.Request) (llm.Response, error)) (ReportEdition, EditionResult) {
 	t.Helper()
 	day := at(t, "2026-09-04T06:00:00Z")
 	cfg, root := fixture(t, day, "profile", editionYAML, germanTitles()...)
@@ -2121,16 +2121,17 @@ func titleCountsFrom(t *testing.T, editionYAML string, title func(llm.Request) (
 	_, report := readReport(t, root, day)
 	require.Len(t, report.Editions, 1)
 	require.Len(t, result.Editions, 1)
-	return report.Editions[0].Titles, result.Editions[0]
+	return report.Editions[0], result.Editions[0]
 }
 
 // TestTheReportSaysWhatTheTitlePassDid is the record issue #5 asks for: what the
 // pass was given and what came back, rather than only that it was billed.
 func TestTheReportSaysWhatTheTitlePassDid(t *testing.T) {
-	titles, _ := titleCountsFrom(t, englishEdition, translateWith(t, map[string]string{
+	edition, _ := titleCountsFrom(t, englishEdition, translateWith(t, map[string]string{
 		"Bahnstreik endet nach vier Tagen": "Rail strike ends after four days",
 	}))
 
+	titles := edition.Titles
 	require.NotNil(t, titles, "the pass ran, so the report carries what it did")
 	assert.Equal(t, 2, titles.Offered, "both selected headlines were sent")
 	assert.Equal(t, 1, titles.Returned, "the reply named one of them")
@@ -2147,16 +2148,20 @@ func TestTheReportSaysWhatTheTitlePassDid(t *testing.T) {
 // the headlines at all. Only Returned separates them, which is why a bare
 // changed-count would not have closed this.
 func TestAPassThatNamedNothingIsNotAPassThatLeftEverythingAlone(t *testing.T) {
-	declined, _ := titleCountsFrom(t, englishEdition, func(llm.Request) (llm.Response, error) {
+	declinedEdition, _ := titleCountsFrom(t, englishEdition, func(llm.Request) (llm.Response, error) {
 		return llm.Response{Content: `{"titles": []}`}, nil
 	})
-	leftAlone, _ := titleCountsFrom(t, englishEdition, translateWith(t, map[string]string{
+	leftAloneEdition, _ := titleCountsFrom(t, englishEdition, translateWith(t, map[string]string{
 		"Bahnstreik endet nach vier Tagen": "Bahnstreik endet nach vier Tagen",
 		"Hafen meldet Rekordumschlag":      "Hafen meldet Rekordumschlag",
 	}))
 
+	declined, leftAlone := declinedEdition.Titles, leftAloneEdition.Titles
 	require.NotNil(t, declined)
 	require.NotNil(t, leftAlone)
+
+	assert.Empty(t, declinedEdition.TitlesFailed, "neither case is a failure")
+	assert.Empty(t, leftAloneEdition.TitlesFailed, "neither case is a failure")
 
 	assert.Equal(t, 0, declined.Changed, "neither case changes a headline")
 	assert.Equal(t, 0, leftAlone.Changed, "neither case changes a headline")
@@ -2170,23 +2175,31 @@ func TestAPassThatNamedNothingIsNotAPassThatLeftEverythingAlone(t *testing.T) {
 // record is present exactly when the pass was attempted, so a reader can take
 // its absence as "never ran" rather than as "ran and did nothing".
 func TestAnUnattemptedTitlePassLeavesNoRecord(t *testing.T) {
-	titles, _ := titleCountsFrom(t, "", nil)
-	assert.Nil(t, titles, "no language is configured, so there was nothing to attempt")
+	edition, _ := titleCountsFrom(t, "", nil)
+	assert.Nil(t, edition.Titles, "no language is configured, so there was nothing to attempt")
 }
 
 // TestAFailedTitlePassStillSaysWhatItWasAsked pairs the counts with the cause.
 // The pass was attempted, so the record exists; it changed nothing, and the
 // edition's failure carries why.
 func TestAFailedTitlePassStillSaysWhatItWasAsked(t *testing.T) {
-	titles, edition := titleCountsFrom(t, englishEdition, func(llm.Request) (llm.Response, error) {
+	reported, edition := titleCountsFrom(t, englishEdition, func(llm.Request) (llm.Response, error) {
 		return llm.Response{Content: `{"titles": [{"index": 0, "title": "Rail strike`}, nil
 	})
 
+	titles := reported.Titles
 	require.NotNil(t, titles, "an attempted pass is recorded even when it could not be completed")
 	assert.Equal(t, 2, titles.Offered)
 	assert.Equal(t, 0, titles.Returned)
 	assert.Equal(t, 0, titles.Changed)
 	assert.True(t, edition.TitlesFailed, "the counts say what was asked; this says why nothing came back")
+
+	// 🚨 The counts here are identical to a reply that named no headline, so the
+	// report carries the cause beside them. Without it the owner's own file
+	// renders a failure and a correct no-op as one record, which is the shape
+	// this pass was changed to stop doing.
+	assert.NotEmpty(t, reported.TitlesFailed,
+		"the report says why, rather than sending its owner to the digest to find out")
 }
 
 // TestATitlePassThatCouldNotBeCalledIsStillRecorded is the other failure mode.
@@ -2194,15 +2207,17 @@ func TestAFailedTitlePassStillSaysWhatItWasAsked(t *testing.T) {
 // published, and both were attempted — so both carry the record, and the reader
 // is never left inferring "attempted" from the absence of one.
 func TestATitlePassThatCouldNotBeCalledIsStillRecorded(t *testing.T) {
-	titles, edition := titleCountsFrom(t, englishEdition, func(llm.Request) (llm.Response, error) {
+	reported, edition := titleCountsFrom(t, englishEdition, func(llm.Request) (llm.Response, error) {
 		return llm.Response{}, errors.New("the aggregator could not be reached")
 	})
 
+	titles := reported.Titles
 	require.NotNil(t, titles, "the pass was attempted; only the call failed")
 	assert.Equal(t, 2, titles.Offered)
 	assert.Equal(t, 0, titles.Returned)
 	assert.Equal(t, 0, titles.Changed)
 	assert.True(t, edition.TitlesFailed)
+	assert.NotEmpty(t, reported.TitlesFailed, "and the report carries the cause, not only the digest")
 }
 
 // TestTheWritingPassIsToldTheLanguageAndKeepsTheOriginal pins the second half of

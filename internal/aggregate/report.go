@@ -15,9 +15,10 @@ import (
 // ReportSchema versions reports/<day>.json.
 //
 // It is 3 because an edition now records what its title pass did — how many
-// headlines it offered, how many came back and how many it changed — so a pass
-// that did nothing stops being the same record as a pass that had nothing to
-// do. Additive, so an existing reader keeps working — bumped anyway on the same
+// headlines it offered, how many came back, how many it changed, and why it
+// could not be completed — so a pass that did nothing stops being the same
+// record as a pass that had nothing to do, or as one that failed outright.
+// Additive, so an existing reader keeps working — bumped anyway on the same
 // grounds as DigestSchema: a version whose shape changed underneath a reader
 // tells that reader nothing.
 const ReportSchema = 3
@@ -170,6 +171,17 @@ type ReportEdition struct {
 	// Titles is what the title pass did for this edition, absent when it was
 	// never attempted. See TitleCounts.
 	Titles *TitleCounts `json:"titles,omitempty"`
+
+	// TitlesFailed carries why the title pass could not be completed, for an
+	// edition that names a language.
+	//
+	// 🚨 It is here as well as on the digest because the counts alone cannot
+	// separate the two: a pass that failed and a reply that named no headline
+	// both record offered N, returned 0, changed 0. The digest carries the
+	// cause for the reader; a report that omitted it would send its owner to
+	// the digest to find out what the engine did, which is the direction ADR-0005
+	// §7 draws the other way round.
+	TitlesFailed string `json:"titles_failed,omitempty"`
 }
 
 // TitleCounts records what the title pass DID to an edition's headlines, rather
@@ -185,9 +197,15 @@ type ReportEdition struct {
 //   - present, Returned > 0, Changed 0: the reply named them and they needed
 //     nothing, which is the correct outcome for an edition whose sources
 //     already publish in its language.
+//   - present, Returned 0, alongside ReportEdition.TitlesFailed: the pass was
+//     attempted and could not be completed.
 //
-// A bare "the pass ran" flag renders the last two as the same record, and a
-// bare changed-count renders all three as the same zero. The middle one is the
+// ⚠️ The counts do not separate the last state from the second on their own —
+// both are offered N, returned 0, changed 0 — which is why the cause is carried
+// beside them rather than left to the digest.
+//
+// A bare "the pass ran" flag renders the middle two as the same record, and a
+// bare changed-count renders all of them as the same zero. The second is the
 // failure this exists to catch, because the third produces an identical zero
 // legitimately (ADR-0005 §7's rule that an absence must not read as a quiet
 // correct outcome).
