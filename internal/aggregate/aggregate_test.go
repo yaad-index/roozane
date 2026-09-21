@@ -217,6 +217,12 @@ func readDigest(t *testing.T, root string, day time.Time, edition string) (strin
 	return string(markdown), digest
 }
 
+func jsonDigestPath(t *testing.T, root string, day time.Time, edition string) string {
+	t.Helper()
+	_, jsonPath := store.New(root).DigestPaths(day, edition)
+	return jsonPath
+}
+
 func readState(t *testing.T, root string, day time.Time) State {
 	t.Helper()
 	raw, err := os.ReadFile(store.New(root).StatePath(day))
@@ -308,6 +314,55 @@ func TestRunWritesBothDigestFilesUnderTheEdition(t *testing.T) {
 	assert.Equal(t, []string{"A concrete point."}, digest.Items[0].Points, "points come from the neutral pass")
 	assert.Equal(t, "announcement", digest.Items[0].Category)
 	assert.InDelta(t, 0.9, digest.Items[0].Score, 0.0001, "the score is the edition's, not the item's salience")
+}
+
+// TestDigestItemCarriesTheSummaryWhenItHasNoDataPoints is the case the fix
+// exists for. An item the enrich pass found no concrete data points in is
+// allowed by that pass's own prompt, and before the summary was carried through
+// such an item reached a consumer as a title, a score and this edition's reason
+// for picking it — everything about the handling and nothing about the content.
+//
+// The empty-points item is the one asserted on because the populated one passes
+// either way: points read as substance to a skim, so a digest whose items all
+// carry them hides the omission behind them.
+func TestDigestItemCarriesTheSummaryWhenItHasNoDataPoints(t *testing.T) {
+	day := at(t, "2026-09-04T06:00:00Z")
+	cfg, root := fixture(t, day, "profile", "",
+		store.Item{Source: "a-source", URL: "https://example.com/a", Title: "A", Content: "body"})
+
+	noPoints, err := json.Marshal(Enrichment{
+		Summary:  "SUMMARY-MARKER",
+		Points:   nil,
+		Tags:     []string{"a-tag"},
+		Category: "announcement",
+		Salience: 0.7,
+	})
+	require.NoError(t, err)
+
+	client := &stubClient{
+		enrich: func(llm.Request) (llm.Response, error) {
+			return llm.Response{Content: string(noPoints)}, nil
+		},
+	}
+	_, err = runner(t, cfg, client, day).Run(context.Background(), day)
+	require.NoError(t, err)
+
+	_, digest := readDigest(t, root, day, config.DefaultEdition)
+	require.Len(t, digest.Items, 1)
+	item := digest.Items[0]
+
+	require.Empty(t, item.Points,
+		"the premise of this test: the enrich pass is allowed to return no data points")
+	assert.Equal(t, "SUMMARY-MARKER", item.Summary,
+		"an item with no data points still has to tell a consumer what it says")
+
+	// Read the encoded document too, not only the struct it round-trips into.
+	// The struct would compare equal on a field the digest never wrote, and a
+	// sink reads the bytes.
+	raw, err := os.ReadFile(jsonDigestPath(t, root, day, config.DefaultEdition))
+	require.NoError(t, err)
+	assert.Contains(t, string(raw), `"summary": "SUMMARY-MARKER"`,
+		"the summary is in the written digest, not only in the type a test decodes it with")
 }
 
 func TestQuietEditionWritesAnExplicitEmptyDigest(t *testing.T) {
@@ -999,10 +1054,11 @@ func TestDigestSchemaIsCurrent(t *testing.T) {
 	require.NoError(t, err)
 
 	_, digest := readDigest(t, root, day, config.DefaultEdition)
-	assert.Equal(t, 5, digest.Schema,
-		"the digest JSON gained the reason its subject-share ceiling could not be applied, "+
-			"after a per-item translated title and a title-pass failure, an unjudged count, "+
-			"an edition and collection outcomes; the version has to move with the shape")
+	assert.Equal(t, 6, digest.Schema,
+		"the digest JSON gained each item's summary, after the reason its subject-share ceiling "+
+			"could not be applied, a per-item translated title and a title-pass failure, an "+
+			"unjudged count, an edition and collection outcomes; the version has to move with "+
+			"the shape, additive or not")
 }
 
 // --- the daily report (ADR-0005 §7) ---
