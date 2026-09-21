@@ -71,20 +71,22 @@ type SourceSilence struct {
 	LastYield string `json:"last_yield,omitempty"`
 
 	// RecordDays is how many consecutive days of collection record the walk
-	// could read, ending at the first day with none.
+	// could read, ending at the first day with none. It describes the WALK, not
+	// this source: a day counts here whether or not this source appears in it.
 	RecordDays int `json:"record_days"`
 
 	// RetentionDays is the item-retention window RecordDays is measured
 	// against, repeated per row for the same reason Threshold is: a row lifted
 	// out on its own has to be judgeable.
 	//
-	// ⚠️ It is what makes an unevaluable row DIAGNOSABLE, and RecordDays alone
-	// is not. Fourteen days of record is equally consistent with a window that
-	// stops there and with an engine that has only run a fortnight, and those
-	// call for opposite actions — raise retention, or wait. The comparison is
-	// the whole diagnosis: RecordDays == RetentionDays means the window is the
-	// binding constraint, and anything less means the history simply does not
-	// go back that far yet.
+	// ⚠️ RecordDays alone cannot be acted on. Fourteen days of record is equally
+	// consistent with a window that stops there and with an engine that has only
+	// run a fortnight, and those call for opposite actions. Compared with this
+	// field it answers one question and one only: what stopped the walk.
+	// RecordDays == RetentionDays means the window did; less means the record
+	// does not go back that far. ⚠️ It does NOT answer whether this source can
+	// be judged — that is ObservedRuns, and conflating the two is how a new
+	// source came to read as a retention problem.
 	RetentionDays int `json:"retention_days"`
 }
 
@@ -126,14 +128,21 @@ func (r *Runner) sourceSilence(day time.Time) []SourceSilence {
 		recordDays++
 
 		for id, t := range tallies {
-			if t.settled {
+			outcome, present := outcomes[id]
+			if !present || !outcome.Ran {
+				// Not attempted, or not yet configured on that day. Neither a
+				// quiet run nor a yielding one, and not evidence either.
 				continue
 			}
-			outcome, present := outcomes[id]
+			// 🔑 Runs is therefore the count of THIS source's observed runs on
+			// any row that ends up unevaluable: settled stays false only if no
+			// day reached the Items > 0 branch, so every run that was seen fell
+			// through to runs++. The unevaluable sentence leans on that
+			// equality to talk about evidence without a second field, so
+			// TestAnUnevaluableStreakCountsEveryRunOfThisSource pins it — break
+			// the equality here and the prose starts lying again.
 			switch {
-			case !present || !outcome.Ran:
-				// Not attempted, or not yet configured on that day. Neither a
-				// quiet run nor a yielding one.
+			case t.settled:
 			case outcome.Items > 0:
 				t.settled = true
 				t.lastYield = store.Day(on)

@@ -400,11 +400,15 @@ func renderSilence(silence SourceSilence) string {
 		// freshly added one, and "at least 0 empty runs" is a true sentence
 		// that tells nobody that.
 		if silence.Runs == 0 {
-			return fmt.Sprintf("no run in %s, so there is nothing to judge%s",
-				recordClause(silence), thresholdClause(silence))
+			return fmt.Sprintf("no run of this source in the record, so there is nothing to judge%s — %s",
+				thresholdClause(silence), walkClause(silence))
 		}
-		return fmt.Sprintf("at least %s in a row and the record stops there — %s%s",
-			plural(silence.Runs, "empty run"), recordClause(silence), thresholdClause(silence))
+		if silence.Threshold == 0 {
+			return fmt.Sprintf("%s seen and none that produced anything%s — %s",
+				plural(silence.Runs, "empty run"), thresholdClause(silence), walkClause(silence))
+		}
+		return fmt.Sprintf("%s seen and none that produced anything, short of the %d needed to judge — %s",
+			plural(silence.Runs, "empty run"), silence.Threshold, walkClause(silence))
 
 	default:
 		return fmt.Sprintf("%s in a row%s (last produced items on %s)",
@@ -412,15 +416,20 @@ func renderSilence(silence SourceSilence) string {
 	}
 }
 
-// recordClause is how much record the walk had, against the window it could
-// have had.
+// walkClause is how far back the walk got, against how far it was allowed to.
 //
 // ⚠️ Both numbers or neither. "2 days of record" is equally consistent with a
 // window that stops there and with an engine that has run for two days, and
 // those call for opposite actions — raise retention, or wait — so printing the
 // figure alone hands the reader a diagnosis they cannot actually make.
-func recordClause(silence SourceSilence) string {
-	return fmt.Sprintf("%d of %s of record", silence.RecordDays, plural(silence.RetentionDays, "day"))
+//
+// 🚨 It is CONTEXT and never the headline, which an earlier version got wrong.
+// These are properties of the walk, not of the source: a source added two days
+// ago into a full record makes them read "the window stops here" and sends
+// someone to widen a window that is already wide enough. The runs figure leads
+// the sentence because the runs figure is the one about this source.
+func walkClause(silence SourceSilence) string {
+	return fmt.Sprintf("the walk covered %d of %s", silence.RecordDays, plural(silence.RetentionDays, "day"))
 }
 
 // thresholdClause is the trailing "threshold N", or the opt-out when flagging

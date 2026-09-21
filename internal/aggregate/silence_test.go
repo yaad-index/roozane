@@ -106,7 +106,7 @@ func TestAShortRecordIsNotReportedAsAHealthySource(t *testing.T) {
 
 	// The markdown is where an operator reads this, so the two states have to
 	// differ THERE and not only in the JSON.
-	assert.Contains(t, markdown, "at least 2 empty runs in a row and the record stops there")
+	assert.Contains(t, markdown, "2 empty runs seen and none that produced anything, short of the 3 needed to judge")
 	assert.NotContains(t, markdown, "**a-source** — 2 empty runs in a row, threshold 3")
 }
 
@@ -253,7 +253,7 @@ func TestAnUnevaluableRowSaysWhichConstraintIsBinding(t *testing.T) {
 		assert.Equal(t, SilenceUnevaluable, silence.Status)
 		assert.Equal(t, silence.RetentionDays, silence.RecordDays,
 			"record equal to the window is what says retention is the thing that stopped the walk")
-		assert.Contains(t, markdown, "2 of 2 days of record")
+		assert.Contains(t, markdown, "the walk covered 2 of 2 days")
 	})
 
 	t.Run("the history is simply short", func(t *testing.T) {
@@ -272,7 +272,82 @@ func TestAnUnevaluableRowSaysWhichConstraintIsBinding(t *testing.T) {
 		assert.Equal(t, SilenceUnevaluable, silence.Status)
 		assert.Less(t, silence.RecordDays, silence.RetentionDays,
 			"record short of the window says the engine has not run long enough, not that retention is wrong")
-		assert.Contains(t, markdown, "2 of 90 days of record",
+		assert.Contains(t, markdown, "the walk covered 2 of 90 days",
 			"the operator reads the markdown, so both numbers have to be in the sentence")
 	})
+}
+
+// TestANewSourceIsNotReportedAsARetentionProblem is the case that sent this
+// back after two approvals.
+//
+// 🚨 A source added two days ago sits in a record going back to the retention
+// window. The walk-level figures are then complete — the walk really did cover
+// the whole window — and leading the sentence with them told the reader the
+// window was the binding constraint. It is not: widening it would change
+// nothing, because what is short is the evidence about THIS source. A correct
+// number carrying a false instruction, in the artifact built to be trusted
+// about absence.
+func TestANewSourceIsNotReportedAsARetentionProblem(t *testing.T) {
+	day := at(t, "2026-09-04T06:00:00Z")
+	cfg, root := fixture(t, day, "profile", "\nretention:\n  items: 5\n")
+	for age := range 5 {
+		sources := map[string]collect.SourceOutcome{"b-source": {Ran: true, Items: 3}}
+		if age < 2 {
+			// a-source was added two days ago: present in the recent record and
+			// absent from the rest, which is not the same as having been quiet.
+			sources["a-source"] = collect.SourceOutcome{Ran: true, Items: 0}
+		}
+		writeCollected(t, root, day.AddDate(0, 0, -age), sources)
+	}
+
+	_, err := runner(t, cfg, &stubClient{}, day).Run(context.Background(), day)
+	require.NoError(t, err)
+	markdown, report := readReport(t, root, day)
+
+	silence := silenceFor(t, report, "a-source")
+	assert.Equal(t, SilenceUnevaluable, silence.Status)
+	assert.Equal(t, 2, silence.Runs)
+	assert.Equal(t, silence.RetentionDays, silence.RecordDays,
+		"the walk really did cover the whole window: the walk-level numbers are not wrong, they are not about this source")
+
+	// The sentence must lead with the evidence about this source. The old
+	// rendering put the walk's reach first and read as a retention verdict.
+	assert.Contains(t, markdown,
+		"**a-source** — 2 empty runs seen and none that produced anything, short of the 3 needed to judge")
+	assert.NotContains(t, markdown, "**a-source** — at least 2 empty runs in a row and the record stops there")
+}
+
+// TestAnUnevaluableStreakCountsEveryRunOfThisSource pins what the unevaluable
+// sentence rests on.
+//
+// 🚨 That sentence talks about the evidence for a source using Runs alone, which
+// is only legitimate because a row cannot reach unevaluable unless every run it
+// saw was empty — a producing run settles the tally. If the streak logic ever
+// changes so an unevaluable row can have runs it did not count, the prose
+// starts understating the evidence with nothing to catch it. This is that
+// something.
+func TestAnUnevaluableStreakCountsEveryRunOfThisSource(t *testing.T) {
+	day := at(t, "2026-09-04T06:00:00Z")
+	cfg, root := fixture(t, day, "profile", "\nretention:\n  items: 9\n")
+
+	// Two run-days, under a threshold of three, so the row genuinely lands
+	// unevaluable rather than crossing and settling the question another way.
+	ranOn := map[int]bool{0: true, 3: true}
+	for age := range 9 {
+		outcome := collect.SourceOutcome{Ran: false}
+		if ranOn[age] {
+			outcome = collect.SourceOutcome{Ran: true, Items: 0}
+		}
+		writeCollected(t, root, day.AddDate(0, 0, -age), map[string]collect.SourceOutcome{"a-source": outcome})
+	}
+
+	_, err := runner(t, cfg, &stubClient{}, day).Run(context.Background(), day)
+	require.NoError(t, err)
+	_, report := readReport(t, root, day)
+
+	silence := silenceFor(t, report, "a-source")
+	require.Equal(t, SilenceUnevaluable, silence.Status,
+		"the premise of this test: the row has to actually be unevaluable for the invariant to be the one that matters")
+	assert.Equal(t, len(ranOn), silence.Runs,
+		"every run of this source in the walk is counted, and on an unevaluable row every one of them was empty")
 }
