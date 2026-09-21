@@ -10,6 +10,11 @@
 # about to be published under — is a mislabelled release, and the only cheap
 # moment to catch that is before `latest` has moved onto it.
 #
+# Nothing here publishes until the test suite has passed for this exact commit
+# (#4). That is a separate question from the version checks below: those ask
+# whether the image is labelled correctly, this asks whether the code in it was
+# ever tested.
+#
 # Auth is the built-in GITHUB_TOKEN against ghcr.io: no PAT, no extra secret.
 
 name: docker-publish
@@ -21,6 +26,9 @@ on:
     branches: [main]
 
 permissions:
+  # actions: read is for the gate job below, which asks the API whether CI
+  # concluded successfully for this commit.
+  actions: read
   contents: read
   packages: write
 
@@ -28,7 +36,70 @@ env:
   IMAGE: ghcr.io/yaad-index/roozane
 
 jobs:
+  # An image must not be publishable from a commit the suite has not passed
+  # (#4). ci.yml runs on the push that lands a squash, but it runs CONCURRENTLY
+  # with this workflow, so reading its verdict once would almost always read
+  # "no run yet" and wave the publish through — the check has to wait for the
+  # verdict rather than sample for one.
+  #
+  # The release path needs nothing special: a release carries the SHA of the
+  # main push that produced it, so the run this looks for already exists and
+  # has concluded by the time the release event fires.
+  require-passing-suite:
+    runs-on: ubuntu-latest
+    # Backstop in case the loop below ever stops making progress; the loop
+    # enforces its own budget well inside this.
+    timeout-minutes: 25
+    env:
+      # The wait budget, as a parameter rather than a literal, so the same
+      # script can be exercised against a short budget without editing it.
+      # Observed CI runs on main conclude in 51-82s, so nearly all of this is
+      # for a runner to become available, not for the suite to run.
+      WAIT_SECONDS: 1200
+      POLL_SECONDS: 10
+    steps:
+      - name: Require a passing CI run for this commit
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          SHA: ${{ github.sha }}
+        run: |
+          deadline=$(( $(date +%s) + WAIT_SECONDS ))
+
+          while :; do
+            # Runs of ci.yml for this exact commit. Asking by workflow means a
+            # green run of some other workflow cannot satisfy the gate.
+            runs="$(gh api \
+              "/repos/$REPO/actions/workflows/ci.yml/runs?head_sha=$SHA&per_page=100" \
+              --jq '[.workflow_runs[] | {id, status, conclusion, event}]')"
+
+            if printf '%s' "$runs" | jq -e 'any(.[]; .conclusion == "success")' > /dev/null; then
+              echo "the suite passed for $SHA:"
+              printf '%s\n' "$runs" | jq .
+              exit 0
+            fi
+
+            # Refuse as soon as the answer is known, rather than sitting out the
+            # budget for a verdict that has already been delivered. The length
+            # guard matters: all() over an empty list is true, so without it a
+            # commit with no runs yet would read as "all concluded".
+            if printf '%s' "$runs" | jq -e 'length > 0 and all(.[]; .status == "completed")' > /dev/null; then
+              echo "every CI run for $SHA has concluded and none passed; refusing to publish an image from a commit the suite rejected:"
+              printf '%s\n' "$runs" | jq .
+              exit 1
+            fi
+
+            if [ "$(date +%s)" -ge "$deadline" ]; then
+              echo "no passing CI run for $SHA within ${WAIT_SECONDS}s; refusing to publish rather than treating a missing verdict as a good one:"
+              printf '%s\n' "$runs" | jq .
+              exit 1
+            fi
+
+            sleep "$POLL_SECONDS"
+          done
+
   publish:
+    needs: require-passing-suite
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
