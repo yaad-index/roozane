@@ -457,7 +457,7 @@ func (r *Runner) Run(ctx context.Context, day time.Time) (Result, error) {
 	state := r.loadState(day)
 
 	ledger := newSpendLedger()
-	report := Report{Sources: r.loadCollectedOutcomes(day)}
+	report := Report{Sources: r.loadCollectedOutcomes(day), Silence: r.sourceSilence(day)}
 
 	// Pass one: enrich every item once, for nobody in particular.
 	var enriched []enrichedItem

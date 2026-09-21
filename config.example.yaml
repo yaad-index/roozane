@@ -117,6 +117,22 @@ sources:
   example-site:
     collector: http
     cadence: weekly
+    # Optional: how many consecutive runs this source may yield nothing before
+    # the daily report flags it. Counted in RUNS, so the same number means the
+    # same thing whatever the cadence. Default 3; 0 never flags this source,
+    # which is the right setting for one whose quiet spells are genuinely
+    # unbounded.
+    #
+    # Every source's streak is written to the report whether or not it crossed,
+    # so this only governs what is FLAGGED, never what is visible. Err towards
+    # the quieter flag: the counts are there to read either way.
+    #
+    # Setting this explicitly is checked against retention.items at load — three
+    # weekly runs need days 0, 7 and 14 on disk, so a 14-day window is refused
+    # and 15 is accepted. The default is never checked that way, because a
+    # window too short for it is reported per-run as "cannot evaluate" rather
+    # than being made your problem at startup.
+    silence_after: 3
     # Optional: the ONLY environment variables this source's collector receives
     # (ADR-0003). Names, never values — nothing else is passed through.
     env:
