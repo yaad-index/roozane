@@ -67,10 +67,22 @@ jobs:
           deadline=$(( $(date +%s) + WAIT_SECONDS ))
 
           while :; do
-            # Runs of ci.yml for this exact commit. Asking by workflow means a
-            # green run of some other workflow cannot satisfy the gate.
+            # Runs of ci.yml for this exact commit, and only the ones triggered
+            # by the push to main. Asking by workflow means a green run of some
+            # other workflow cannot satisfy the gate; asking by event means a
+            # green PULL_REQUEST run cannot either.
+            #
+            # That second filter has no effect under squash merging, because a
+            # squash produces a SHA no pull_request run ever carried. It is here
+            # because the gate would otherwise depend on a repository SETTING it
+            # does not control: switch the repo to merge commits and a commit on
+            # main can carry the PR head's SHA, at which point a green PR run —
+            # which validated the head against the base as it stood then, not
+            # the result — would satisfy the gate for a commit whose push run
+            # failed. That is the hole #4 exists to close, reopened by a setting
+            # rather than by code, and nothing would report it.
             runs="$(gh api \
-              "/repos/$REPO/actions/workflows/ci.yml/runs?head_sha=$SHA&per_page=100" \
+              "/repos/$REPO/actions/workflows/ci.yml/runs?head_sha=$SHA&event=push&per_page=100" \
               --jq '[.workflow_runs[] | {id, status, conclusion, event}]')"
 
             if printf '%s' "$runs" | jq -e 'any(.[]; .conclusion == "success")' > /dev/null; then
