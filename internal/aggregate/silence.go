@@ -141,6 +141,21 @@ func (r *Runner) sourceSilence(day time.Time) []SourceSilence {
 			// equality to talk about evidence without a second field, so
 			// TestAnUnevaluableStreakCountsEveryRunOfThisSource pins it — break
 			// the equality here and the prose starts lying again.
+			//
+			// 🔑 The sentence rests on a SECOND invariant, and it comes from the
+			// status switch below rather than from here: crossed is tested
+			// before unevaluable, so a row can only be unevaluable when
+			// threshold is 0 or runs < threshold. That is what makes "short of
+			// the N needed to judge" true by construction rather than by luck.
+			//
+			// It is pinned by the tests that assert a long streak reads as
+			// crossed — TestTheStreakCrossesAtTheThreshold,
+			// TestADayTheSourceWasNotDueNeitherBreaksNorExtendsTheStreak and
+			// TestAFailedFetchCountsTowardsTheStreak all fail if the cases are
+			// reordered. Verified by making that reordering, not by reading it:
+			// an assertion added here instead would have been unfalsifiable,
+			// since every row that reaches unevaluable already has
+			// runs < threshold under the correct order.
 			switch {
 			case t.settled:
 			case outcome.Items > 0:
@@ -170,6 +185,10 @@ func (r *Runner) sourceSilence(day time.Time) []SourceSilence {
 			RecordDays:    recordDays,
 			RetentionDays: r.cfg.Retention.ItemDays(),
 		}
+		// ⚠️ Order matters and is not stylistic: crossed is tested first so a
+		// streak that has already reached the threshold is a finding rather
+		// than a question, whatever the record behind it. It is also what keeps
+		// runs < threshold on every unevaluable row — see the note in the walk.
 		switch {
 		case threshold > 0 && t.runs >= threshold:
 			silence.Status = SilenceCrossed
