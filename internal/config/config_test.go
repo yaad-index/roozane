@@ -1170,3 +1170,81 @@ func TestEditionRejectsALengthBelowOne(t *testing.T) {
 		})
 	}
 }
+
+// silenceConfig is validConfig with an explicit silence_after on the weekly
+// source and the item window swapped in, so a test changes only what it is
+// about.
+func silenceConfig(items, silenceAfter int) string {
+	body := strings.Replace(validConfig, "  items: 30", "  items: "+strconv.Itoa(items), 1)
+	return strings.Replace(body, "    cadence: weekly",
+		"    cadence: weekly\n    silence_after: "+strconv.Itoa(silenceAfter), 1)
+}
+
+// TestAnExplicitSilenceThresholdTheWindowCannotReachIsRejected is the rule: an
+// operator who asks for a streak the record can never hold is told at load,
+// rather than reading "cannot evaluate" on that source forever.
+func TestAnExplicitSilenceThresholdTheWindowCannotReachIsRejected(t *testing.T) {
+	// Vacuity guard: three weekly runs need days 0, 7 and 14, so a 15-day
+	// window is exactly enough and the same fixture loads.
+	_, err := Load(write(t, silenceConfig(15, 3)))
+	require.NoError(t, err, "the fixture must be valid apart from the window under test")
+
+	_, err = Load(write(t, silenceConfig(14, 3)))
+	require.Error(t, err, "one day short of the oldest run the threshold needs must be rejected")
+
+	msg := err.Error()
+	assert.Contains(t, msg, "retention.items is 14 days")
+	assert.Contains(t, msg, `"example-site"`)
+	assert.Contains(t, msg, "needs 15")
+	assert.Contains(t, msg, "silence_after 3")
+}
+
+// TestTheDefaultSilenceThresholdNeverRejectsAConfig is the guarantee that this
+// feature does not narrow what loads.
+//
+// 🚨 The default threshold is this package's choice, not the operator's. A
+// blanket check would mean a stock daily config with items: 1 — which
+// validateRetentionCoversCadences accepts, and which is pinned as acceptable by
+// TestRetentionEqualToLongestCadenceIsAccepted — suddenly failing to load
+// because of a number nobody wrote. A defaulted source whose window is too
+// short is not silently wrong: its streak reports as unevaluable on every run,
+// which is visible in the report.
+func TestTheDefaultSilenceThresholdNeverRejectsAConfig(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		items   int
+		cadence Cadence
+	}{
+		{"one day with a daily source", 1, CadenceDaily},
+		{"seven days with a weekly source", 7, CadenceWeekly},
+		{"thirty days with a monthly source", 30, CadenceMonthly},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			// No silence_after anywhere in this body: the default applies, and
+			// every one of these windows is far too short to hold three runs.
+			body := retentionConfig(tc.items, tc.cadence)
+			require.NotContains(t, body, "silence_after")
+
+			_, err := Load(write(t, body))
+			assert.NoError(t, err, "a default this package chose must not reject a config the operator wrote")
+		})
+	}
+}
+
+// TestANegativeSilenceThresholdIsRejected keeps the opt-out spelled the one way
+// that means it: zero.
+func TestANegativeSilenceThresholdIsRejected(t *testing.T) {
+	_, err := Load(write(t, silenceConfig(90, -1)))
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "silence_after must not be negative")
+	assert.Contains(t, err.Error(), "use 0 to stop flagging this source")
+}
+
+// TestSilenceThresholdZeroLoads is the opt-out itself.
+func TestSilenceThresholdZeroLoads(t *testing.T) {
+	// Seven days, because the weekly source still has to satisfy the older
+	// retention-covers-cadence rule; this test is about silence_after alone.
+	cfg, err := Load(write(t, silenceConfig(7, 0)))
+	require.NoError(t, err, "a source that is never flagged needs no silence history at all")
+	assert.Zero(t, cfg.Sources["example-site"].SilenceThreshold())
+}

@@ -285,6 +285,21 @@ type Source struct {
 	Collector string  `yaml:"collector"`
 	Cadence   Cadence `yaml:"cadence"`
 
+	// SilenceAfter is how many consecutive runs this source may yield nothing
+	// before the daily report flags it (#10). Absent takes defaultSilenceAfter;
+	// an explicit zero turns the flag off for this source, which is a real
+	// configuration for one whose quiet periods are genuinely unbounded.
+	//
+	// It counts RUNS, not days, so that one number means the same thing to a
+	// daily wire and a monthly journal. The cadence normalisation therefore
+	// lives in the walk alone, rather than half in the walk and half in a
+	// per-cadence default nobody can see.
+	//
+	// A pointer, because zero is a decision and absent is not: a plain int
+	// would make "never flag this source" the silent default for every source
+	// nobody configured.
+	SilenceAfter *int `yaml:"silence_after"`
+
 	// Command is an exec-based collector: the program and its arguments,
 	// invoked under the ADR-0003 contract. Required by, and only meaningful
 	// to, the `exec` collector.
@@ -305,6 +320,42 @@ type Source struct {
 // with no params block decode to nothing and report no error, so a collector
 // that needs none does not have to special-case its absence.
 func (s Source) DecodeParams(v any) error { return decodeParams(s.Params, v) }
+
+// SilenceThreshold is how many consecutive empty runs flag this source, with
+// the default applied. Zero means the source is never flagged.
+func (s Source) SilenceThreshold() int {
+	if s.SilenceAfter == nil {
+		return defaultSilenceAfter
+	}
+	return *s.SilenceAfter
+}
+
+// SilenceHistoryDays is how many days of collection record the report needs in
+// order to reach this source's threshold at all: runs land at ages 0, P, 2P …
+// (N-1)P, so the oldest day that has to survive is (N-1)P, and the window
+// counts the day itself.
+//
+// ⚠️ It is a floor and not a guarantee. It assumes runs land exactly one period
+// apart, and nothing enforces that — an engine that was off for a week puts its
+// runs further apart and needs more history than this returns. Config
+// validation can therefore only reject the case that is impossible on the
+// numbers; a walk that runs out of record for any other reason is caught at run
+// time instead, by reporting that it could not evaluate rather than that the
+// source is fine.
+//
+// The second result is false for a cadence outside the vocabulary, and for a
+// threshold below two, neither of which has a meaningful floor.
+func (s Source) SilenceHistoryDays() (int, bool) {
+	threshold := s.SilenceThreshold()
+	if threshold < 2 {
+		return 0, false
+	}
+	days, ok := s.Cadence.Days()
+	if !ok {
+		return 0, false
+	}
+	return (threshold-1)*days + 1, true
+}
 
 // Sink is one entry in the sink list: where a digest goes and what that
 // delivery needs (ADR-0003 §3). Exactly one of Type and Command identifies it —
@@ -462,6 +513,7 @@ const (
 	defaultDataRoot         = "data"
 	defaultRelevanceProfile = "profile.md"
 	defaultRetentionItems   = 90
+	defaultSilenceAfter     = 3
 	defaultTimeout          = 60 * time.Second
 )
 
@@ -621,6 +673,7 @@ func (c *Config) Validate() error {
 	problems = append(problems, c.validateAggregator()...)
 	problems = append(problems, c.validateSources()...)
 	problems = append(problems, c.validateRetentionCoversCadences()...)
+	problems = append(problems, c.validateRetentionCoversSilence()...)
 	problems = append(problems, c.validateEditions()...)
 	problems = append(problems, c.validateSinks()...)
 
@@ -762,6 +815,59 @@ func (c *Config) validateRetentionCoversCadences() []error {
 		items, longestSource, c.Sources[longestSource].Cadence, longestDays)}
 }
 
+// validateRetentionCoversSilence rejects a silence threshold the item-retention
+// window can never satisfy.
+//
+// The report derives a source's zero-yield streak by walking back over the
+// day folders, so a threshold whose runs do not all fit inside the window is
+// one the walk can never reach. Left unchecked, that source reports "not
+// enough record to say" on every single run, for the life of the config —
+// which is honest but useless, and is a configuration mistake rather than a
+// fact about the source.
+//
+// 🚨 This is deliberately the weakest of the two guards and must not be read as
+// the strong one. It rejects only what is impossible on the numbers; a walk can
+// still run out of record with retention configured correctly — a fresh
+// install, a restored backup, days when the engine did not run — and that case
+// is not detectable here at all. It is reported at run time instead, by the
+// per-source record saying it could not evaluate rather than saying the source
+// is quiet. Neither guard substitutes for the other.
+//
+// 🚨 It checks only sources that set silence_after EXPLICITLY, and the omission
+// is the point rather than an oversight. The default threshold is this
+// package's choice, not the operator's, and a config that loaded yesterday must
+// not stop loading because a later version gained a default with an opinion
+// about retention — validateRetentionCoversCadences accepts a window exactly
+// equal to the longest cadence, and under a blanket check a stock daily config
+// with items: 1 would be rejected by a number nobody wrote. A defaulted source
+// whose window is too short is not silently wrong either: its streak reports
+// unevaluable, every run, which is the honest answer and is visible in the
+// artifact. An explicit silence_after is an instruction, and an instruction the
+// window cannot carry out is worth refusing at load.
+func (c *Config) validateRetentionCoversSilence() []error {
+	items := c.Retention.ItemDays()
+
+	var problems []error
+	for _, id := range sortedKeys(c.Sources) {
+		src := c.Sources[id]
+		if src.SilenceAfter == nil {
+			continue
+		}
+		// An unknown cadence is already reported by validateSources, and a
+		// negative threshold likewise; neither needs a second complaint here.
+		needed, ok := src.SilenceHistoryDays()
+		if !ok || items >= needed {
+			continue
+		}
+		problems = append(problems, fmt.Errorf(
+			"retention.items is %d days but source %q needs %d to reach silence_after %d "+
+				"at cadence %q: the streak would never be observable, and the source would "+
+				"report an unevaluable streak on every run",
+			items, id, needed, src.SilenceThreshold(), src.Cadence))
+	}
+	return problems
+}
+
 // validateEditions checks the edition list. Load materialises the default
 // edition before this runs, so the map is never empty here.
 //
@@ -885,6 +991,12 @@ func validateSource(id string, s Source) []error {
 	}
 	if s.Collector != collectorExec && len(s.Command) > 0 {
 		problems = append(problems, fmt.Errorf("source %q: command is only meaningful for the %q collector, but this source uses %q", id, collectorExec, s.Collector))
+	}
+
+	if s.SilenceAfter != nil && *s.SilenceAfter < 0 {
+		problems = append(problems, fmt.Errorf(
+			"source %q: silence_after must not be negative, got %d: use 0 to stop flagging this source",
+			id, *s.SilenceAfter))
 	}
 
 	problems = append(problems, validateEnv(fmt.Sprintf("source %q", id), s.Env)...)

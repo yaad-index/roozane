@@ -1047,10 +1047,10 @@ func TestReportSchemaIsCurrent(t *testing.T) {
 	require.NoError(t, err)
 
 	_, report := readReport(t, root, day)
-	assert.Equal(t, 3, report.Schema,
-		"an edition now records what its title pass offered, got back and changed; the "+
-			"version has to move with the shape, and a reader outside this repo is told "+
-			"by this number what to expect")
+	assert.Equal(t, 4, report.Schema,
+		"the report now carries every source's zero-yield streak; the version has to move "+
+			"with the shape, and a reader outside this repo is told by this number what "+
+			"to expect")
 }
 
 func TestReportRecordsSourcesItemsAndEditions(t *testing.T) {

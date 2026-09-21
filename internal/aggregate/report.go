@@ -14,14 +14,19 @@ import (
 
 // ReportSchema versions reports/<day>.json.
 //
-// It is 3 because an edition now records what its title pass did — how many
+// It is 4 because the report now carries each source's zero-yield streak, so a
+// source that has quietly stopped producing is a row someone can read rather
+// than an absence nobody can see.
+//
+// It was 3 for an edition recording what its title pass did — how many
 // headlines it offered, how many came back, how many it changed, and why it
-// could not be completed — so a pass that did nothing stops being the same
+// could not be completed — so a pass that did nothing stopped being the same
 // record as a pass that had nothing to do, or as one that failed outright.
+//
 // Additive, so an existing reader keeps working — bumped anyway on the same
 // grounds as DigestSchema: a version whose shape changed underneath a reader
 // tells that reader nothing.
-const ReportSchema = 3
+const ReportSchema = 4
 
 // Pass names the calls a run makes, used to attribute spend.
 //
@@ -241,6 +246,12 @@ type Report struct {
 	Items    []ReportItem                     `json:"items"`
 	Editions []ReportEdition                  `json:"editions"`
 
+	// Silence is every configured source's zero-yield streak, not only the
+	// flagged ones. Sources carries what happened TODAY, which cannot answer
+	// the question #10 asks: today's zero is the same row whether it is the
+	// first or the fortieth.
+	Silence []SourceSilence `json:"silence"`
+
 	Spend []PassSpend `json:"spend"`
 
 	// SpendIsPerRun is always true and is written anyway, because the figure it
@@ -371,6 +382,57 @@ func countAbsent(absences []ReportAbsence, reason string) int {
 }
 
 // renderReport writes the operator-facing markdown.
+// renderSilence is one source's streak in a sentence.
+//
+// ⚠️ An unevaluable row must not render as a number and nothing else. "2 empty
+// runs" and "at least 2 empty runs, and the record stops there" are the two
+// states this whole feature exists to separate, and the markdown is where an
+// operator actually reads them — rendering both as "2" would put the bug back
+// in the one artifact built to show it.
+func renderSilence(silence SourceSilence) string {
+	switch silence.Status {
+	case SilenceCrossed:
+		return fmt.Sprintf("FLAGGED: %s in a row, threshold %d (last produced items on %s)",
+			plural(silence.Runs, "empty run"), silence.Threshold, lastYieldOrNever(silence))
+
+	case SilenceUnevaluable:
+		// A source with no run at all in the record is the ordinary state of a
+		// freshly added one, and "at least 0 empty runs" is a true sentence
+		// that tells nobody that.
+		if silence.Runs == 0 {
+			return fmt.Sprintf("no run in %s of record, so there is nothing to judge%s",
+				plural(silence.RecordDays, "day"), thresholdClause(silence))
+		}
+		return fmt.Sprintf("at least %s in a row and the record stops there — %s of record%s",
+			plural(silence.Runs, "empty run"), plural(silence.RecordDays, "day"), thresholdClause(silence))
+
+	default:
+		return fmt.Sprintf("%s in a row%s (last produced items on %s)",
+			plural(silence.Runs, "empty run"), thresholdClause(silence), lastYieldOrNever(silence))
+	}
+}
+
+// thresholdClause is the trailing "threshold N", or the opt-out when flagging
+// is off.
+//
+// ⚠️ It is one function rather than a clause repeated in each branch because
+// silence_after 0 must not render as "threshold 0": there is no threshold, and
+// a reader told there is one will reasonably conclude the source crossed it on
+// its first empty run and that the flag is broken.
+func thresholdClause(silence SourceSilence) string {
+	if silence.Threshold == 0 {
+		return ", never flagged (silence_after 0)"
+	}
+	return fmt.Sprintf(", threshold %d", silence.Threshold)
+}
+
+func lastYieldOrNever(silence SourceSilence) string {
+	if silence.LastYield == "" {
+		return "no day in the record"
+	}
+	return silence.LastYield
+}
+
 func renderReport(report Report) string {
 	var b strings.Builder
 
@@ -395,6 +457,15 @@ func renderReport(report Report) string {
 			default:
 				fmt.Fprintf(&b, "- **%s** — %s\n", id, plural(outcome.Items, "item"))
 			}
+		}
+	}
+
+	b.WriteString("\n## Source silence\n\n")
+	if len(report.Silence) == 0 {
+		b.WriteString("_No sources configured._\n")
+	} else {
+		for _, silence := range report.Silence {
+			fmt.Fprintf(&b, "- **%s** — %s\n", silence.Source, renderSilence(silence))
 		}
 	}
 
