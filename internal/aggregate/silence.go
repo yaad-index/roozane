@@ -71,11 +71,21 @@ type SourceSilence struct {
 	LastYield string `json:"last_yield,omitempty"`
 
 	// RecordDays is how many consecutive days of collection record the walk
-	// could read, ending at the first day with none. It is what makes an
-	// unevaluable row diagnosable rather than merely disappointing: it
-	// separates "retention is too short" from "the engine has not run long
-	// enough yet".
+	// could read, ending at the first day with none.
 	RecordDays int `json:"record_days"`
+
+	// RetentionDays is the item-retention window RecordDays is measured
+	// against, repeated per row for the same reason Threshold is: a row lifted
+	// out on its own has to be judgeable.
+	//
+	// ⚠️ It is what makes an unevaluable row DIAGNOSABLE, and RecordDays alone
+	// is not. Fourteen days of record is equally consistent with a window that
+	// stops there and with an engine that has only run a fortnight, and those
+	// call for opposite actions — raise retention, or wait. The comparison is
+	// the whole diagnosis: RecordDays == RetentionDays means the window is the
+	// binding constraint, and anything less means the history simply does not
+	// go back that far yet.
+	RetentionDays int `json:"retention_days"`
 }
 
 // sourceSilence walks the collection record backwards and reports each source's
@@ -144,11 +154,12 @@ func (r *Runner) sourceSilence(day time.Time) []SourceSilence {
 		threshold := r.cfg.Sources[id].SilenceThreshold()
 
 		silence := SourceSilence{
-			Source:     id,
-			Runs:       t.runs,
-			Threshold:  threshold,
-			LastYield:  t.lastYield,
-			RecordDays: recordDays,
+			Source:        id,
+			Runs:          t.runs,
+			Threshold:     threshold,
+			LastYield:     t.lastYield,
+			RecordDays:    recordDays,
+			RetentionDays: r.cfg.Retention.ItemDays(),
 		}
 		switch {
 		case threshold > 0 && t.runs >= threshold:

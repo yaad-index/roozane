@@ -400,16 +400,27 @@ func renderSilence(silence SourceSilence) string {
 		// freshly added one, and "at least 0 empty runs" is a true sentence
 		// that tells nobody that.
 		if silence.Runs == 0 {
-			return fmt.Sprintf("no run in %s of record, so there is nothing to judge%s",
-				plural(silence.RecordDays, "day"), thresholdClause(silence))
+			return fmt.Sprintf("no run in %s, so there is nothing to judge%s",
+				recordClause(silence), thresholdClause(silence))
 		}
-		return fmt.Sprintf("at least %s in a row and the record stops there — %s of record%s",
-			plural(silence.Runs, "empty run"), plural(silence.RecordDays, "day"), thresholdClause(silence))
+		return fmt.Sprintf("at least %s in a row and the record stops there — %s%s",
+			plural(silence.Runs, "empty run"), recordClause(silence), thresholdClause(silence))
 
 	default:
 		return fmt.Sprintf("%s in a row%s (last produced items on %s)",
 			plural(silence.Runs, "empty run"), thresholdClause(silence), lastYieldOrNever(silence))
 	}
+}
+
+// recordClause is how much record the walk had, against the window it could
+// have had.
+//
+// ⚠️ Both numbers or neither. "2 days of record" is equally consistent with a
+// window that stops there and with an engine that has run for two days, and
+// those call for opposite actions — raise retention, or wait — so printing the
+// figure alone hands the reader a diagnosis they cannot actually make.
+func recordClause(silence SourceSilence) string {
+	return fmt.Sprintf("%d of %s of record", silence.RecordDays, plural(silence.RetentionDays, "day"))
 }
 
 // thresholdClause is the trailing "threshold N", or the opt-out when flagging

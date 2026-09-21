@@ -100,6 +100,8 @@ func TestAShortRecordIsNotReportedAsAHealthySource(t *testing.T) {
 		"two empty runs with no older record cannot be called healthy: the walk ran out before the threshold")
 	assert.Equal(t, 2, unevaluable.Runs, "the count is a floor, and is still worth reporting")
 	assert.Equal(t, 2, unevaluable.RecordDays)
+	assert.Equal(t, 90, unevaluable.RetentionDays,
+		"the window is carried beside the record so the row can be diagnosed on its own")
 	assert.Empty(t, unevaluable.LastYield)
 
 	// The markdown is where an operator reads this, so the two states have to
@@ -220,4 +222,57 @@ func TestAFailedFetchCountsTowardsTheStreak(t *testing.T) {
 	_, report := readReport(t, root, day)
 
 	assert.Equal(t, SilenceCrossed, silenceFor(t, report, "a-source").Status)
+}
+
+// TestAnUnevaluableRowSaysWhichConstraintIsBinding is what RetentionDays buys.
+//
+// 🚨 RecordDays alone cannot be acted on. "2 days of record" is equally the
+// answer for a window that stops at 2 and for an engine that has run twice, and
+// the two call for opposite responses — raise retention, or simply wait. Only
+// the comparison distinguishes them, so both numbers travel together or the row
+// states a diagnosis its reader cannot make.
+func TestAnUnevaluableRowSaysWhichConstraintIsBinding(t *testing.T) {
+	day := at(t, "2026-09-04T06:00:00Z")
+
+	t.Run("retention is the binding constraint", func(t *testing.T) {
+		// A two-day window under a threshold of three: the streak can never be
+		// settled, and more record exists on disk than the window admits, so
+		// the walk is stopped by retention rather than by a short history.
+		cfg, root := fixture(t, day, "profile", "\nretention:\n  items: 2\n")
+		for age := range 6 {
+			writeCollected(t, root, day.AddDate(0, 0, -age), map[string]collect.SourceOutcome{
+				"a-source": {Ran: true, Items: 0},
+			})
+		}
+
+		_, err := runner(t, cfg, &stubClient{}, day).Run(context.Background(), day)
+		require.NoError(t, err)
+		markdown, report := readReport(t, root, day)
+
+		silence := silenceFor(t, report, "a-source")
+		assert.Equal(t, SilenceUnevaluable, silence.Status)
+		assert.Equal(t, silence.RetentionDays, silence.RecordDays,
+			"record equal to the window is what says retention is the thing that stopped the walk")
+		assert.Contains(t, markdown, "2 of 2 days of record")
+	})
+
+	t.Run("the history is simply short", func(t *testing.T) {
+		cfg, root := fixture(t, day, "profile", "")
+		for age := range 2 {
+			writeCollected(t, root, day.AddDate(0, 0, -age), map[string]collect.SourceOutcome{
+				"a-source": {Ran: true, Items: 0},
+			})
+		}
+
+		_, err := runner(t, cfg, &stubClient{}, day).Run(context.Background(), day)
+		require.NoError(t, err)
+		markdown, report := readReport(t, root, day)
+
+		silence := silenceFor(t, report, "a-source")
+		assert.Equal(t, SilenceUnevaluable, silence.Status)
+		assert.Less(t, silence.RecordDays, silence.RetentionDays,
+			"record short of the window says the engine has not run long enough, not that retention is wrong")
+		assert.Contains(t, markdown, "2 of 90 days of record",
+			"the operator reads the markdown, so both numbers have to be in the sentence")
+	})
 }
