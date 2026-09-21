@@ -45,16 +45,18 @@ import (
 // asks — so the existing schema-mismatch path starts the day fresh rather than
 // relabelling one as the other. That costs one re-enriched day, not a converter.
 //
-// DigestSchema is 5 because the digest now says when its subject-share ceiling
-// could not be applied. Earlier it gained each item's title in the edition's
-// language alongside the publisher's original, and said when that rendering
-// could not be done. Earlier it gained the count of items its edition
+// DigestSchema is 6 because each digest item now carries the neutral pass's
+// summary, so a consumer is told what an item says and not only why this
+// edition chose it. Earlier it gained a note for when its subject-share ceiling
+// could not be applied, each item's title in the edition's
+// language alongside the publisher's original, and a note for when that
+// rendering could not be done. Earlier it gained the count of items its edition
 // never managed to ask about, the edition it was written for, and the collection
 // outcomes of the sources that edition drew on. All are additive, so an existing
 // reader keeps working — but a version whose shape has changed underneath it
 // tells a reader nothing, which is the whole job of carrying one.
 const (
-	DigestSchema = 5
+	DigestSchema = 6
 	stateSchema  = 2
 
 	// enrichPromptVersion is bumped whenever the enrichment prompt changes in a
@@ -168,6 +170,24 @@ type DigestItem struct {
 	// consumer's rule is the same in every case: show TitleTranslated if it is
 	// there, otherwise Title.
 	TitleTranslated string `json:"title_translated,omitempty"`
+
+	// Summary is what the item says, from the neutral pass. It is the only
+	// field here that describes the item rather than this edition's handling of
+	// it: Reason is why this edition picked it and Points are isolated facts
+	// the enrich pass was free to return none of, so without Summary an item
+	// carrying no hard numbers reaches a consumer as a headline and a
+	// justification for it.
+	//
+	// It is safe to put in every edition's digest precisely because the enrich
+	// pass is given no profile and no reader — the record is cached per item and
+	// served to all of them, which is what makes it shareable where Reason is
+	// not.
+	//
+	// No omitempty: a parsed enrichment always carries a summary (parseEnrichment
+	// rejects one that does not), so an absent key would mean a digest written
+	// before this field existed, and that is worth being able to tell apart from
+	// an item that somehow has nothing to say.
+	Summary string `json:"summary"`
 
 	Score    float64  `json:"score"`
 	Reason   string   `json:"reason"`
@@ -1322,6 +1342,7 @@ func (r *Runner) writeDigest(ctx context.Context, day time.Time, in digestInput,
 			URL:             s.Item.URL,
 			Title:           s.Item.Title,
 			TitleTranslated: s.TitleTranslated,
+			Summary:         s.Enrichment.Summary,
 			Score:           s.Selection.Score,
 			Reason:          s.Selection.Reason,
 			Points:          s.Enrichment.Points,
