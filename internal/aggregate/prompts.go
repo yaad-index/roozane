@@ -90,11 +90,12 @@ Write the day's digest in Markdown.
 Rules:
 - LENGTH FOLLOWS SIGNAL. Two small items get two lines. Do not pad to a familiar shape, do not add an introduction, a conclusion, or a "nothing else of note" line.
 - Lead with the data points. The reader wants the facts, not a description of the news.
+- An item with no data points carries a SUMMARY line instead, written by the pass that read the item. Write that item's entry from it: it is given fact, and it is there so an item whose facts did not reduce to points is still more than its headline. An item that has points carries no summary line — there, the points are what you have.
 - ONE EVENT IS ONE ENTRY. Several of the items below often report the same underlying event. Merge those into a single entry carrying the fullest set of facts between them, and name the sources that reported it — several sources agreeing is worth showing. Never give one event several entries: to the reader that is repetition rather than emphasis, and it crowds out everything else that happened.
 - Decide sameness from what the data points describe, not from wording. Two reports of one event routinely share almost no vocabulary — a different headline, a different angle, sometimes a different language. If the facts point at the same occurrence, it is one event.
 - Merge only what is genuinely the same occurrence. Items that are merely related stay separate, and when in doubt keep them separate. A short heading may group related entries where that helps the reader, but a heading is not a merge.
 - Preserve specifics exactly: numbers, names, dates. Do not round, soften, or generalise them.
-- Do not invent anything that is not in the points you were given, and do not speculate about what an item implies.
+- Do not invent anything that is not in the points or the summary you were given, and do not speculate about what an item implies.
 - No preamble about what you are doing. Output the digest only.`
 
 // groupSystemPrompt drives the grouping pass, which runs once per edition over
@@ -315,6 +316,13 @@ func buildSelectMessages(profile string, candidate enrichedItem) []llmMessages {
 //
 // The language rule is appended to the system prompt rather than folded into it,
 // so an edition that names no language sends exactly what it sent before.
+//
+// The enriched summary is sent only for an item with no data points. The select
+// and grouping passes send it unconditionally; this pass does not, because its
+// instructions are tuned to lead with the points and prose competing with them
+// on every item is a regression no test here can see — nothing exercises a real
+// model. Restricting it to the items that have no points keeps the message for
+// every other item byte-identical, which is a guarantee rather than a judgement.
 func buildDigestMessages(profile, language string, selected []selectedItem) []llmMessages {
 	var b strings.Builder
 
@@ -346,6 +354,18 @@ func buildDigestMessages(profile, language string, selected []selectedItem) []ll
 			fmt.Fprintf(&b, "Source: %s (%s)\n", s.Item.Source, s.Item.URL)
 		} else {
 			fmt.Fprintf(&b, "Source: %s\n", s.Item.Source)
+		}
+
+		// Only where there are no points. An item that has points sends the same
+		// bytes it always has, so the tuned rules above cannot regress on it, and
+		// the change reaches exactly the items that could otherwise only come out
+		// as a headline. The cliff that creates is deliberate: an item with one
+		// thin point gets no summary, which leaves it exactly as it is rather than
+		// making it worse.
+		if len(s.Enrichment.Points) == 0 {
+			if summary := strings.TrimSpace(s.Enrichment.Summary); summary != "" {
+				fmt.Fprintf(&b, "Summary: %s\n", summary)
+			}
 		}
 		for _, point := range s.Enrichment.Points {
 			fmt.Fprintf(&b, "- %s\n", point)
