@@ -813,6 +813,99 @@ func TestOneEventIsOneEntryInTheDigestPrompt(t *testing.T) {
 	assert.Contains(t, digestSystemPrompt, "when in doubt keep them separate")
 }
 
+// TestTheDigestWriterIsGivenTheSummaryOnlyForAnItemWithNoPoints covers both
+// halves of the decision in one call, so the two items are a control for each
+// other rather than two tests that could drift apart.
+//
+// The Contains half is the reported gap: an item whose points array is
+// legitimately empty otherwise reaches the writer as a headline and a source,
+// beside a rule forbidding it to go beyond what it was given.
+//
+// ⚠️ The NotContains half is the one carrying the design. The summary is
+// withheld from an item that has points so that item's message is unchanged,
+// which is what keeps lead-with-the-points and length-follows-signal out of
+// reach of this change. Nothing here exercises a real model, so a regression in
+// those rules would not surface in this suite at all — the guarantee has to come
+// from the message being identical rather than from a test of the writing.
+func TestTheDigestWriterIsGivenTheSummaryOnlyForAnItemWithNoPoints(t *testing.T) {
+	selected := []selectedItem{
+		{
+			Item:       store.StoredItem{Title: "synthetic headline, item with points", Source: "example-source-a"},
+			Enrichment: Enrichment{Summary: "synthetic-summary-withheld", Points: []string{"synthetic-point-one"}},
+		},
+		{
+			Item:       store.StoredItem{Title: "synthetic headline, item with no points", Source: "example-source-b"},
+			Enrichment: Enrichment{Summary: "synthetic-summary-supplied"},
+		},
+	}
+
+	msgs := buildDigestMessages("synthetic reader profile", "", selected)
+	require.Len(t, msgs, 2)
+	user := msgs[1].Content
+
+	assert.Contains(t, user, "Summary: synthetic-summary-supplied",
+		"an item with no data points must carry its summary, labelled as one")
+
+	assert.NotContains(t, user, "synthetic-summary-withheld",
+		"an item with data points must not gain a summary line")
+	assert.Contains(t, user, "- synthetic-point-one",
+		"the points themselves must still be sent")
+}
+
+// TestASummaryChangesNothingForAnItemThatHasPoints states the guarantee the
+// design rests on as an equality rather than as a claim in a comment: for an
+// item with points, the message is the same bytes whether the enrichment
+// carries a summary or not.
+//
+// It is deliberately not written as "the message contains no Summary label" —
+// that would pass just as well if some other field had started leaking in
+// alongside it.
+func TestASummaryChangesNothingForAnItemThatHasPoints(t *testing.T) {
+	item := store.StoredItem{
+		Title:  "synthetic headline",
+		Source: "example-source",
+		URL:    "https://example.invalid/synthetic",
+	}
+	points := []string{"synthetic-point-one", "synthetic-point-two"}
+
+	withSummary := []selectedItem{{
+		Item:       item,
+		Enrichment: Enrichment{Summary: "synthetic-summary-that-must-not-appear", Points: points},
+	}}
+	withoutSummary := []selectedItem{{
+		Item:       item,
+		Enrichment: Enrichment{Points: points},
+	}}
+
+	assert.Equal(t,
+		buildDigestMessages("synthetic reader profile", "", withoutSummary)[1].Content,
+		buildDigestMessages("synthetic reader profile", "", withSummary)[1].Content,
+		"an item with points must send identical bytes whether or not a summary exists")
+}
+
+// TestTheDigestPromptNamesTheSummaryAsAPermittedSource guards the half of this
+// change that is wording rather than plumbing. Sending the field is not enough:
+// an unlabelled line under a "Data points" heading, next to a do-not-invent
+// rule, is as likely to be ignored as used.
+//
+// ⚠️ The NotContains assertion is the load-bearing one. The do-not-invent rule
+// named the points alone, and left that way it forbids the writer from using
+// the one field this change exists to supply — the prompt would hand over a
+// source and ban it in the same breath, and the result would look exactly like
+// the bug being fixed here.
+func TestTheDigestPromptNamesTheSummaryAsAPermittedSource(t *testing.T) {
+	assert.Contains(t, digestSystemPrompt, "carries a SUMMARY line",
+		"the prompt must say what the field is")
+
+	// And that it is conditional, so its absence on an item with points reads as
+	// intended rather than as something that went missing.
+	assert.Contains(t, digestSystemPrompt, "An item that has points carries no summary line")
+
+	assert.NotContains(t, digestSystemPrompt, "not in the points you were given",
+		"do-not-invent must not go back to naming the points alone")
+	assert.Contains(t, digestSystemPrompt, "not in the points or the summary you were given")
+}
+
 // TestEnrichPromptDefinesTheSalienceScale keeps the number comparable to
 // something. A floor and a report are both stated in terms of this scale, and a
 // score on an undefined scale is not a measurement.
