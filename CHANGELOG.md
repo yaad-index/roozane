@@ -1,5 +1,21 @@
 # Changelog
 
+## [0.8.0](https://github.com/yaad-index/roozane/compare/v0.7.0...v0.8.0) (2026-09-25)
+
+
+### Features
+
+* record what the title pass did, not only that it ran ([#25](https://github.com/yaad-index/roozane/issues/25)) ([79b15c5](https://github.com/yaad-index/roozane/commit/79b15c5ad7355fee126758a0de8783bce8d1f4d8))
+* report each source's zero-yield streak so a dark source is a row, not an absence ([#31](https://github.com/yaad-index/roozane/issues/31)) ([8afcd52](https://github.com/yaad-index/roozane/commit/8afcd52199b02613f350c697611e536d14ed4a8a))
+
+
+### Bug Fixes
+
+* carry the enriched summary onto each digest item ([#36](https://github.com/yaad-index/roozane/issues/36)) ([4669872](https://github.com/yaad-index/roozane/commit/4669872610b6ce1b87a56c0ed4ceb75f02e3124a)), closes [#34](https://github.com/yaad-index/roozane/issues/34)
+* don't report a legacy-path digest as the aggregator not running ([#18](https://github.com/yaad-index/roozane/issues/18)) ([6332705](https://github.com/yaad-index/roozane/commit/6332705930bf56a059315edfef049a09dca1f0a7))
+* give the digest writer the enriched summary when an item has no data points ([#37](https://github.com/yaad-index/roozane/issues/37)) ([13de7df](https://github.com/yaad-index/roozane/commit/13de7dfddd3c5db36f70040511645476cf5a9a90))
+* stop drawing the unlabelled-cluster placeholder from the label namespace ([#23](https://github.com/yaad-index/roozane/issues/23)) ([7636825](https://github.com/yaad-index/roozane/commit/76368250ee814066746d07bb58137e7baeaf0f9c))
+
 ## [0.7.0](https://github.com/yaad-index/roozane/compare/v0.6.0...v0.7.0) (2026-09-09)
 
 
