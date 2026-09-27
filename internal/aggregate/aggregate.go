@@ -1432,13 +1432,18 @@ func unfence(content string) string {
 	if end := strings.LastIndex(inner, "```"); end >= 0 {
 		inner = inner[:end]
 	}
-	// The language tag runs from the fence to the first whitespace. Anything
-	// that is not a tag word is already the payload, so it is kept.
+	// The language tag runs from the fence to the first whitespace, or to the
+	// payload when minified JSON follows it directly. Anything that is not a
+	// tag word is already the payload, so it is kept.
 	switch i := strings.IndexFunc(inner, unicode.IsSpace); {
 	case i >= 0 && isFenceTag(inner[:i]):
 		inner = inner[i:]
 	case i < 0 && isFenceTag(inner):
 		inner = "" // a fence and a tag with nothing after them
+	default:
+		if j := strings.IndexAny(inner, "{["); j > 0 && isFenceTag(inner[:j]) {
+			inner = inner[j:]
+		}
 	}
 	return strings.TrimSpace(inner)
 }
