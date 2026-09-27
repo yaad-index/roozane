@@ -29,6 +29,7 @@ import (
 	"sort"
 	"strings"
 	"time"
+	"unicode"
 
 	"github.com/yaad-index/roozane/internal/collect"
 	"github.com/yaad-index/roozane/internal/config"
@@ -1416,19 +1417,41 @@ func (r *Runner) saveState(day time.Time, state State) {
 // Models routinely wrap JSON in one despite being asked not to, so it is
 // removed before decoding rather than treated as a failure — the alternative is
 // discarding a correct answer over its packaging.
+//
+// The opening and closing fences are removed independently: a reply that opens
+// a fence and never closes it is still a JSON answer. If it was cut short
+// instead, the decoder now reports the missing end of the JSON rather than the
+// fence in front of it.
 func unfence(content string) string {
 	text := strings.TrimSpace(content)
+	if !strings.HasPrefix(text, "```") {
+		return text
+	}
 
-	if strings.HasPrefix(text, "```") {
-		if end := strings.LastIndex(text, "```"); end > 3 {
-			inner := text[3:end]
-			if nl := strings.IndexByte(inner, '\n'); nl >= 0 {
-				inner = inner[nl+1:] // drop the language tag line
-			}
-			text = strings.TrimSpace(inner)
+	inner := text[3:]
+	if end := strings.LastIndex(inner, "```"); end >= 0 {
+		inner = inner[:end]
+	}
+	// The language tag runs from the fence to the first whitespace. Anything
+	// that is not a tag word is already the payload, so it is kept.
+	switch i := strings.IndexFunc(inner, unicode.IsSpace); {
+	case i >= 0 && isFenceTag(inner[:i]):
+		inner = inner[i:]
+	case i < 0 && isFenceTag(inner):
+		inner = "" // a fence and a tag with nothing after them
+	}
+	return strings.TrimSpace(inner)
+}
+
+// isFenceTag reports whether s can be a code fence's language tag, such as
+// "json". The empty tag counts: a fence followed directly by a newline.
+func isFenceTag(s string) bool {
+	for _, r := range s {
+		if !unicode.IsLetter(r) && !unicode.IsDigit(r) && !strings.ContainsRune("+-_.", r) {
+			return false
 		}
 	}
-	return text
+	return true
 }
 
 // parseEnrichment decodes the enrichment pass's reply.

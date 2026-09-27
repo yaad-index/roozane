@@ -929,6 +929,12 @@ func TestParseEnrichment(t *testing.T) {
 		assert.Equal(t, "s", got.Summary)
 	})
 
+	t.Run("a fence that is opened and never closed is still unwrapped", func(t *testing.T) {
+		got, err := parseEnrichment("```json\n{\"summary\":\"s\",\"salience\":0.4}")
+		require.NoError(t, err)
+		assert.Equal(t, "s", got.Summary)
+	})
+
 	t.Run("no summary is rejected", func(t *testing.T) {
 		_, err := parseEnrichment(`{"summary":"   ","salience":0.4}`)
 		require.Error(t, err)
@@ -948,6 +954,38 @@ func TestParseEnrichment(t *testing.T) {
 		require.Error(t, err)
 		assert.Contains(t, err.Error(), "usable JSON")
 	})
+}
+
+func TestUnfence(t *testing.T) {
+	const payload = `{"summary": "s"}`
+	for name, tc := range map[string]struct{ in, want string }{
+		"no fence":                          {payload, payload},
+		"closed, tagged":                    {"```json\n" + payload + "\n```", payload},
+		"closed, untagged":                  {"```\n" + payload + "\n```", payload},
+		"closed, one line":                  {"```json " + payload + "```", payload},
+		"closed, no tag on one line":        {"```" + payload + "```", payload},
+		"prose after the closing fence":     {"```json\n" + payload + "\n```\nHope that helps.", payload},
+		"opened and never closed":           {"```json\n" + payload, payload},
+		"never closed, untagged":            {"```\n" + payload, payload},
+		"never closed, one line":            {"```json " + payload, payload},
+		"surrounding whitespace":            {"\n  ```json\n" + payload + "\n```  \n", payload},
+		"a bare fence and tag":              {"```json", ""},
+		"cut short inside the fence":        {"```json\n{\"summary\": \"s", `{"summary": "s`},
+		"a fence later in the text is kept": {"Here: ```json\n" + payload + "\n```", "Here: ```json\n" + payload + "\n```"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			assert.Equal(t, tc.want, unfence(tc.in))
+		})
+	}
+}
+
+// A reply cut off inside its fence must fail as cut off, not as a stray fence:
+// the error is what anyone reading the log has to go on.
+func TestParseEnrichmentNamesATruncatedReply(t *testing.T) {
+	_, err := parseEnrichment("```json\n{\"summary\":\"a long summary that ran out")
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "unexpected end of JSON input")
+	assert.NotContains(t, err.Error(), "invalid character '`'")
 }
 
 func TestParseSelection(t *testing.T) {
