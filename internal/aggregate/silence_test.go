@@ -1,7 +1,9 @@
 package aggregate
 
 import (
+	"bytes"
 	"context"
+	"log/slog"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -350,4 +352,71 @@ func TestAnUnevaluableStreakCountsEveryRunOfThisSource(t *testing.T) {
 		"the premise of this test: the row has to actually be unevaluable for the invariant to be the one that matters")
 	assert.Equal(t, len(ranOn), silence.Runs,
 		"every run of this source in the walk is counted, and on an unevaluable row every one of them was empty")
+}
+
+// TestOnlyACrossedSourceIsSaidOutLoud is #10's remaining half: a crossing has to
+// reach something other than the report file. Three sources, one per case: one
+// past its silence_after, one short of it, and one that has opted out with 0
+// despite the longest streak of the three.
+func TestOnlyACrossedSourceIsSaidOutLoud(t *testing.T) {
+	day := at(t, "2026-09-04T06:00:00Z")
+	cfg, root := fixture(t, day, "profile",
+		"  quiet-source: {collector: feed, cadence: daily, silence_after: 0}\n")
+	for age := range 5 {
+		writeCollected(t, root, day.AddDate(0, 0, -age), map[string]collect.SourceOutcome{
+			"a-source":     {Ran: true, Items: 0},
+			"b-source":     {Ran: true, Items: map[bool]int{true: 0, false: 1}[age < 2]},
+			"quiet-source": {Ran: true, Items: 0},
+		})
+	}
+
+	var logs bytes.Buffer
+	logger := slog.New(slog.NewTextHandler(&logs, &slog.HandlerOptions{Level: slog.LevelWarn}))
+	result, err := runner(t, cfg, &stubClient{}, day, WithLogger(logger)).Run(context.Background(), day)
+	require.NoError(t, err)
+
+	require.Len(t, result.Dark, 1, "only the source past its threshold is dark")
+	assert.Equal(t, "a-source", result.Dark[0].Source)
+	assert.Equal(t, 5, result.Dark[0].Runs)
+
+	assert.Contains(t, logs.String(), "source=a-source")
+	assert.NotContains(t, logs.String(), "source=b-source", "two empty runs is short of the threshold of 3")
+	assert.NotContains(t, logs.String(), "source=quiet-source", "silence_after 0 is never flagged, however long the streak")
+
+	// The rows themselves are unchanged by the new signal: every source still
+	// has one, including the two that were not said out loud.
+	_, report := readReport(t, root, day)
+	assert.Equal(t, SilenceEvaluated, silenceFor(t, report, "b-source").Status)
+	assert.Equal(t, 2, silenceFor(t, report, "b-source").Runs)
+	assert.Equal(t, 5, silenceFor(t, report, "quiet-source").Runs)
+}
+
+// TestTheSilenceRowCountsFailedFetchesApart is the other gap: both kinds of
+// empty run extend the streak, and the row now says which kind it was.
+func TestTheSilenceRowCountsFailedFetchesApart(t *testing.T) {
+	day := at(t, "2026-09-04T06:00:00Z")
+	cfg, root := fixture(t, day, "profile", "")
+	for age := range 3 {
+		mixed := collect.SourceOutcome{Ran: true, Items: 0}
+		if age > 0 {
+			mixed.Error = "dial tcp: connection refused"
+		}
+		writeCollected(t, root, day.AddDate(0, 0, -age), map[string]collect.SourceOutcome{
+			"a-source": mixed,
+			"b-source": {Ran: true, Items: 0, Error: "403 Forbidden"},
+		})
+	}
+
+	_, err := runner(t, cfg, &stubClient{}, day).Run(context.Background(), day)
+	require.NoError(t, err)
+	markdown, report := readReport(t, root, day)
+
+	mixed := silenceFor(t, report, "a-source")
+	assert.Equal(t, 3, mixed.Runs, "a failed fetch still counts towards the streak")
+	assert.Equal(t, 2, mixed.FailedRuns)
+	assert.Contains(t, markdown, "3 empty runs in a row (2 of them failed fetches)")
+
+	broken := silenceFor(t, report, "b-source")
+	assert.Equal(t, 3, broken.FailedRuns)
+	assert.Contains(t, markdown, "3 empty runs in a row (all failed fetches)")
 }

@@ -127,6 +127,10 @@ sources:
     # so this only governs what is FLAGGED, never what is visible. Err towards
     # the quieter flag: the counts are there to read either way.
     #
+    # A flagged source is also a warning in the log and a "sources dark" line in
+    # `roozane aggregate`'s summary. Neither changes the exit code: exit 1 asks
+    # for a re-run, and running again does not bring a dark source back.
+    #
     # Setting this explicitly is checked against retention.items at load — three
     # weekly runs need days 0, 7 and 14 on disk, so a 14-day window is refused
     # and 15 is accepted. The default is never checked that way, because a

@@ -9,6 +9,7 @@ import (
 	"io"
 	"log/slog"
 	"os"
+	"strings"
 	"time"
 
 	"github.com/yaad-index/roozane/internal/aggregate"
@@ -221,10 +222,42 @@ func runAggregate(args []string, stdout, stderr io.Writer) int {
 		}
 		_, _ = fmt.Fprintln(stdout, line)
 	}
+	if len(result.Dark) > 0 {
+		// Said on the summary for the same reason a title failure is: the report
+		// file already has the row, and a row nobody opens is how a source went
+		// dark unnoticed (#10). It does not change the exit code. Exit 1 asks
+		// for a re-run, and running again does not bring a dark source back.
+		_, _ = fmt.Fprintln(stdout, darkLine(result.Dark))
+	}
 	_, _ = fmt.Fprintf(stdout, "tokens: %d prompt, %d completion\n",
 		result.Usage.PromptTokens, result.Usage.CompletionTokens)
 
 	return aggregateExitCode(result)
+}
+
+// darkLine names every source that has reached its silence_after, with its
+// streak, in one line.
+func darkLine(dark []aggregate.SourceSilence) string {
+	parts := make([]string, 0, len(dark))
+	for _, s := range dark {
+		part := fmt.Sprintf("%s (%s", s.Source, count(s.Runs, "empty run"))
+		if s.FailedRuns > 0 {
+			part += ", " + count(s.FailedRuns, "failed fetch")
+		}
+		parts = append(parts, part+")")
+	}
+	return fmt.Sprintf("%s dark: %s", count(len(dark), "source"), strings.Join(parts, ", "))
+}
+
+// count is n followed by noun, pluralised with an s or es as English needs.
+func count(n int, noun string) string {
+	if n == 1 {
+		return fmt.Sprintf("1 %s", noun)
+	}
+	if strings.HasSuffix(noun, "ch") {
+		return fmt.Sprintf("%d %ses", n, noun)
+	}
+	return fmt.Sprintf("%d %ss", n, noun)
 }
 
 // aggregateExitCode decides the exit status for an aggregation that ran to

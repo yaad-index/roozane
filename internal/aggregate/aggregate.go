@@ -395,6 +395,12 @@ type Result struct {
 
 	// Editions reports each edition's selection pass, in edition-id order.
 	Editions []EditionResult
+
+	// Dark is every source whose silence streak has reached its silence_after,
+	// in source order. The report carries every source's row; this is the
+	// subset a caller should say out loud, because a row in a file nobody
+	// opens is how a source went dark unnoticed in the first place (#10).
+	Dark []SourceSilence
 }
 
 // Unjudged totals the candidates no edition could ask about, across every
@@ -478,6 +484,15 @@ func (r *Runner) Run(ctx context.Context, day time.Time) (Result, error) {
 
 	ledger := newSpendLedger()
 	report := Report{Sources: r.loadCollectedOutcomes(day), Silence: r.sourceSilence(day)}
+	for _, silence := range report.Silence {
+		if silence.Status != SilenceCrossed {
+			continue
+		}
+		result.Dark = append(result.Dark, silence)
+		r.log.Warn("source has produced nothing for its silence_after runs",
+			"source", silence.Source, "empty_runs", silence.Runs, "failed_fetches", silence.FailedRuns,
+			"threshold", silence.Threshold, "last_yield", lastYieldOrNever(silence))
+	}
 
 	// Pass one: enrich every item once, for nobody in particular.
 	var enriched []enrichedItem
