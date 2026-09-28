@@ -56,6 +56,13 @@ retention:
   # A window of its own, not a share of the digest one: a digest is the record
   # a reader keeps, while a report is operator telemetry — interesting while you
   # are tuning the profile and dead weight once you have stopped.
+  #
+  # Left at 0, reports/ grows without bound: nothing is ever removed from it
+  # until you set a window here, and the next collection pass then prunes it.
+  # The default is 0 on purpose. A non-zero default would delete reports on the
+  # first run after an upgrade, before anyone had asked for a retention policy
+  # or read a word about one, and nothing could bring them back. A tree that
+  # grows is visible and is undone by setting this number.
   reports: 0
 
 # The one layer with a brain. It speaks the standard chat-completions API shape
