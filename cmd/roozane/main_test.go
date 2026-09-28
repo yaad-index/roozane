@@ -78,6 +78,16 @@ func TestAggregateExitCodeReportsUnjudgedItems(t *testing.T) {
 			},
 			want: 1,
 		},
+		// #10: a dark source is said on the summary line, never through the
+		// exit code. Exit 1 asks for a re-run, which does not bring it back.
+		"a source that has gone dark": {
+			result: aggregate.Result{
+				Items: 3, Enriched: 3,
+				Editions: []aggregate.EditionResult{{ID: "default", Candidates: 3, Selected: 2}},
+				Dark:     []aggregate.SourceSilence{{Source: "a-source", Status: aggregate.SilenceCrossed, Runs: 4, Threshold: 3}},
+			},
+			want: 0,
+		},
 		"a selection failure in the second of two editions": {
 			result: aggregate.Result{
 				Items: 3, Enriched: 3,
@@ -93,4 +103,15 @@ func TestAggregateExitCodeReportsUnjudgedItems(t *testing.T) {
 			assert.Equal(t, tc.want, aggregateExitCode(tc.result))
 		})
 	}
+}
+
+func TestDarkLineNamesEverySourceWithItsStreak(t *testing.T) {
+	assert.Equal(t, "1 source dark: a-source (1 empty run)",
+		darkLine([]aggregate.SourceSilence{{Source: "a-source", Runs: 1, Threshold: 1}}))
+
+	assert.Equal(t, "2 sources dark: a-source (4 empty runs, 3 failed fetches), b-source (3 empty runs, 1 failed fetch)",
+		darkLine([]aggregate.SourceSilence{
+			{Source: "a-source", Runs: 4, FailedRuns: 3, Threshold: 3},
+			{Source: "b-source", Runs: 3, FailedRuns: 1, Threshold: 3},
+		}))
 }

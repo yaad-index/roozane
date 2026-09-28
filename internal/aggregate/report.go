@@ -392,8 +392,8 @@ func countAbsent(absences []ReportAbsence, reason string) int {
 func renderSilence(silence SourceSilence) string {
 	switch silence.Status {
 	case SilenceCrossed:
-		return fmt.Sprintf("FLAGGED: %s in a row, threshold %d (last produced items on %s)",
-			plural(silence.Runs, "empty run"), silence.Threshold, lastYieldOrNever(silence))
+		return fmt.Sprintf("FLAGGED: %s in a row%s, threshold %d (last produced items on %s)",
+			plural(silence.Runs, "empty run"), failedClause(silence), silence.Threshold, lastYieldOrNever(silence))
 
 	case SilenceUnevaluable:
 		// A source with no run at all in the record is the ordinary state of a
@@ -404,15 +404,33 @@ func renderSilence(silence SourceSilence) string {
 				thresholdClause(silence), walkClause(silence))
 		}
 		if silence.Threshold == 0 {
-			return fmt.Sprintf("%s seen and none that produced anything%s — %s",
-				plural(silence.Runs, "empty run"), thresholdClause(silence), walkClause(silence))
+			return fmt.Sprintf("%s seen%s and none that produced anything%s — %s",
+				plural(silence.Runs, "empty run"), failedClause(silence), thresholdClause(silence), walkClause(silence))
 		}
-		return fmt.Sprintf("%s seen and none that produced anything, short of the %d needed to judge — %s",
-			plural(silence.Runs, "empty run"), silence.Threshold, walkClause(silence))
+		return fmt.Sprintf("%s seen%s and none that produced anything, short of the %d needed to judge — %s",
+			plural(silence.Runs, "empty run"), failedClause(silence), silence.Threshold, walkClause(silence))
 
 	default:
-		return fmt.Sprintf("%s in a row%s (last produced items on %s)",
-			plural(silence.Runs, "empty run"), thresholdClause(silence), lastYieldOrNever(silence))
+		return fmt.Sprintf("%s in a row%s%s (last produced items on %s)",
+			plural(silence.Runs, "empty run"), failedClause(silence), thresholdClause(silence), lastYieldOrNever(silence))
+	}
+}
+
+// failedClause says how much of the streak was failed fetches rather than
+// fetches that found nothing, or nothing when none was: a broken source and a
+// quiet one call for different fixes.
+func failedClause(silence SourceSilence) string {
+	switch {
+	case silence.FailedRuns == 0:
+		return ""
+	case silence.Runs == 1:
+		return " (a failed fetch)"
+	case silence.FailedRuns == silence.Runs:
+		return " (all failed fetches)"
+	case silence.FailedRuns == 1:
+		return " (1 of them a failed fetch)"
+	default:
+		return fmt.Sprintf(" (%d of them failed fetches)", silence.FailedRuns)
 	}
 }
 

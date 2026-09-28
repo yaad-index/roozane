@@ -59,6 +59,11 @@ type SourceSilence struct {
 	// seven.
 	Runs int `json:"runs"`
 
+	// FailedRuns is how many of Runs were fetches that failed, as against
+	// fetches that succeeded and found nothing. Both count towards the streak;
+	// this says which kind of dark it is without opening each day's record.
+	FailedRuns int `json:"failed_runs"`
+
 	// Threshold is the source's silence_after, repeated per row so a row read
 	// on its own can be judged. Zero means this source is never flagged, and
 	// then Status is never crossed however long the streak.
@@ -103,6 +108,7 @@ type SourceSilence struct {
 func (r *Runner) sourceSilence(day time.Time) []SourceSilence {
 	type tally struct {
 		runs      int
+		failed    int
 		settled   bool
 		lastYield string
 	}
@@ -164,10 +170,13 @@ func (r *Runner) sourceSilence(day time.Time) []SourceSilence {
 			default:
 				// Ran and produced nothing. The fetch may also have failed —
 				// the streak counts it either way, because a source that is
-				// broken is exactly as dark as one that is quiet, and the
-				// error is already carried in the day's own outcome for
-				// whoever needs to tell them apart.
+				// broken is exactly as dark as one that is quiet. FailedRuns
+				// keeps the two apart on the row, and each day's own outcome
+				// still carries the error text.
 				t.runs++
+				if outcome.Error != "" {
+					t.failed++
+				}
 			}
 		}
 	}
@@ -180,6 +189,7 @@ func (r *Runner) sourceSilence(day time.Time) []SourceSilence {
 		silence := SourceSilence{
 			Source:        id,
 			Runs:          t.runs,
+			FailedRuns:    t.failed,
 			Threshold:     threshold,
 			LastYield:     t.lastYield,
 			RecordDays:    recordDays,
